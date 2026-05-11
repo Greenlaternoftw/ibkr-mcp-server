@@ -7,6 +7,13 @@ from decimal import Decimal
 
 from ib_async import IB, Stock, util
 from .config import settings
+from .orders import (
+    OrderRequest,
+    build_order,
+    make_preview,
+    validate_request,
+)
+from .oca import prepare_group
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
@@ -339,6 +346,175 @@ class IBKRClient:
             self.logger.error(f"Error getting accounts: {e}")
             return {"error": str(e)}
     
+    async def place_order(self, **kwargs) -> Dict:
+        """Place a single order. Honors `ENABLE_LIVE_TRADING` and `MAX_ORDER_SIZE`.
+
+        All Layer 1 order types are supported (MKT, LMT, STP, STP LMT, TRAIL,
+        TRAIL LIMIT, LOO, MOO, LOC, MOC). See `orders.py` for validation rules.
+        """
+        try:
+            req = OrderRequest.from_kwargs(**kwargs)
+            validate_request(req)
+        except ValidationError as e:
+            return self._order_response("error", req=None, preview_kwargs=kwargs, message=str(e))
+
+        preview = make_preview(req)
+
+        if not settings.enable_live_trading:
+            return self._order_response(
+                "blocked",
+                req=req,
+                preview=preview,
+                message="ENABLE_LIVE_TRADING=false; order not transmitted",
+            )
+
+        if req.dry_run:
+            return self._order_response(
+                "dry_run",
+                req=req,
+                preview=preview,
+                message="dry_run=true; order not transmitted",
+            )
+
+        if not await self._ensure_connected():
+            return self._order_response(
+                "error",
+                req=req,
+                preview=preview,
+                message="Not connected to IBKR",
+            )
+
+        try:
+            contract = Stock(req.symbol, "SMART", "USD")
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if not qualified or not contract.conId:
+                return self._order_response(
+                    "error",
+                    req=req,
+                    preview=preview,
+                    message=f"Could not qualify contract for {req.symbol}",
+                )
+
+            ib_order = build_order(req)
+            trade = self.ib.placeOrder(contract, ib_order)
+            return self._order_response(
+                "submitted",
+                req=req,
+                preview=preview,
+                order_id=getattr(trade.order, "orderId", None),
+                perm_id=getattr(trade.order, "permId", None) or None,
+                message="Order submitted",
+            )
+        except Exception as e:
+            self.logger.error(f"place_order failed for {req.symbol}: {e}")
+            return self._order_response(
+                "error",
+                req=req,
+                preview=preview,
+                message=f"IBKR API error: {e}",
+            )
+
+    async def place_oca_group(
+        self,
+        orders: List[Dict],
+        oca_group_name: str,
+        oca_type: int = 1,
+    ) -> Dict:
+        """Place 2+ linked orders that cancel each other on any fill."""
+        try:
+            requests = [OrderRequest.from_kwargs(**o) for o in orders]
+            prepared = prepare_group(requests, group_name=oca_group_name, oca_type=oca_type)
+        except ValidationError as e:
+            return {
+                "status": "error",
+                "group_id": oca_group_name,
+                "orders": [],
+                "message": str(e),
+            }
+
+        previews = [make_preview(r) for r in prepared]
+
+        if not settings.enable_live_trading:
+            return {
+                "status": "blocked",
+                "group_id": oca_group_name,
+                "orders": [{"preview": p, "order_id": None, "perm_id": None} for p in previews],
+                "message": "ENABLE_LIVE_TRADING=false; OCA group not transmitted",
+            }
+
+        if any(r.dry_run for r in prepared):
+            return {
+                "status": "dry_run",
+                "group_id": oca_group_name,
+                "orders": [{"preview": p, "order_id": None, "perm_id": None} for p in previews],
+                "message": "dry_run=true on one or more legs; OCA group not transmitted",
+            }
+
+        if not await self._ensure_connected():
+            return {
+                "status": "error",
+                "group_id": oca_group_name,
+                "orders": [{"preview": p, "order_id": None, "perm_id": None} for p in previews],
+                "message": "Not connected to IBKR",
+            }
+
+        results: List[Dict] = []
+        try:
+            for req, preview in zip(prepared, previews):
+                contract = Stock(req.symbol, "SMART", "USD")
+                qualified = await self.ib.qualifyContractsAsync(contract)
+                if not qualified or not contract.conId:
+                    return {
+                        "status": "error",
+                        "group_id": oca_group_name,
+                        "orders": results,
+                        "message": f"Could not qualify contract for {req.symbol}",
+                    }
+                ib_order = build_order(req)
+                trade = self.ib.placeOrder(contract, ib_order)
+                results.append(
+                    {
+                        "preview": preview,
+                        "order_id": getattr(trade.order, "orderId", None),
+                        "perm_id": getattr(trade.order, "permId", None) or None,
+                    }
+                )
+            return {
+                "status": "submitted",
+                "group_id": oca_group_name,
+                "orders": results,
+                "message": f"OCA group of {len(results)} orders submitted",
+            }
+        except Exception as e:
+            self.logger.error(f"place_oca_group failed: {e}")
+            return {
+                "status": "error",
+                "group_id": oca_group_name,
+                "orders": results,
+                "message": f"IBKR API error: {e}",
+            }
+
+    def _order_response(
+        self,
+        status: str,
+        req: Optional[OrderRequest],
+        preview: Optional[Dict] = None,
+        preview_kwargs: Optional[Dict] = None,
+        order_id: Optional[int] = None,
+        perm_id: Optional[int] = None,
+        message: str = "",
+    ) -> Dict:
+        """Uniform response shape across all `place_order` paths."""
+        if preview is None:
+            preview = preview_kwargs or {}
+        return {
+            "status": status,
+            "order_id": order_id,
+            "perm_id": perm_id,
+            "preview": preview,
+            "message": message,
+        }
+
     def _serialize_position(self, position) -> Dict:
         """Convert Position to serializable dict."""
         return {

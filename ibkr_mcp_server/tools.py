@@ -98,7 +98,64 @@ TOOLS = [
         name="get_connection_status",
         description="Check IBKR TWS/Gateway connection status and account information",
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
-    )
+    ),
+    Tool(
+        name="place_order",
+        description=(
+            "Place a single equity order. Supports MKT, LMT, STP, STP LMT, TRAIL, "
+            "TRAIL LIMIT, LOO, MOO, LOC, MOC. Honors ENABLE_LIVE_TRADING and "
+            "MAX_ORDER_SIZE. Set dry_run=true to validate without transmitting."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "action": {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity": {"type": "integer", "minimum": 1},
+                "order_type": {
+                    "type": "string",
+                    "enum": [
+                        "MKT", "LMT", "STP", "STP LMT",
+                        "TRAIL", "TRAIL LIMIT",
+                        "LOO", "MOO", "LOC", "MOC",
+                    ],
+                },
+                "limit_price": {"type": "number"},
+                "stop_price": {"type": "number"},
+                "trail_amount": {"type": "number"},
+                "trail_percent": {"type": "number"},
+                "trail_stop_price": {"type": "number"},
+                "limit_price_offset": {"type": "number"},
+                "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "OPG"]},
+                "outside_rth": {"type": "boolean"},
+                "account": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["symbol", "action", "quantity", "order_type"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="place_oca_group",
+        description=(
+            "Place 2+ linked orders as a One-Cancels-All group. Filling any one "
+            "cancels the others. Each order uses the same schema as place_order."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "oca_group_name": {"type": "string"},
+                "oca_type": {"type": "integer", "enum": [1], "default": 1},
+                "orders": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["oca_group_name", "orders"],
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 
@@ -205,6 +262,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     text=f"Error performing short selling analysis: {str(e)}"
                 )]
                 
+        elif name == "place_order":
+            result = await ibkr_client.place_order(**arguments)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "place_oca_group":
+            result = await ibkr_client.place_oca_group(
+                orders=arguments["orders"],
+                oca_group_name=arguments["oca_group_name"],
+                oca_type=arguments.get("oca_type", 1),
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
         elif name == "get_connection_status":
             status = {
                 "connected": ibkr_client.is_connected(),
