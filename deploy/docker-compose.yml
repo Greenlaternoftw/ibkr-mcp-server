@@ -35,9 +35,11 @@ services:
     volumes:
       # Persist the per-strategy JSON state files across container restarts.
       - mcp-state:/home/trader
-    # Wait long enough for Gateway to finish logging in before we try to connect
-    # to it. The healthcheck handles steady-state restarts.
-    command: ["python", "-m", "ibkr_mcp_server", "--daemon", "--transport", "http"]
+    # The Dockerfile sets ENTRYPOINT=["python", "-m", "ibkr_mcp_server"]; compose's
+    # `command` appends to it, so we list only the CLI flags here. Wait long
+    # enough for Gateway to finish logging in before we try to connect; the
+    # healthcheck handles steady-state restarts.
+    command: ["--daemon", "--transport", "http"]
 
 volumes:
   mcp-state:
