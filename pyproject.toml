@@ -58,6 +58,10 @@ ibkr-mcp-server = "ibkr_mcp_server.main:cli"
 
 [tool.hatch.version]
 source = "vcs"
+# In a normal git checkout the version is derived from VCS tags. In Docker
+# builds (no .git in the build context) hatch-vcs uses this fallback instead
+# so the build doesn't fail. Real git checkouts override this.
+fallback-version = "0.1.0"
 
 [tool.black]
 line-length = 88
