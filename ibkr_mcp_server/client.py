@@ -1,8 +1,10 @@
 """IBKR Client with advanced trading capabilities."""
 
 import asyncio
+import datetime as dt
 import logging
-from typing import Dict, List, Optional, Union
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Union
 from decimal import Decimal
 
 from ib_async import IB, Stock, util
@@ -15,6 +17,17 @@ from .orders import (
 )
 from .oca import prepare_group
 from .regime import RegimeConfig, check_regime_from_bars
+from .reversal import (
+    DEFAULT_STATE_PATH as REVERSAL_STATE_PATH,
+    FilledTranche,
+    ReversalConfig,
+    ReversalState,
+    ReversalStatus,
+    check_reversal_signals_from_bars,
+    decide_next_action,
+    load_state as load_reversal_state,
+    save_state as save_reversal_state,
+)
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
@@ -40,6 +53,13 @@ class IBKRClient:
         # Connection state
         self._connected = False
         self._connecting = False
+
+        # Layer 3 — reversal entry: per-symbol state + background tasks.
+        # Loaded lazily on first access (so tests with isolated state paths
+        # don't read a real user's file). Layer 5 daemon will replace this.
+        self._reversal_states: Dict[str, ReversalState] | None = None
+        self._reversal_tasks: Dict[str, asyncio.Task] = {}
+        self._reversal_state_path = REVERSAL_STATE_PATH
     
     @property
     def is_paper(self) -> bool:
@@ -395,6 +415,265 @@ class IBKRClient:
         except Exception as e:
             self.logger.error(f"check_regime failed for {symbol}: {e}")
             return {"error": str(e), "symbol": symbol}
+
+    # --- Layer 3: reversal entry -------------------------------------------
+
+    def _reversal_state_dict(self) -> Dict[str, ReversalState]:
+        """Lazy-load the reversal state file on first access."""
+        if self._reversal_states is None:
+            self._reversal_states = load_reversal_state(self._reversal_state_path)
+        return self._reversal_states
+
+    def _persist_reversal_state(self) -> None:
+        save_reversal_state(self._reversal_state_dict(), self._reversal_state_path)
+
+    async def check_reversal_signals(self, symbol: str, **kwargs) -> Dict:
+        """Compute the five reversal signals and the recommended tranche.
+
+        Stateless — does NOT touch the reversal entry state machine. Use
+        `start_reversal_entry` to actually act on the signals.
+        """
+        try:
+            bars = await self.get_historical_bars(symbol, lookback_days=120)
+            min_sig = kwargs.get("min_signals_for_entry", 3)
+            return check_reversal_signals_from_bars(symbol, bars, min_sig)
+        except Exception as e:
+            self.logger.error(f"check_reversal_signals failed for {symbol}: {e}")
+            return {"error": str(e), "symbol": symbol}
+
+    async def start_reversal_entry(
+        self,
+        symbol: str,
+        total_dollars: float,
+        recheck_interval_seconds: int = 3600,
+        **config_kwargs,
+    ) -> Dict:
+        """Register a reversal entry plan and start the in-process hourly tick.
+
+        Layer 5's daemon will replace the asyncio-task tick with event-driven
+        execution; the state shape and `decide_next_action` planner are stable.
+        """
+        states = self._reversal_state_dict()
+        if symbol in states and states[symbol].status in (
+            ReversalStatus.WATCHING,
+            ReversalStatus.PARTIALLY_FILLED,
+            ReversalStatus.STALLED,
+        ):
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": f"reversal entry already running for {symbol} (status={states[symbol].status.value})",
+            }
+
+        # Build config from known kwargs only
+        valid = {f for f in ReversalConfig.__dataclass_fields__}
+        cfg = ReversalConfig(**{k: v for k, v in config_kwargs.items() if k in valid})
+
+        today = dt.date.today().isoformat()
+        states[symbol] = ReversalState(
+            symbol=symbol,
+            total_dollars=total_dollars,
+            config=cfg,
+            started_at=today,
+            last_action_at=today,
+        )
+        self._persist_reversal_state()
+
+        if symbol not in self._reversal_tasks or self._reversal_tasks[symbol].done():
+            self._reversal_tasks[symbol] = asyncio.create_task(
+                self._reversal_loop(symbol, recheck_interval_seconds)
+            )
+
+        return {
+            "status": "started",
+            "symbol": symbol,
+            "total_dollars": total_dollars,
+            "tranche_count": cfg.tranche_count,
+            "tranche_sizing": cfg.tranche_sizing,
+            "min_signals_for_entry": cfg.min_signals_for_entry,
+            "recheck_interval_seconds": recheck_interval_seconds,
+        }
+
+    async def stop_reversal_entry(self, symbol: str, action: str = "cancel") -> Dict:
+        """Stop a running reversal entry.
+
+        `action`:
+          - "cancel": stop the tick, leave filled tranches alone
+          - "liquidate_filled": stop the tick AND market-sell everything filled
+          - "convert_to_swing_loop": NOT YET IMPLEMENTED (Layer 4)
+        """
+        states = self._reversal_state_dict()
+        state = states.get(symbol)
+        if not state:
+            return {"status": "error", "message": f"no reversal entry for {symbol}"}
+
+        task = self._reversal_tasks.pop(symbol, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if action == "cancel":
+            state.status = ReversalStatus.CANCELLED
+            self._persist_reversal_state()
+            return {
+                "status": "cancelled",
+                "symbol": symbol,
+                "filled_tranches": len(state.filled_tranches),
+            }
+
+        if action == "liquidate_filled":
+            total_shares = sum(t.shares for t in state.filled_tranches)
+            sell_result: Dict[str, Any] = {"status": "noop", "message": "no filled shares"}
+            if total_shares > 0:
+                sell_result = await self.place_order(
+                    symbol=symbol, action="SELL", quantity=total_shares,
+                    order_type="MKT", tif="GTC",
+                )
+            state.status = ReversalStatus.LIQUIDATED
+            self._persist_reversal_state()
+            return {
+                "status": "liquidated",
+                "symbol": symbol,
+                "filled_tranches": len(state.filled_tranches),
+                "shares_sold": total_shares,
+                "sell_order": sell_result,
+            }
+
+        if action == "convert_to_swing_loop":
+            return {
+                "status": "not_implemented",
+                "symbol": symbol,
+                "message": "convert_to_swing_loop wires up in Layer 4 (swing strategy)",
+            }
+
+        return {"status": "error", "message": f"unknown action: {action}"}
+
+    async def get_reversal_status(self, symbol: str) -> Dict:
+        states = self._reversal_state_dict()
+        state = states.get(symbol)
+        if not state:
+            return {"status": "not_found", "symbol": symbol}
+        return {
+            "symbol": symbol,
+            "status": state.status.value,
+            "total_dollars": state.total_dollars,
+            "config": asdict(state.config),
+            "last_signal_count": state.last_signal_count,
+            "last_signal_dict": state.last_signal_dict,
+            "consecutive_days_at_threshold": state.consecutive_days_at_threshold,
+            "filled_tranches": [
+                {
+                    "index": t.index, "shares": t.shares,
+                    "target_dollars": t.target_dollars,
+                    "fill_price": t.fill_price, "filled_at": t.filled_at,
+                }
+                for t in state.filled_tranches
+            ],
+            "started_at": state.started_at,
+            "last_action_at": state.last_action_at,
+            "protective_stop_order_id": state.protective_stop_order_id,
+        }
+
+    async def _reversal_loop(self, symbol: str, interval_seconds: int) -> None:
+        """Background task: call _reversal_tick on interval until cancelled."""
+        try:
+            while True:
+                try:
+                    await self._reversal_tick(symbol)
+                except Exception as e:
+                    self.logger.exception(f"reversal tick failed for {symbol}: {e}")
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            self.logger.info(f"reversal loop for {symbol} cancelled")
+            raise
+
+    async def _reversal_tick(self, symbol: str) -> Dict:
+        """One iteration: fetch bars, plan action, execute, persist."""
+        states = self._reversal_state_dict()
+        state = states.get(symbol)
+        if not state:
+            return {"action": "missing"}
+        if state.status not in (
+            ReversalStatus.WATCHING,
+            ReversalStatus.PARTIALLY_FILLED,
+            ReversalStatus.STALLED,
+        ):
+            return {"action": "terminal", "status": state.status.value}
+
+        bars = await self.get_historical_bars(symbol, lookback_days=120)
+        today = dt.date.today()
+        decision = decide_next_action(state, bars, today)
+
+        # Update state with the latest reading regardless of action
+        state.last_signal_count = decision["signal_count"]
+        state.last_signal_dict = decision["signals"]
+        state.consecutive_days_at_threshold = decision["consecutive_days_at_threshold"]
+        state.last_check_date = today.isoformat()
+
+        action = decision["action"]
+        if action == "place_tranche":
+            idx = decision["tranche_index"]
+            target = decision["target_dollars"]
+            price_now = float(bars["close"].iloc[-1])
+            shares = int(target / price_now)
+            if shares <= 0:
+                self.logger.warning(
+                    f"reversal {symbol}: tranche {idx} target ${target:.2f} at "
+                    f"${price_now:.2f} rounds to 0 shares; holding"
+                )
+                self._persist_reversal_state()
+                return {"action": "hold", "reason": "zero_shares"}
+
+            result = await self.place_order(
+                symbol=symbol, action="BUY", quantity=shares,
+                order_type="MKT", tif="GTC",
+            )
+            if result["status"] == "submitted":
+                state.filled_tranches.append(FilledTranche(
+                    index=idx,
+                    target_dollars=target,
+                    shares=shares,
+                    fill_price=price_now,  # approximation; real fill via event in Layer 5
+                    filled_at=today.isoformat(),
+                ))
+                if idx >= state.config.tranche_count:
+                    state.status = ReversalStatus.COMPLETE
+                else:
+                    state.status = ReversalStatus.PARTIALLY_FILLED
+                state.last_action_at = today.isoformat()
+            self._persist_reversal_state()
+            return {"action": action, "result": result, "tranche_index": idx}
+
+        if action == "place_protective_stop":
+            if not state.filled_tranches:
+                return {"action": "hold", "reason": "no_tranches_to_protect"}
+            last = state.filled_tranches[-1]
+            result = await self.place_order(
+                symbol=symbol, action="SELL", quantity=last.shares,
+                order_type="STP", stop_price=decision["stop_price"], tif="GTC",
+            )
+            if result["status"] == "submitted":
+                state.protective_stop_order_id = result.get("order_id")
+                state.status = ReversalStatus.STALLED
+                state.last_action_at = today.isoformat()
+            self._persist_reversal_state()
+            return {"action": action, "result": result}
+
+        if action == "abort_stalled":
+            state.status = ReversalStatus.ABORTED
+            self._persist_reversal_state()
+            return {"action": action, "days_since": decision["days_since_last_action"]}
+
+        if action == "complete":
+            state.status = ReversalStatus.COMPLETE
+            self._persist_reversal_state()
+            return {"action": action}
+
+        self._persist_reversal_state()
+        return {"action": "hold", "signal_count": decision["signal_count"]}
 
     async def place_order(self, **kwargs) -> Dict:
         """Place a single order. Honors `ENABLE_LIVE_TRADING` and `MAX_ORDER_SIZE`.

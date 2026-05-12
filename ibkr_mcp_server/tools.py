@@ -159,6 +159,83 @@ TOOLS = [
         },
     ),
     Tool(
+        name="check_reversal_signals",
+        description=(
+            "Compute the 5 reversal signals for a symbol — bullish RSI divergence, "
+            "RSI crossing above 30, MACD bullish crossover, higher swing-low, "
+            "volume surge. Returns a signal count (0-5) and the recommended "
+            "tranche to place (0 means hold). Stateless — does not trigger an entry."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "min_signals_for_entry": {"type": "integer", "default": 3},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="start_reversal_entry",
+        description=(
+            "Start a tranched reversal entry plan for a symbol. Total capital "
+            "is split across N tranches (default 3); each tranche fires when "
+            "the signal count crosses the next threshold and has held for "
+            "signal_window_days. Stop-and-wait kicks in if signals drop after "
+            "tranche 1 fills. Runs an in-process hourly tick — Layer 5 will "
+            "replace it with a real daemon."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "total_dollars": {"type": "number", "minimum": 1},
+                "tranche_count": {"type": "integer", "minimum": 1, "default": 3},
+                "tranche_sizing": {"type": "string", "enum": ["equal", "weighted"], "default": "equal"},
+                "min_signals_for_entry": {"type": "integer", "default": 3},
+                "signal_window_days": {"type": "integer", "default": 3},
+                "stall_timeout_days": {"type": "integer", "default": 10},
+                "protective_stop_atr_multiple": {"type": "number", "default": 2.0},
+                "recheck_interval_seconds": {"type": "integer", "default": 3600},
+            },
+            "required": ["symbol", "total_dollars"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="stop_reversal_entry",
+        description=(
+            "Stop an active reversal entry. action='cancel' stops further "
+            "tranches but leaves filled tranches alone. action='liquidate_filled' "
+            "also market-sells anything filled. action='convert_to_swing_loop' "
+            "returns not_implemented until Layer 4 ships."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["cancel", "liquidate_filled", "convert_to_swing_loop"],
+                    "default": "cancel",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="get_reversal_status",
+        description="Return the current state of an active or recent reversal entry.",
+        inputSchema={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="place_oca_group",
         description=(
             "Place 2+ linked orders as a One-Cancels-All group. Filling any one "
@@ -292,6 +369,27 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         elif name == "check_regime":
             symbol = arguments.pop("symbol")
             result = await ibkr_client.check_regime(symbol, **arguments)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "check_reversal_signals":
+            symbol = arguments.pop("symbol")
+            result = await ibkr_client.check_reversal_signals(symbol, **arguments)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "start_reversal_entry":
+            symbol = arguments.pop("symbol")
+            total_dollars = arguments.pop("total_dollars")
+            result = await ibkr_client.start_reversal_entry(symbol, total_dollars, **arguments)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "stop_reversal_entry":
+            symbol = arguments.pop("symbol")
+            action = arguments.get("action", "cancel")
+            result = await ibkr_client.stop_reversal_entry(symbol, action)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "get_reversal_status":
+            result = await ibkr_client.get_reversal_status(arguments["symbol"])
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "place_oca_group":
