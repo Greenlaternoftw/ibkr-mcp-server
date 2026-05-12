@@ -29,6 +29,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "click>=8.0.0",
     "rich>=13.0.0",
+    # Layer 2 (regime filter)
+    "pandas>=2.0.0,<3.0.0",
+    "pandas_ta==0.4.71b0",
+    "numpy>=2.2.6",
 ]
 
 [project.optional-dependencies]
@@ -93,6 +97,11 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 strict_equality = true
+
+[tool.uv]
+# pandas_ta's only PyPI release is a beta (0.4.71b0), so we need to permit
+# prereleases when resolving Layer 2's dependencies.
+prerelease = "allow"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

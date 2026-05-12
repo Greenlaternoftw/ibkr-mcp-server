@@ -14,6 +14,7 @@ from .orders import (
     validate_request,
 )
 from .oca import prepare_group
+from .regime import RegimeConfig, check_regime_from_bars
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
@@ -346,6 +347,55 @@ class IBKRClient:
             self.logger.error(f"Error getting accounts: {e}")
             return {"error": str(e)}
     
+    @rate_limit(calls_per_second=0.5)
+    async def get_historical_bars(
+        self,
+        symbol: str,
+        lookback_days: int = 250,
+        bar_size: str = "1 day",
+    ) -> "pandas.DataFrame":  # type: ignore[name-defined]
+        """Daily OHLCV bars for `symbol`, most recent last.
+
+        Used by Layer 2's regime filter. `lookback_days` is calendar days; you'll
+        typically get fewer rows back because IBKR skips weekends and holidays.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        contract = Stock(symbol, "SMART", "USD")
+        await self.ib.qualifyContractsAsync(contract)
+        if not contract.conId:
+            raise RuntimeError(f"Could not qualify contract for {symbol}")
+
+        bars = await self.ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr=f"{lookback_days} D",
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        df = util.df(bars)
+        if df is None or len(df) == 0:
+            raise RuntimeError(f"No historical bars returned for {symbol}")
+        return df
+
+    async def check_regime(self, symbol: str, **overrides) -> Dict:
+        """Evaluate the Layer 2 regime filter against `symbol`'s recent bars.
+
+        `overrides` are passed to `RegimeConfig` — any subset of `adx_threshold`,
+        `atr_lookback`, `sma_period`, `sma_lookback_days`, `require_all_gates`,
+        `smoothing_days`.
+        """
+        try:
+            bars = await self.get_historical_bars(symbol, lookback_days=250)
+            config = RegimeConfig(**overrides) if overrides else RegimeConfig()
+            return check_regime_from_bars(symbol, bars, config)
+        except Exception as e:
+            self.logger.error(f"check_regime failed for {symbol}: {e}")
+            return {"error": str(e), "symbol": symbol}
+
     async def place_order(self, **kwargs) -> Dict:
         """Place a single order. Honors `ENABLE_LIVE_TRADING` and `MAX_ORDER_SIZE`.
 

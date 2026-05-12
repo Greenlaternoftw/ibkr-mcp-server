@@ -136,6 +136,29 @@ TOOLS = [
         },
     ),
     Tool(
+        name="check_regime",
+        description=(
+            "Evaluate the three-gate regime filter for a symbol. Gates: "
+            "SMA(50) trend rising, ADX(14) below threshold, ATR%(14) below "
+            "its 100-day average. Returns enabled/disabled plus the per-gate "
+            "breakdown and a consecutive-days counter for whipsaw smoothing."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "adx_threshold": {"type": "number"},
+                "atr_lookback": {"type": "integer"},
+                "sma_period": {"type": "integer"},
+                "sma_lookback_days": {"type": "integer"},
+                "require_all_gates": {"type": "boolean"},
+                "smoothing_days": {"type": "integer"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="place_oca_group",
         description=(
             "Place 2+ linked orders as a One-Cancels-All group. Filling any one "
@@ -264,6 +287,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 
         elif name == "place_order":
             result = await ibkr_client.place_order(**arguments)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "check_regime":
+            symbol = arguments.pop("symbol")
+            result = await ibkr_client.check_regime(symbol, **arguments)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "place_oca_group":

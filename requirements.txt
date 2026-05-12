@@ -4,3 +4,9 @@ pydantic>=2.0.0
 python-dotenv>=1.0.0
 click>=8.0.0
 rich>=13.0.0
+# Layer 2: regime filter — technical indicators on historical bars.
+# pandas_ta 0.3.14b0 is the last stable PyPI release (the 0.4 fork has
+# had packaging churn). Pinning to avoid surprises.
+pandas>=2.0.0,<3.0.0
+pandas_ta==0.4.71b0
+numpy>=2.2.6
