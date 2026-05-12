@@ -123,6 +123,9 @@ class IBKRClient:
             # Setup event handlers
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
+            # Layer 5a: real-time fill detection for active strategies.
+            self.ib.execDetailsEvent += self._on_exec_details_for_strategies
+            self.ib.orderStatusEvent += self._on_order_status_for_strategies
             
             # Wait for connection to stabilize
             await asyncio.sleep(2)
@@ -1118,6 +1121,135 @@ class IBKRClient:
             "preview": preview,
             "message": message,
         }
+
+    # --- Layer 5a: daemon-mode resilience ---------------------------------
+
+    def _on_exec_details_for_strategies(self, trade, fill) -> None:
+        """Real-time fill detection: when IBKR fires execDetailsEvent for an
+        order we're tracking, immediately schedule a strategy tick so we react
+        within milliseconds instead of waiting up to an hour for the next poll.
+        """
+        order_id = getattr(trade.order, "orderId", None)
+        if order_id is None:
+            return
+
+        # Match against reversal strategies
+        for symbol, state in self._reversal_state_dict().items():
+            if order_id == state.protective_stop_order_id:
+                self.logger.info(
+                    f"reversal {symbol}: fill event on protective stop {order_id}, triggering tick"
+                )
+                asyncio.create_task(self._reversal_tick(symbol))
+                return
+
+        # Match against swing strategies
+        for symbol, state in self._swing_state_dict().items():
+            tracked = (
+                state.protective_trail_order_id,
+                state.protective_stop_order_id,
+                state.dip_buy_order_id,
+            )
+            if order_id in tracked:
+                self.logger.info(
+                    f"swing {symbol}: fill event on order {order_id}, triggering tick"
+                )
+                asyncio.create_task(self._swing_tick(symbol))
+                return
+
+    def _on_order_status_for_strategies(self, trade) -> None:
+        """Order status changes (Cancelled, Filled, etc). Forward to the same
+        per-strategy tick trigger as fills — many status transitions also
+        warrant re-planning.
+        """
+        # Only react to terminal statuses to avoid tick storms.
+        status = getattr(trade.orderStatus, "status", "")
+        if status not in ("Filled", "Cancelled", "ApiCancelled"):
+            return
+        # Reuse the same lookup as fill events; same outcome (schedule a tick).
+        self._on_exec_details_for_strategies(trade, None)
+
+    async def resume_strategies_from_state(self) -> Dict[str, Any]:
+        """On daemon startup, restart asyncio tasks for any active strategies
+        that were running before the previous shutdown.
+        """
+        resumed: Dict[str, Any] = {"reversal": [], "swing": []}
+
+        # Reversal entries that were mid-execution
+        for symbol, state in self._reversal_state_dict().items():
+            if state.status in (
+                ReversalStatus.WATCHING,
+                ReversalStatus.PARTIALLY_FILLED,
+                ReversalStatus.STALLED,
+            ):
+                if symbol in self._reversal_tasks and not self._reversal_tasks[symbol].done():
+                    continue  # already running
+                self._reversal_tasks[symbol] = asyncio.create_task(
+                    self._reversal_loop(symbol, 3600)
+                )
+                resumed["reversal"].append(symbol)
+                self.logger.info(
+                    f"resumed reversal entry for {symbol} (status={state.status.value})"
+                )
+
+        # Swing strategies that were running
+        for symbol, state in self._swing_state_dict().items():
+            if state.state in (SwingState.HOLDING, SwingState.FLAT):
+                if symbol in self._swing_tasks and not self._swing_tasks[symbol].done():
+                    continue
+                self._swing_tasks[symbol] = asyncio.create_task(
+                    self._swing_loop(symbol, 3600)
+                )
+                resumed["swing"].append(symbol)
+                self.logger.info(
+                    f"resumed swing strategy for {symbol} (state={state.state.value})"
+                )
+
+        return resumed
+
+    async def reconcile_on_startup(self) -> Dict[str, Any]:
+        """Compare persisted order IDs with IBKR's current open orders.
+
+        On mismatch (stored ID not in IBKR's open list), prefer reality:
+        clear the local reference so the next tick re-plans from a clean
+        slate. Returns a summary of what was cleared.
+        """
+        if not self.is_connected() or not self.ib:
+            return {"status": "skipped", "reason": "not_connected"}
+
+        open_order_ids = {
+            t.order.orderId
+            for t in self.ib.trades()
+            if t.orderStatus.status in ("PreSubmitted", "Submitted", "PendingSubmit")
+        }
+        cleared: Dict[str, list] = {"reversal": [], "swing": []}
+
+        for symbol, state in self._reversal_state_dict().items():
+            if state.protective_stop_order_id and state.protective_stop_order_id not in open_order_ids:
+                self.logger.warning(
+                    f"reversal {symbol}: stored protective stop {state.protective_stop_order_id} "
+                    f"not in IBKR open orders; clearing local reference"
+                )
+                state.protective_stop_order_id = None
+                cleared["reversal"].append(symbol)
+
+        for symbol, state in self._swing_state_dict().items():
+            entries_cleared: list[str] = []
+            for field in ("protective_trail_order_id", "protective_stop_order_id", "dip_buy_order_id"):
+                oid = getattr(state, field)
+                if oid and oid not in open_order_ids:
+                    self.logger.warning(
+                        f"swing {symbol}: stored {field}={oid} not in IBKR open orders; clearing"
+                    )
+                    setattr(state, field, None)
+                    entries_cleared.append(field)
+            if "protective_trail_order_id" in entries_cleared or "protective_stop_order_id" in entries_cleared:
+                state.oca_group = None
+            if entries_cleared:
+                cleared["swing"].append({"symbol": symbol, "fields": entries_cleared})
+
+        self._persist_reversal_state()
+        self._persist_swing_state()
+        return {"status": "reconciled", "cleared": cleared}
 
     def _serialize_position(self, position) -> Dict:
         """Convert Position to serializable dict."""

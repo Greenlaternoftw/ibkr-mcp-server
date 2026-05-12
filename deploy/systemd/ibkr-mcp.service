@@ -1,0 +1,47 @@
+[Unit]
+Description=IBKR MCP trading daemon (Layer 5a)
+Documentation=https://github.com/Greenlaternoftw/ibkr-mcp-server
+After=network-online.target docker.service
+Wants=network-online.target
+
+# IB Gateway must be up before the daemon connects. If you're running Gateway
+# as a Docker container, this dependency keeps systemd from starting the daemon
+# before Docker is ready. If Gateway is on a different host, drop this.
+Requires=docker.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/ibkr-mcp-server
+
+# .env is loaded directly so IBKR_HOST/IBKR_PORT/ENABLE_LIVE_TRADING etc.
+# are present without source-ing a shell file.
+EnvironmentFile=/home/trader/ibkr-mcp-server/.env
+
+ExecStart=/home/trader/ibkr-mcp-server/.venv/bin/python -m ibkr_mcp_server --daemon
+
+# Always restart on crash. 5s back-off, max 5 restarts in 60s before giving up
+# (gives you time to fix things before systemd burns its retry budget).
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Send logs to journald — view with `journalctl -u ibkr-mcp -f`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ibkr-mcp
+
+# Resource hygiene
+LimitNOFILE=8192
+TimeoutStopSec=30
+
+# Security hardening (basic). Tighten further if you don't need home-dir state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

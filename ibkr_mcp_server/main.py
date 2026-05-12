@@ -99,6 +99,58 @@ async def test_connection():
         await ibkr_client.disconnect()
 
 
+async def run_daemon():
+    """Layer 5a — run as a persistent daemon.
+
+    Connects to IBKR, restores any active strategies from state files, subscribes
+    to fill events (already wired up in `IBKRClient.connect`), and keeps the
+    process alive indefinitely. Designed to run under systemd or Docker.
+
+    No stdio MCP server is started in this mode — daemon-only. Use the regular
+    `--test` path or future `--transport http` (Layer 5b) for control.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("=== IBKR MCP daemon starting ===")
+
+    try:
+        await ibkr_client.connect()
+        logger.info("connected to IBKR Gateway")
+
+        reconciled = await ibkr_client.reconcile_on_startup()
+        logger.info(f"startup reconciliation: {reconciled}")
+
+        resumed = await ibkr_client.resume_strategies_from_state()
+        logger.info(
+            f"resumed strategies: reversal={resumed['reversal']} swing={resumed['swing']}"
+        )
+
+        # Stay alive. Periodically probe the connection so we notice silent
+        # disconnects that the disconnect handler missed.
+        while True:
+            await asyncio.sleep(300)  # 5-minute heartbeat
+            if not ibkr_client.is_connected():
+                logger.warning("connection check failed, attempting reconnect")
+                try:
+                    await ibkr_client.connect()
+                    await ibkr_client.reconcile_on_startup()
+                except Exception as e:
+                    logger.error(f"reconnect attempt failed: {e}")
+            else:
+                logger.debug("heartbeat: connection ok")
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("daemon shutdown requested")
+    except Exception as e:
+        logger.exception(f"daemon error: {e}")
+        raise
+    finally:
+        try:
+            await ibkr_client.disconnect()
+        except Exception:
+            pass
+        logger.info("=== IBKR MCP daemon stopped ===")
+
+
 async def run_server():
     """Run the MCP server with connection management."""
     logger = logging.getLogger(__name__)
@@ -131,18 +183,24 @@ async def run_server():
 
 @click.command()
 @click.option('--test', is_flag=True, help='Test connection and exit')
+@click.option('--daemon', is_flag=True, help='Run as a persistent always-on daemon (Layer 5a)')
 @click.option('--log-level', default=settings.log_level, help='Logging level')
 @click.option('--log-file', default=settings.log_file, help='Log file path')
-def cli(test: bool, log_level: str, log_file: str):
+def cli(test: bool, daemon: bool, log_level: str, log_file: str):
     """IBKR MCP Server - Interactive Brokers integration for Claude."""
-    setup_logging(log_level, log_file, mcp_mode=not test)
-    
+    # MCP stdio mode requires logging to stderr so stdout stays JSON-RPC clean.
+    # `--test` and `--daemon` can use plain logging.
+    setup_logging(log_level, log_file, mcp_mode=(not test and not daemon))
+
     if test:
-        # Run connection test
         success = asyncio.run(test_connection())
         sys.exit(0 if success else 1)
+    elif daemon:
+        try:
+            asyncio.run(run_daemon())
+        except KeyboardInterrupt:
+            sys.exit(0)
     else:
-        # Run the server
         asyncio.run(run_server())
 
 
