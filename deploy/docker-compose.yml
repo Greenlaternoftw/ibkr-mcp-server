@@ -7,7 +7,7 @@ services:
     # (which is what its TrustedIPs=127.0.0.1 config allows). The same
     # arrangement we settled on for the Layer 1 verification.
     network_mode: host
-    env_file: .env
+    env_file: ../.env
     environment:
       TRADING_MODE: paper
       READ_ONLY_API: "no"
@@ -31,7 +31,7 @@ services:
     # is 127.0.0.1 in .env, which it should be for SSH-tunnel access).
     network_mode: host
     env_file:
-      - .env
+      - ../.env
     volumes:
       # Persist the per-strategy JSON state files across container restarts.
       - mcp-state:/home/trader
