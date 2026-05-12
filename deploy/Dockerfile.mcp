@@ -15,6 +15,12 @@ RUN apt-get update && \
 COPY pyproject.toml requirements.txt README.md ./
 COPY ibkr_mcp_server/ ./ibkr_mcp_server/
 
+# pyproject.toml uses `dynamic = ["version"]` with hatch-vcs, which reads the
+# version from git tags. The Docker build context has no .git directory, so
+# we tell hatchling to use a fixed pretend-version instead. The exact value
+# doesn't matter — it just has to satisfy the build backend.
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_IBKR_MCP_SERVER=0.1.0
+
 # Install with prereleases allowed (pandas_ta is currently a beta on PyPI)
 RUN uv pip install --system --prerelease=allow -e .
 
