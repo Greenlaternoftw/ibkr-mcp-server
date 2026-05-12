@@ -99,6 +99,38 @@ async def test_connection():
         await ibkr_client.disconnect()
 
 
+async def _patient_initial_connect(timeout_seconds: int = 240) -> None:
+    """Try to connect to IBKR with extended patience.
+
+    Daemon startup commonly races Gateway's own login sequence (especially in
+    Docker compose, where both containers start at the same time and Gateway
+    takes 30-60 seconds to authenticate before its API port responds). The
+    `@retry_on_failure(3)` on `connect` only gives ~7 seconds total, which
+    isn't enough. Here we retry with a longer ceiling so the daemon waits
+    patiently for Gateway to come up rather than crash-looping.
+    """
+    import time
+    logger = logging.getLogger(__name__)
+    deadline = time.time() + timeout_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await ibkr_client.connect()
+            logger.info(f"connected to IBKR Gateway (attempt {attempt})")
+            return
+        except Exception as e:
+            remaining = int(deadline - time.time())
+            if remaining <= 0:
+                logger.error(f"giving up on initial connect after {timeout_seconds}s")
+                raise
+            logger.warning(
+                f"initial connect attempt {attempt} failed ({e!s}); "
+                f"retrying in 10s (~{remaining}s remaining)"
+            )
+            await asyncio.sleep(10)
+
+
 async def run_daemon_http():
     """Layer 5b — daemon + HTTP MCP transport.
 
@@ -113,8 +145,7 @@ async def run_daemon_http():
     logger.info("=== IBKR MCP daemon (HTTP transport) starting ===")
 
     try:
-        await ibkr_client.connect()
-        logger.info("connected to IBKR Gateway")
+        await _patient_initial_connect()
 
         reconciled = await ibkr_client.reconcile_on_startup()
         logger.info(f"startup reconciliation: {reconciled}")
@@ -157,8 +188,7 @@ async def run_daemon():
     logger.info("=== IBKR MCP daemon starting ===")
 
     try:
-        await ibkr_client.connect()
-        logger.info("connected to IBKR Gateway")
+        await _patient_initial_connect()
 
         reconciled = await ibkr_client.reconcile_on_startup()
         logger.info(f"startup reconciliation: {reconciled}")
