@@ -42,16 +42,18 @@ async def main() -> None:
     expected = "dry_run" if DRY else "submitted"
 
     # S1: trailing SELL of 100 AAPL with $2 trail
+    # tif=GTC so the order persists outside RTH (paper account preset
+    # otherwise forces DAY → Gateway cancels when market is closed).
     r = await ibkr_client.place_order(
         symbol="AAPL", action="SELL", quantity=100, order_type="TRAIL",
-        trail_amount=2.0, dry_run=DRY,
+        trail_amount=2.0, tif="GTC", dry_run=DRY,
     )
     _print("S1 trailing SELL AAPL $2 trail", r, expected)
 
     # S2: 3% trailing BUY of 50 NVDA
     r = await ibkr_client.place_order(
         symbol="NVDA", action="BUY", quantity=50, order_type="TRAIL",
-        trail_percent=3.0, dry_run=DRY,
+        trail_percent=3.0, tif="GTC", dry_run=DRY,
     )
     _print("S2 trailing BUY NVDA 3% trail", r, expected)
 
@@ -60,9 +62,11 @@ async def main() -> None:
         oca_group_name="aapl-protect-smoke",
         orders=[
             {"symbol": "AAPL", "action": "SELL", "quantity": 100,
-             "order_type": "TRAIL", "trail_percent": 5.0, "dry_run": DRY},
+             "order_type": "TRAIL", "trail_percent": 5.0,
+             "tif": "GTC", "dry_run": DRY},
             {"symbol": "AAPL", "action": "SELL", "quantity": 100,
-             "order_type": "STP", "stop_price": 250.0, "dry_run": DRY},
+             "order_type": "STP", "stop_price": 250.0,
+             "tif": "GTC", "dry_run": DRY},
         ],
     )
     flag = "OK " if r["status"] == expected else "!! "
@@ -88,6 +92,18 @@ async def main() -> None:
     ok = r["status"] == "error" and "MAX_ORDER_SIZE" in r["message"]
     flag = "OK " if ok else "!! "
     print(f"{flag}S5 MAX_ORDER_SIZE cap enforced: status={r['status']}  -> {r['message']}")
+
+    if not DRY:
+        # Give Gateway a few seconds to send back any server-side reject/cancel events,
+        # then dump the actual final status of every trade we touched this run.
+        print("\n--- waiting 5s for Gateway-side status updates ---")
+        await asyncio.sleep(5)
+        print("Final order state at Gateway:")
+        for t in ibkr_client.ib.trades():
+            o, s, c = t.order, t.orderStatus, t.contract
+            oca = f"  oca={o.ocaGroup}" if o.ocaGroup else ""
+            print(f"  id={o.orderId:>4}  {c.symbol:6} {o.action:4} qty={int(o.totalQuantity):>4}  "
+                  f"{o.orderType:<10}  tif={o.tif or '-':<4}  status={s.status}{oca}")
 
     await ibkr_client.disconnect()
     print("=== done ===")
