@@ -64,7 +64,11 @@ class Settings(BaseSettings):
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
-        "case_sensitive": False
+        "case_sensitive": False,
+        # The .env file is shared with the Gateway container, which needs
+        # its own creds (TWS_USERID, TWS_PASSWORD, etc.) plus a handful of
+        # gnzsnz-image-specific vars. Don't reject those on load.
+        "extra": "ignore",
     }
 
 
