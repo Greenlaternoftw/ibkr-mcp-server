@@ -28,6 +28,18 @@ from .reversal import (
     load_state as load_reversal_state,
     save_state as save_reversal_state,
 )
+from .swing import (
+    DEFAULT_STATE_PATH as SWING_STATE_PATH,
+    SwingConfig,
+    SwingState,
+    SwingStateRecord,
+    apply_fill,
+    decide_next_action as swing_decide_next_action,
+    detect_fills_from_trades,
+    load_state as load_swing_state,
+    save_state as save_swing_state,
+)
+from .oca import make_group_id
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
@@ -60,6 +72,11 @@ class IBKRClient:
         self._reversal_states: Dict[str, ReversalState] | None = None
         self._reversal_tasks: Dict[str, asyncio.Task] = {}
         self._reversal_state_path = REVERSAL_STATE_PATH
+
+        # Layer 4 — swing-trading loop.
+        self._swing_states: Dict[str, SwingStateRecord] | None = None
+        self._swing_tasks: Dict[str, asyncio.Task] = {}
+        self._swing_state_path = SWING_STATE_PATH
     
     @property
     def is_paper(self) -> bool:
@@ -543,13 +560,271 @@ class IBKRClient:
             }
 
         if action == "convert_to_swing_loop":
+            if not state.filled_tranches:
+                return {
+                    "status": "error",
+                    "symbol": symbol,
+                    "message": "no filled tranches to convert",
+                }
+            total_shares = sum(t.shares for t in state.filled_tranches)
+            avg_cost = sum(t.shares * t.fill_price for t in state.filled_tranches) / total_shares
+            # Hand off with default swing config; caller can refine via
+            # update_swing_params after the handoff.
+            handoff_result = await self.start_swing_strategy(
+                symbol=symbol,
+                quantity=total_shares,
+                cost_basis=round(avg_cost, 2),
+                dip_percent=3.0,           # conservative default re-entry
+                trail_atr_multiplier=2.0,
+            )
+            state.status = ReversalStatus.COMPLETE
+            self._persist_reversal_state()
             return {
-                "status": "not_implemented",
+                "status": "converted",
                 "symbol": symbol,
-                "message": "convert_to_swing_loop wires up in Layer 4 (swing strategy)",
+                "handoff": {"shares": total_shares, "cost_basis": round(avg_cost, 2)},
+                "swing": handoff_result,
             }
 
         return {"status": "error", "message": f"unknown action: {action}"}
+
+    # --- Layer 4: swing-trading loop ---------------------------------------
+
+    def _swing_state_dict(self) -> Dict[str, SwingStateRecord]:
+        if self._swing_states is None:
+            self._swing_states = load_swing_state(self._swing_state_path)
+        return self._swing_states
+
+    def _persist_swing_state(self) -> None:
+        save_swing_state(self._swing_state_dict(), self._swing_state_path)
+
+    async def start_swing_strategy(
+        self,
+        symbol: str,
+        quantity: int,
+        cost_basis: float,
+        recheck_interval_seconds: int = 3600,
+        **config_kwargs: Any,
+    ) -> Dict:
+        """Register a swing strategy and start the in-process hourly tick."""
+        if quantity <= 0:
+            return {"status": "error", "message": "quantity must be > 0"}
+        if cost_basis <= 0:
+            return {"status": "error", "message": "cost_basis must be > 0"}
+
+        valid = {f for f in SwingConfig.__dataclass_fields__}
+        cfg = SwingConfig(**{k: v for k, v in config_kwargs.items() if k in valid})
+
+        # Validate dip_amount XOR dip_percent
+        has_amt = cfg.dip_amount is not None
+        has_pct = cfg.dip_percent is not None
+        if has_amt == has_pct:
+            return {
+                "status": "error",
+                "message": "specify exactly one of dip_amount or dip_percent",
+            }
+
+        states = self._swing_state_dict()
+        if symbol in states and states[symbol].state is not SwingState.STOPPED:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": f"swing strategy already active for {symbol} "
+                           f"(state={states[symbol].state.value})",
+            }
+
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        states[symbol] = SwingStateRecord(
+            symbol=symbol,
+            quantity=int(quantity),
+            cost_basis=float(cost_basis),
+            config=cfg,
+            state=SwingState.HOLDING,
+            started_at=now,
+            last_tick_at=now,
+        )
+        self._persist_swing_state()
+
+        if symbol not in self._swing_tasks or self._swing_tasks[symbol].done():
+            self._swing_tasks[symbol] = asyncio.create_task(
+                self._swing_loop(symbol, recheck_interval_seconds)
+            )
+
+        return {
+            "status": "started",
+            "symbol": symbol,
+            "quantity": quantity,
+            "cost_basis": cost_basis,
+            "config": asdict(cfg),
+            "recheck_interval_seconds": recheck_interval_seconds,
+        }
+
+    async def stop_swing_strategy(self, symbol: str) -> Dict:
+        """Cancel any open swing orders and stop the loop."""
+        states = self._swing_state_dict()
+        state = states.get(symbol)
+        if not state:
+            return {"status": "error", "message": f"no swing strategy for {symbol}"}
+
+        task = self._swing_tasks.pop(symbol, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Cancel any open orders we know about
+        cancelled: list[int] = []
+        for oid_field in (
+            "protective_trail_order_id",
+            "protective_stop_order_id",
+            "dip_buy_order_id",
+        ):
+            oid = getattr(state, oid_field)
+            if not oid or not self.ib:
+                continue
+            for trade in self.ib.trades():
+                if trade.order.orderId == oid and trade.orderStatus.status in (
+                    "PreSubmitted", "Submitted", "PendingSubmit"
+                ):
+                    self.ib.cancelOrder(trade.order)
+                    cancelled.append(oid)
+                    break
+            setattr(state, oid_field, None)
+
+        state.state = SwingState.STOPPED
+        self._persist_swing_state()
+        return {
+            "status": "stopped",
+            "symbol": symbol,
+            "cancelled_order_ids": cancelled,
+            "last_state": state.state.value,
+        }
+
+    async def get_swing_status(self, symbol: str) -> Dict:
+        state = self._swing_state_dict().get(symbol)
+        if not state:
+            return {"status": "not_found", "symbol": symbol}
+        return {
+            "symbol": symbol,
+            "state": state.state.value,
+            "quantity": state.quantity,
+            "cost_basis": state.cost_basis,
+            "config": asdict(state.config),
+            "protective_trail_order_id": state.protective_trail_order_id,
+            "protective_stop_order_id": state.protective_stop_order_id,
+            "oca_group": state.oca_group,
+            "dip_buy_order_id": state.dip_buy_order_id,
+            "last_fill_action": state.last_fill_action,
+            "last_fill_price": state.last_fill_price,
+            "last_fill_time": state.last_fill_time,
+            "last_regime_enabled": state.last_regime_enabled,
+            "started_at": state.started_at,
+            "last_tick_at": state.last_tick_at,
+        }
+
+    async def update_swing_params(self, symbol: str, **params: Any) -> Dict:
+        state = self._swing_state_dict().get(symbol)
+        if not state:
+            return {"status": "error", "message": f"no swing strategy for {symbol}"}
+        valid = {f for f in SwingConfig.__dataclass_fields__}
+        applied = {}
+        for k, v in params.items():
+            if k in valid:
+                setattr(state.config, k, v)
+                applied[k] = v
+        self._persist_swing_state()
+        return {"status": "updated", "symbol": symbol, "applied": applied}
+
+    async def _swing_loop(self, symbol: str, interval_seconds: int) -> None:
+        try:
+            while True:
+                try:
+                    await self._swing_tick(symbol)
+                except Exception as e:
+                    self.logger.exception(f"swing tick failed for {symbol}: {e}")
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            self.logger.info(f"swing loop for {symbol} cancelled")
+            raise
+
+    async def _swing_tick(self, symbol: str) -> Dict:
+        states = self._swing_state_dict()
+        state = states.get(symbol)
+        if not state or state.state is SwingState.STOPPED:
+            return {"action": "stopped"}
+
+        now = dt.datetime.now(dt.timezone.utc)
+        bars = await self.get_historical_bars(symbol, lookback_days=120)
+
+        # 1. Detect fills since last tick
+        trades = list(self.ib.trades()) if self.ib else []
+        fills = detect_fills_from_trades(state, trades)
+        for fill in fills:
+            apply_fill(state, fill)
+
+        # 2. Optional regime check (uses 250d of bars — separate call)
+        regime_enabled = True
+        if state.config.regime_filter_enabled:
+            try:
+                regime_bars = await self.get_historical_bars(symbol, lookback_days=250)
+                from .regime import check_regime_from_bars as _crfb
+                regime_result = _crfb(symbol, regime_bars)
+                regime_enabled = regime_result.get("enabled", True)
+                state.last_regime_enabled = regime_enabled
+            except Exception as e:
+                self.logger.warning(
+                    f"swing tick regime check failed for {symbol}: {e}"
+                )
+
+        # 3. Plan
+        decision = swing_decide_next_action(state, bars, regime_enabled, now)
+        action = decision["action"]
+
+        # 4. Execute
+        if action == "place_protective_oca":
+            grp = make_group_id(f"swing-{symbol.lower()}")
+            result = await self.place_oca_group(
+                oca_group_name=grp,
+                orders=[
+                    {"symbol": symbol, "action": "SELL", "quantity": state.quantity,
+                     "order_type": "TRAIL", "trail_amount": decision["trail_amount"],
+                     "tif": "GTC"},
+                    {"symbol": symbol, "action": "SELL", "quantity": state.quantity,
+                     "order_type": "STP", "stop_price": decision["floor_price"],
+                     "tif": "GTC"},
+                ],
+            )
+            if result["status"] == "submitted" and len(result.get("orders", [])) == 2:
+                state.protective_trail_order_id = result["orders"][0].get("order_id")
+                state.protective_stop_order_id = result["orders"][1].get("order_id")
+                state.oca_group = grp
+
+        elif action == "place_dip_buy":
+            result = await self.place_order(
+                symbol=symbol, action="BUY", quantity=decision["quantity"],
+                order_type="LMT", limit_price=decision["limit_price"], tif="GTC",
+            )
+            if result["status"] == "submitted":
+                state.dip_buy_order_id = result.get("order_id")
+
+        elif action == "cancel_dip_buy":
+            if state.dip_buy_order_id and self.ib:
+                for trade in trades:
+                    if trade.order.orderId == state.dip_buy_order_id:
+                        self.ib.cancelOrder(trade.order)
+                        break
+            state.dip_buy_order_id = None
+
+        state.last_tick_at = now.isoformat()
+        self._persist_swing_state()
+        return {
+            "action": action,
+            "fills": [{"role": f.role, "price": f.fill_price} for f in fills],
+            "decision": {k: v for k, v in decision.items() if k != "action"},
+            "regime_enabled": regime_enabled,
+        }
 
     async def get_reversal_status(self, symbol: str) -> Dict:
         states = self._reversal_state_dict()

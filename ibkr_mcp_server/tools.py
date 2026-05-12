@@ -236,6 +236,78 @@ TOOLS = [
         },
     ),
     Tool(
+        name="start_swing_strategy",
+        description=(
+            "Start the Layer 4 swing-trading loop on an existing position. "
+            "Places an OCA protective pair (trailing SELL + hard STP at "
+            "cost_basis - floor_offset), then on a fill re-enters via a LMT BUY "
+            "at the dip price. Specify EXACTLY ONE of dip_amount or dip_percent."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "quantity": {"type": "integer", "minimum": 1},
+                "cost_basis": {"type": "number", "minimum": 0.01},
+                "trail_atr_multiplier": {"type": "number", "default": 2.0},
+                "floor_offset": {"type": "number", "default": 0.0},
+                "dip_amount": {"type": "number"},
+                "dip_percent": {"type": "number"},
+                "regime_filter_enabled": {"type": "boolean", "default": True},
+                "require_close_confirmation": {"type": "boolean", "default": True},
+                "require_volume_confirmation": {"type": "boolean", "default": False},
+                "volume_threshold_multiplier": {"type": "number", "default": 1.0},
+                "cooldown_hours": {"type": "integer", "default": 24},
+                "recheck_interval_seconds": {"type": "integer", "default": 3600},
+            },
+            "required": ["symbol", "quantity", "cost_basis"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="stop_swing_strategy",
+        description="Cancel all open swing orders and stop the loop for `symbol`.",
+        inputSchema={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="get_swing_status",
+        description="Return the current state of a swing strategy (state machine, open orders, last fill).",
+        inputSchema={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="update_swing_params",
+        description=(
+            "Adjust an active swing strategy's tuning (trail multiplier, dip, "
+            "floor, gates, etc.) without stopping the loop. Unknown params are ignored."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "trail_atr_multiplier": {"type": "number"},
+                "floor_offset": {"type": "number"},
+                "dip_amount": {"type": "number"},
+                "dip_percent": {"type": "number"},
+                "regime_filter_enabled": {"type": "boolean"},
+                "require_volume_confirmation": {"type": "boolean"},
+                "volume_threshold_multiplier": {"type": "number"},
+                "cooldown_hours": {"type": "integer"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="place_oca_group",
         description=(
             "Place 2+ linked orders as a One-Cancels-All group. Filling any one "
@@ -390,6 +462,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
         elif name == "get_reversal_status":
             result = await ibkr_client.get_reversal_status(arguments["symbol"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "start_swing_strategy":
+            symbol = arguments.pop("symbol")
+            quantity = arguments.pop("quantity")
+            cost_basis = arguments.pop("cost_basis")
+            result = await ibkr_client.start_swing_strategy(
+                symbol, quantity, cost_basis, **arguments
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "stop_swing_strategy":
+            result = await ibkr_client.stop_swing_strategy(arguments["symbol"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "get_swing_status":
+            result = await ibkr_client.get_swing_status(arguments["symbol"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "update_swing_params":
+            symbol = arguments.pop("symbol")
+            result = await ibkr_client.update_swing_params(symbol, **arguments)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "place_oca_group":
