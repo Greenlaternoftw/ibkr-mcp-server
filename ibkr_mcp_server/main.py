@@ -13,7 +13,7 @@ from rich.logging import RichHandler
 
 from .client import ibkr_client
 from .config import settings
-from .tools import server
+from .tools import TOOLS, server
 
 
 console = Console()
@@ -81,13 +81,13 @@ async def test_connection():
         
         # Test basic functionality
         console.print("🔍 Testing basic functionality...")
-        accounts = await ibkr_client.get_accounts()
-        console.print(f"📊 Found {len(accounts)} accounts")
-        
-        # Test tools
+        accounts_info = await ibkr_client.get_accounts()
+        available = accounts_info.get("available_accounts") or []
+        console.print(f"📊 Found {len(available)} accounts: {available}")
+
+        # Tool registry sanity check
         console.print("🛠️ Testing MCP tools...")
-        tools = server.list_tools()
-        console.print(f"⚙️ Loaded {len(tools)} tools")
+        console.print(f"⚙️ Loaded {len(TOOLS)} tools: {[t.name for t in TOOLS]}")
         
         console.print("[bold green]✅ All tests passed![/bold green]")
         return True
