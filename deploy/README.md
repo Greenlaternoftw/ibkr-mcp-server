@@ -1,12 +1,13 @@
-# Deploying the IBKR MCP daemon (Layer 5a)
+# Deploying the IBKR MCP daemon
 
-This directory contains the artefacts you need to run the daemon as a 24/7
-service on the VPS that hosts IB Gateway.
+This directory contains the artefacts to run the daemon as a 24/7 service
+on the VPS that hosts IB Gateway. Two paths:
 
-For now (Layer 5a), the daemon is **always-on without an MCP listener** —
-the trading strategies tick by themselves; you control them via SSH'd Python
-invocations as you have been. Layer 5b will swap stdio for a remote-reachable
-HTTP transport.
+- **Layer 5a (systemd, no MCP listener)** — daemon runs strategies; you SSH
+  in to register/inspect them. Section below.
+- **Layer 5b (Docker compose, HTTP MCP transport)** — Gateway + daemon
+  come up together; remote clients call MCP tools over HTTPS/bearer auth.
+  Section further down.
 
 ## What you get from Layer 5a
 
@@ -126,3 +127,88 @@ daemon bounce.
   and IBKR will reject the second one. Either use different client IDs in
   separate `.env` files, or stop the daemon before running ad-hoc commands
   that connect to IBKR.
+
+---
+
+# Layer 5b — Docker compose + HTTP MCP transport
+
+Brings up Gateway and the MCP daemon together in two containers, with the
+MCP protocol exposed over HTTP at `127.0.0.1:8765/mcp`. Adds bearer auth
+for any non-localhost bind.
+
+## Install (one-time)
+
+On the VPS:
+
+```bash
+# 1. Stop the systemd daemon if you previously installed Layer 5a — Docker
+#    will run the daemon instead.
+sudo systemctl stop ibkr-mcp     2>/dev/null || true
+sudo systemctl disable ibkr-mcp  2>/dev/null || true
+
+# 2. Make sure .env is configured. The Layer 5b additions are MCP_BIND_HOST,
+#    MCP_BIND_PORT, MCP_AUTH_TOKEN — see .env.example. For local-only access
+#    via SSH tunnel, leave MCP_BIND_HOST=127.0.0.1 and you can omit the
+#    token. For Tailscale or any other shared network, generate a token:
+openssl rand -hex 32
+#    and put it in MCP_AUTH_TOKEN (mode 600 on the .env file).
+
+# 3. Build and start
+cd ~/ibkr-mcp-server/deploy
+docker compose up -d --build
+
+# 4. Verify both containers are healthy
+docker compose ps
+# Expected: ib-gateway and ibkr-mcp both "Up" — ibkr-mcp also "healthy"
+# (after ~90 seconds — first start waits on Gateway to log in).
+
+# 5. Health check the MCP transport directly
+curl -s http://127.0.0.1:8765/healthz | python -m json.tool
+# Expected: {"status":"ok","ibkr_connected":true,"swing_strategies":0,...}
+```
+
+## Reaching the MCP endpoint from your laptop
+
+Two options.
+
+### A. SSH tunnel (simplest, no extra software)
+
+```bash
+# On your laptop, in a dedicated terminal (keep open):
+ssh -N -L 8765:127.0.0.1:8765 trader@your-vps
+
+# Then any local tool that speaks MCP-over-HTTP can connect to
+# http://127.0.0.1:8765/mcp on your laptop, which tunnels to the daemon.
+```
+
+### B. Tailscale (or any private mesh)
+
+1. Install Tailscale on both the VPS and your laptop, join the same tailnet.
+2. In `.env`, change `MCP_BIND_HOST` to the VPS's tailscale IP (e.g.
+   `100.x.x.x`). The daemon will refuse to start unless `MCP_AUTH_TOKEN` is
+   also set — set one with `openssl rand -hex 32`.
+3. `docker compose up -d --force-recreate` to pick up the new bind.
+4. From your laptop, the MCP endpoint is at `http://100.x.x.x:8765/mcp`
+   with `Authorization: Bearer <token>`.
+
+## Daily operations (Docker version)
+
+- **View logs**: `docker compose logs -f ibkr-mcp`
+- **Restart MCP only** (after code update): `docker compose up -d --build ibkr-mcp`
+- **Restart everything**: `docker compose restart`
+- **Stop everything**: `docker compose down`
+- **Inspect strategy state**: state files are inside the `mcp-state` Docker
+  volume. Easiest path: `docker compose exec ibkr-mcp ls /home/trader/`
+
+## Differences from Layer 5a (systemd)
+
+| | systemd (5a) | Docker (5b) |
+|---|---|---|
+| Gateway managed by | You (separate docker run) | Same compose file |
+| MCP protocol exposed | ❌ — SSH + Python | ✅ HTTP at `:8765/mcp` |
+| State files | `~trader/.ibkr-mcp-*-state.json` (on host) | Docker volume `ibkr-mcp-state` |
+| Updates | `git pull && systemctl restart ibkr-mcp` | `git pull && docker compose up -d --build ibkr-mcp` |
+| Logs | `journalctl -u ibkr-mcp` | `docker compose logs ibkr-mcp` |
+
+You should pick **one or the other** — running both simultaneously will fight
+over `IBKR_CLIENT_ID=1`.

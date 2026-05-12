@@ -99,6 +99,50 @@ async def test_connection():
         await ibkr_client.disconnect()
 
 
+async def run_daemon_http():
+    """Layer 5b — daemon + HTTP MCP transport.
+
+    Same lifecycle as `run_daemon`, but also starts a Starlette HTTP server
+    on `MCP_BIND_HOST:MCP_BIND_PORT` so remote MCP clients can call tools.
+    The HTTP server runs the protocol over streamable HTTP at `/mcp` with
+    `/healthz` for unauthenticated monitoring probes.
+    """
+    from .http_server import run_http_server
+
+    logger = logging.getLogger(__name__)
+    logger.info("=== IBKR MCP daemon (HTTP transport) starting ===")
+
+    try:
+        await ibkr_client.connect()
+        logger.info("connected to IBKR Gateway")
+
+        reconciled = await ibkr_client.reconcile_on_startup()
+        logger.info(f"startup reconciliation: {reconciled}")
+
+        resumed = await ibkr_client.resume_strategies_from_state()
+        logger.info(
+            f"resumed strategies: reversal={resumed['reversal']} swing={resumed['swing']}"
+        )
+
+        await run_http_server(
+            host=settings.mcp_bind_host,
+            port=settings.mcp_bind_port,
+            auth_token=settings.mcp_auth_token,
+        )
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("daemon shutdown requested")
+    except Exception as e:
+        logger.exception(f"daemon error: {e}")
+        raise
+    finally:
+        try:
+            await ibkr_client.disconnect()
+        except Exception:
+            pass
+        logger.info("=== IBKR MCP daemon (HTTP transport) stopped ===")
+
+
 async def run_daemon():
     """Layer 5a — run as a persistent daemon.
 
@@ -184,24 +228,61 @@ async def run_server():
 @click.command()
 @click.option('--test', is_flag=True, help='Test connection and exit')
 @click.option('--daemon', is_flag=True, help='Run as a persistent always-on daemon (Layer 5a)')
+@click.option('--transport', type=click.Choice(['stdio', 'http']), default='stdio',
+              help='MCP transport: stdio (default) or http (Layer 5b)')
 @click.option('--log-level', default=settings.log_level, help='Logging level')
 @click.option('--log-file', default=settings.log_file, help='Log file path')
-def cli(test: bool, daemon: bool, log_level: str, log_file: str):
+def cli(test: bool, daemon: bool, transport: str, log_level: str, log_file: str):
     """IBKR MCP Server - Interactive Brokers integration for Claude."""
     # MCP stdio mode requires logging to stderr so stdout stays JSON-RPC clean.
-    # `--test` and `--daemon` can use plain logging.
-    setup_logging(log_level, log_file, mcp_mode=(not test and not daemon))
+    # Other modes (test, daemon, http transport) can use plain logging.
+    mcp_stdio_mode = (transport == 'stdio' and not daemon and not test)
+    setup_logging(log_level, log_file, mcp_mode=mcp_stdio_mode)
 
     if test:
         success = asyncio.run(test_connection())
         sys.exit(0 if success else 1)
+    elif daemon and transport == 'http':
+        try:
+            asyncio.run(run_daemon_http())
+        except KeyboardInterrupt:
+            sys.exit(0)
     elif daemon:
         try:
             asyncio.run(run_daemon())
         except KeyboardInterrupt:
             sys.exit(0)
+    elif transport == 'http':
+        # HTTP transport without --daemon: still need to connect, but skip
+        # state recovery (operator probably testing the transport itself).
+        try:
+            asyncio.run(_run_http_only())
+        except KeyboardInterrupt:
+            sys.exit(0)
     else:
         asyncio.run(run_server())
+
+
+async def _run_http_only() -> None:
+    """HTTP transport without the daemon lifecycle. Mainly for testing the
+    transport in isolation; production uses `--daemon --transport http`."""
+    from .http_server import run_http_server
+    logger = logging.getLogger(__name__)
+    logger.info("=== IBKR MCP HTTP transport (no daemon) starting ===")
+    try:
+        await ibkr_client.connect()
+        await run_http_server(
+            host=settings.mcp_bind_host,
+            port=settings.mcp_bind_port,
+            auth_token=settings.mcp_auth_token,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            await ibkr_client.disconnect()
+        except Exception:
+            pass
 
 
 async def main():

@@ -1,0 +1,34 @@
+FROM python:3.12-slim
+
+# Non-root user for the daemon (state files live in its home dir)
+RUN useradd --create-home --shell /bin/bash trader
+
+WORKDIR /app
+
+# Install build deps + uv for fast resolution
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir uv
+
+# Copy just what we need to install the package
+COPY pyproject.toml requirements.txt README.md ./
+COPY ibkr_mcp_server/ ./ibkr_mcp_server/
+
+# Install with prereleases allowed (pandas_ta is currently a beta on PyPI)
+RUN uv pip install --system --prerelease=allow -e .
+
+# Drop privileges
+RUN chown -R trader:trader /app /home/trader
+USER trader
+
+# Healthcheck hits /healthz (which doesn't require auth)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD python -c "import urllib.request, sys; \
+      r = urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=5); \
+      sys.exit(0 if r.status == 200 else 1)" || exit 1
+
+EXPOSE 8765
+
+ENTRYPOINT ["python", "-m", "ibkr_mcp_server"]
+CMD ["--daemon", "--transport", "http"]

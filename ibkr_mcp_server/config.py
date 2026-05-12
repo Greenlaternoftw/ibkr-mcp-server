@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # MCP Server
     mcp_server_name: str = "ibkr-mcp"
     mcp_server_version: str = "1.0.0"
+
+    # Layer 5b — HTTP transport
+    mcp_bind_host: str = "127.0.0.1"
+    mcp_bind_port: int = 8765
+    mcp_auth_token: Optional[str] = None
     
     @field_validator('ibkr_managed_accounts')
     @classmethod

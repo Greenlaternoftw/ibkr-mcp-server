@@ -1,0 +1,44 @@
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    restart: unless-stopped
+    # Host networking so Gateway sees connections as coming from 127.0.0.1
+    # (which is what its TrustedIPs=127.0.0.1 config allows). The same
+    # arrangement we settled on for the Layer 1 verification.
+    network_mode: host
+    env_file: .env
+    environment:
+      TRADING_MODE: paper
+      READ_ONLY_API: "no"
+      TWS_ACCEPT_INCOMING: accept
+      TIME_ZONE: America/New_York
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_2FA_TIMEOUT: "yes"
+      BYPASS_WARNING: "yes"
+
+  ibkr-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp
+    container_name: ibkr-mcp
+    restart: unless-stopped
+    depends_on:
+      - ib-gateway
+    # Also host networking — the daemon needs to reach 127.0.0.1:4002 (Gateway)
+    # via the same loopback Gateway is bound to. This also publishes the MCP
+    # HTTP port directly on the host's 127.0.0.1:8765 (assuming MCP_BIND_HOST
+    # is 127.0.0.1 in .env, which it should be for SSH-tunnel access).
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      # Persist the per-strategy JSON state files across container restarts.
+      - mcp-state:/home/trader
+    # Wait long enough for Gateway to finish logging in before we try to connect
+    # to it. The healthcheck handles steady-state restarts.
+    command: ["python", "-m", "ibkr_mcp_server", "--daemon", "--transport", "http"]
+
+volumes:
+  mcp-state:
+    name: ibkr-mcp-state
