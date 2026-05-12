@@ -285,6 +285,24 @@ TOOLS = [
         },
     ),
     Tool(
+        name="tick_now",
+        description=(
+            "Force an immediate tick on an active swing or reversal strategy. "
+            "Useful for testing, after a manual config change, or to react to "
+            "market news without waiting for the next scheduled tick (default "
+            "1 hour). Returns the action the tick took."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "kind": {"type": "string", "enum": ["swing", "reversal"], "default": "swing"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="update_swing_params",
         description=(
             "Adjust an active swing strategy's tuning (trail multiplier, dip, "
@@ -479,6 +497,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
         elif name == "get_swing_status":
             result = await ibkr_client.get_swing_status(arguments["symbol"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "tick_now":
+            kind = arguments.get("kind", "swing")
+            result = await ibkr_client.tick_now(arguments["symbol"], kind=kind)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "update_swing_params":

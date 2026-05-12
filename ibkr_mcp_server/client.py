@@ -727,18 +727,93 @@ class IBKRClient:
             "last_tick_at": state.last_tick_at,
         }
 
+    # Parameters that affect *live* orders. Changing any of these means the
+    # active OCA pair (HOLDING) or dip-buy (FLAT) no longer matches user intent
+    # and must be cancelled so the next tick re-places it with new values.
+    _STRUCTURAL_SWING_PARAMS = {
+        "trail_atr_multiplier",
+        "floor_offset",
+        "dip_amount",
+        "dip_percent",
+    }
+
     async def update_swing_params(self, symbol: str, **params: Any) -> Dict:
+        """Update swing config and reconcile broker-side orders.
+
+        If any STRUCTURAL parameter changed (one that affects the live OCA or
+        dip-buy), the corresponding orders are cancelled and a tick is fired
+        immediately so the new params reach the broker within a second.
+        Non-structural params (regime_filter_enabled, cooldown_hours, etc.)
+        take effect on the next regularly-scheduled tick.
+        """
         state = self._swing_state_dict().get(symbol)
         if not state:
             return {"status": "error", "message": f"no swing strategy for {symbol}"}
+
         valid = {f for f in SwingConfig.__dataclass_fields__}
-        applied = {}
+        applied: Dict[str, Any] = {}
         for k, v in params.items():
             if k in valid:
                 setattr(state.config, k, v)
                 applied[k] = v
+
+        structural_changed = bool(set(applied.keys()) & self._STRUCTURAL_SWING_PARAMS)
+        cancelled: list[int] = []
+
+        if structural_changed and self.ib and self.is_connected():
+            # Cancel any live orders that were built with the OLD config.
+            for field in (
+                "protective_trail_order_id",
+                "protective_stop_order_id",
+                "dip_buy_order_id",
+            ):
+                oid = getattr(state, field)
+                if not oid:
+                    continue
+                for trade in self.ib.trades():
+                    if (
+                        trade.order.orderId == oid
+                        and trade.orderStatus.status in (
+                            "PreSubmitted", "Submitted", "PendingSubmit"
+                        )
+                    ):
+                        self.ib.cancelOrder(trade.order)
+                        cancelled.append(oid)
+                        break
+                setattr(state, field, None)
+            state.oca_group = None
+
         self._persist_swing_state()
-        return {"status": "updated", "symbol": symbol, "applied": applied}
+
+        # Fire an immediate tick so the new params reach the broker now.
+        if structural_changed:
+            asyncio.create_task(self._swing_tick(symbol))
+
+        return {
+            "status": "updated",
+            "symbol": symbol,
+            "applied": applied,
+            "structural_changed": structural_changed,
+            "cancelled_order_ids": cancelled,
+            "note": (
+                "Structural change — old orders cancelled, new ones will be placed by the immediate tick."
+                if structural_changed else
+                "Non-structural change — takes effect on next tick."
+            ),
+        }
+
+    async def tick_now(self, symbol: str, kind: str = "swing") -> Dict:
+        """Force an immediate strategy tick. Useful for testing or after a
+        manual config change. `kind` is "swing" or "reversal"."""
+        if kind == "swing":
+            if symbol not in self._swing_state_dict():
+                return {"status": "error", "message": f"no swing strategy for {symbol}"}
+            return await self._swing_tick(symbol)
+        if kind == "reversal":
+            if symbol not in self._reversal_state_dict():
+                return {"status": "error", "message": f"no reversal entry for {symbol}"}
+            return await self._reversal_tick(symbol)
+        return {"status": "error", "message": f"unknown kind: {kind}"}
 
     async def _swing_loop(self, symbol: str, interval_seconds: int) -> None:
         try:
