@@ -341,6 +341,11 @@ TOOLS = [
                     "minItems": 2,
                     "items": {"type": "object"},
                 },
+                "dry_run": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Validate every leg and return a preview without transmission.",
+                },
             },
             "required": ["oca_group_name", "orders"],
             "additionalProperties": False,
@@ -514,6 +519,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 orders=arguments["orders"],
                 oca_group_name=arguments["oca_group_name"],
                 oca_type=arguments.get("oca_type", 1),
+                dry_run=arguments.get("dry_run", False),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 

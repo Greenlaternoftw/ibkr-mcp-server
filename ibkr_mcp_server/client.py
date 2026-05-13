@@ -7,7 +7,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, util
+from ib_async import IB, MarketOrder, Stock, util
 from .config import settings
 from .orders import (
     OrderRequest,
@@ -41,6 +41,29 @@ from .swing import (
 )
 from .oca import make_group_id
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
+
+
+def _classify_shortable(raw: Optional[float]) -> str:
+    """Map IB's log-encoded shortableShares to a human-readable category.
+
+    IBKR reports shortable availability on a log-ish scale where values >= 3.0
+    mean "plenty available" (easy to borrow), 2.5–3.0 means "hard but possible",
+    and below 2.5 / negative typically means unavailable. Values are an
+    approximation of orders of magnitude (so 3.0 ~= 1000 shares, 4.0 ~=
+    10000), but the exact thresholds vary by broker tier — verify against
+    your account if precision matters.
+    """
+    if raw is None:
+        return "unknown"
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return "unknown"
+    if v >= 3.0:
+        return "easy_to_borrow"
+    if v >= 2.5:
+        return "hard_to_borrow"
+    return "not_available"
 
 
 class IBKRClient:
@@ -77,6 +100,20 @@ class IBKRClient:
         self._swing_states: Dict[str, SwingStateRecord] | None = None
         self._swing_tasks: Dict[str, asyncio.Task] = {}
         self._swing_state_path = SWING_STATE_PATH
+
+        # Bug class #5/#6/#7 — single bad IB call could wedge the entire server
+        # via unbounded awaits on a shared connection. Three defences:
+        #   1. _order_lock serializes order placements so a slow one can't
+        #      interleave with another order. Reads stay parallel.
+        #   2. _bounded() wraps every IB API call in asyncio.wait_for so no
+        #      single call can hang the handler longer than its timeout.
+        #   3. _reset_on_timeout() force-disconnects+reconnects when an IB
+        #      call times out, clearing any stuck waits in the underlying
+        #      ib_async event loop. This is what prevents the *whole-server*
+        #      wedge — without it, even after a timeout returns, the next
+        #      call inherits the same broken state.
+        self._order_lock = asyncio.Lock()
+        self._resetting = False
     
     @property
     def is_paper(self) -> bool:
@@ -87,13 +124,61 @@ class IBKRClient:
         """Ensure IBKR connection is active, reconnect if needed."""
         if self.is_connected():
             return True
-        
+
         try:
             await self.connect()
             return self.is_connected()
         except Exception as e:
             self.logger.error(f"Failed to ensure connection: {e}")
             return False
+
+    # --- IB call safety helpers (Bug #5/#6/#7 defences) -------------------
+
+    # Default per-call timeouts. Tune per operation if needed.
+    DEFAULT_IB_TIMEOUT = 10.0
+    QUALIFY_TIMEOUT = 5.0
+    ORDER_ACK_TIMEOUT = 5.0
+    HISTDATA_TIMEOUT = 20.0
+    SUMMARY_TIMEOUT = 5.0
+
+    async def _bounded(self, coro, *, timeout: float, op: str):
+        """Run an IB coroutine with a hard timeout.
+
+        On timeout, schedules a connection reset and re-raises TimeoutError.
+        The reset is what prevents the whole-server wedge bug class: without
+        it, the next IB call inherits the same stuck event-loop state.
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"IB call timed out: op={op} timeout={timeout}s -- resetting connection"
+            )
+            # Fire-and-forget reset so callers see the timeout immediately and
+            # the next caller starts on a fresh connection.
+            asyncio.create_task(self._reset_on_timeout())
+            raise
+
+    async def _reset_on_timeout(self) -> None:
+        """Force-disconnect and reconnect to clear stuck ib_async waits."""
+        if self._resetting:
+            return
+        self._resetting = True
+        try:
+            try:
+                if self.ib and self.ib.isConnected():
+                    self.ib.disconnect()
+            except Exception:
+                pass
+            self._connected = False
+            await asyncio.sleep(0.5)
+            try:
+                await self.connect()
+                self.logger.info("IB connection reset complete after timeout")
+            except Exception as e:
+                self.logger.error(f"IB reset reconnect failed: {e}")
+        finally:
+            self._resetting = False
     
     @retry_on_failure(max_attempts=3)
     async def connect(self) -> bool:
@@ -186,160 +271,303 @@ class IBKRClient:
     
     @rate_limit(calls_per_second=1.0)
     async def get_portfolio(self, account: Optional[str] = None) -> List[Dict]:
-        """Get portfolio positions."""
+        """Get portfolio positions. Bounded by SUMMARY_TIMEOUT."""
         try:
             if not await self._ensure_connected():
                 raise ConnectionError("Not connected to IBKR")
-            
+
             account = account or self.current_account
-            
-            positions = await self.ib.reqPositionsAsync()
-            
+
+            positions = await self._bounded(
+                self.ib.reqPositionsAsync(),
+                timeout=self.SUMMARY_TIMEOUT,
+                op="reqPositions",
+            )
+
             portfolio = []
             for pos in positions:
                 if not account or pos.account == account:
                     portfolio.append(self._serialize_position(pos))
-            
+
             return portfolio
-            
+
+        except asyncio.TimeoutError:
+            self.logger.error("Portfolio request timed out")
+            raise RuntimeError("IB call timed out fetching portfolio; connection reset")
         except Exception as e:
             self.logger.error(f"Portfolio request failed: {e}")
             raise RuntimeError(f"IBKR API error: {str(e)}")
     
+    # Bug #1 fix: ib_async's `reqAccountSummaryAsync()` no longer takes
+    # positional `(group, tags)` args. The correct pattern is to start a
+    # subscription with `reqAccountSummary()` (sync, no args) and read cached
+    # values via `accountValues()`. We whitelist the important tags to avoid
+    # returning ~80 fields of noise.
+    IMPORTANT_ACCOUNT_TAGS = {
+        "NetLiquidation", "TotalCashValue", "BuyingPower", "AvailableFunds",
+        "ExcessLiquidity", "MaintMarginReq", "InitMarginReq",
+        "GrossPositionValue", "UnrealizedPnL", "RealizedPnL", "Cushion",
+        "EquityWithLoanValue", "PreviousDayEquityWithLoanValue",
+        "FullInitMarginReq", "FullMaintMarginReq",
+    }
+
     @rate_limit(calls_per_second=1.0)
-    async def get_account_summary(self, account: Optional[str] = None) -> List[Dict]:
-        """Get account summary."""
+    async def get_account_summary(self, account: Optional[str] = None) -> Dict:
+        """Get account summary.
+
+        Returns a dict shaped:
+          {
+            "account": "...",
+            "as_of": "2026-05-13T...Z",
+            "summary": {tag: value, ...}  # only IMPORTANT_ACCOUNT_TAGS
+          }
+
+        Bug #1: previous implementation called reqAccountSummaryAsync(group,
+        tags) which is no longer the ib_async signature. Use the subscription
+        + accountValues() pattern instead.
+        """
         try:
             if not await self._ensure_connected():
-                raise ConnectionError("Not connected to IBKR")
-            
-            account = account or self.current_account or "All"
-            
-            summary_tags = [
-                'TotalCashValue', 'NetLiquidation', 'UnrealizedPnL', 'RealizedPnL',
-                'GrossPositionValue', 'BuyingPower', 'EquityWithLoanValue',
-                'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq'
-            ]
-            
-            account_values = await self.ib.reqAccountSummaryAsync(account, ','.join(summary_tags))
-            
-            return [self._serialize_account_value(av) for av in account_values]
-            
+                return {"error": "Not connected to IBKR"}
+
+            target = account or self.current_account
+            if not target and self.ib.managedAccounts():
+                target = self.ib.managedAccounts()[0]
+            if not target:
+                return {"error": "No account available"}
+
+            # Idempotent subscription kick-off. After the first call this is a
+            # no-op; values stream in continuously.
+            await self._bounded(
+                self._ensure_account_summary_subscription(),
+                timeout=self.SUMMARY_TIMEOUT,
+                op=f"account_summary:{target}",
+            )
+
+            values = self.ib.accountValues(target)
+            summary = {
+                v.tag: v.value
+                for v in values
+                if v.tag in self.IMPORTANT_ACCOUNT_TAGS
+            }
+
+            return {
+                "account": target,
+                "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "summary": summary,
+            }
+
+        except asyncio.TimeoutError:
+            return {"error": "IB call timed out fetching account summary; connection reset"}
         except Exception as e:
             self.logger.error(f"Account summary request failed: {e}")
-            raise RuntimeError(f"IBKR API error: {str(e)}")
+            return {"error": f"IBKR API error: {e}"}
+
+    async def _ensure_account_summary_subscription(self) -> None:
+        """Start the account-summary subscription if not already active.
+
+        Idempotent: subsequent calls are cheap no-ops. First call sleeps
+        briefly to let the initial snapshot populate before the caller reads
+        accountValues().
+        """
+        # ib_async accumulates accountValues() automatically once
+        # reqAccountSummary() has been called at least once per session. We
+        # use a flag on the client to avoid re-subscribing.
+        if getattr(self, "_account_summary_subscribed", False):
+            return
+        self.ib.reqAccountSummary()
+        await asyncio.sleep(1.5)  # initial snapshot
+        self._account_summary_subscribed = True
     
     @rate_limit(calls_per_second=0.5)
     async def get_shortable_shares(self, symbol: str, account: str = None) -> Dict:
-        """Get short selling information for a symbol."""
+        """Get short-selling availability for a symbol.
+
+        Bug #2 fix: `ib.reqShortableSharesAsync` doesn't exist. The correct
+        approach is to subscribe via `reqMktData` with generic tick code 236
+        ("Shortable") and poll `ticker.shortableShares`. We poll briefly with
+        a hard ceiling and always cancel the subscription afterwards to avoid
+        leaks.
+
+        Returns:
+          {
+            "symbol": "...",
+            "shortable_shares": <float|None>,    # IB's log-encoded value
+            "classification": "easy_to_borrow" | "hard_to_borrow" | "not_available" | "unknown",
+            "current_price": <float>,
+            "bid": <float>, "ask": <float>,
+            "contract_id": <int>,
+            "as_of": "...Z",
+          }
+        Or {"symbol": ..., "error": "..."}.
+        """
+        ticker = None
+        contract: Optional[Stock] = None
         try:
             if not await self._ensure_connected():
-                raise ConnectionError("Not connected to IBKR")
-            
+                return {"symbol": symbol, "error": "Not connected to IBKR"}
+
             contract = Stock(symbol, 'SMART', 'USD')
-            
-            # Qualify the contract
-            qualified_contracts = await self.ib.reqContractDetailsAsync(contract)
-            if not qualified_contracts:
-                return {"error": "Contract not found"}
-            
-            qualified_contract = qualified_contracts[0].contract
-            
-            # Request shortable shares
-            shortable_shares = await self.ib.reqShortableSharesAsync(qualified_contract)
-            
-            # Get current market data
-            ticker = self.ib.reqMktData(qualified_contract, '', False, False)
-            await asyncio.sleep(1.5)  # Wait for market data
-            
-            result = {
+            qualified = await self._bounded(
+                self.ib.qualifyContractsAsync(contract),
+                timeout=self.QUALIFY_TIMEOUT,
+                op=f"qualify_short:{symbol}",
+            )
+            if not qualified or not contract.conId:
+                return {"symbol": symbol, "error": "Contract not qualifiable"}
+
+            # Generic tick 236 = Shortable. Poll up to 2s for the tick to arrive.
+            ticker = self.ib.reqMktData(contract, "236", False, False)
+            for _ in range(20):
+                if ticker.shortableShares is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+            shortable_raw = ticker.shortableShares  # log-encoded; see classify
+
+            return {
                 "symbol": symbol,
-                "shortable_shares": shortable_shares if shortable_shares != -1 else "Unlimited",
+                "shortable_shares": shortable_raw,
+                "classification": _classify_shortable(shortable_raw),
                 "current_price": safe_float(ticker.last or ticker.close),
                 "bid": safe_float(ticker.bid),
                 "ask": safe_float(ticker.ask),
-                "contract_id": qualified_contract.conId
+                "contract_id": contract.conId,
+                "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
-            
-            # Clean up ticker
-            self.ib.cancelMktData(qualified_contract)
-            
-            return result
-            
+
+        except asyncio.TimeoutError:
+            return {"symbol": symbol, "error": "IB call timed out; connection reset"}
         except Exception as e:
             self.logger.error(f"Error getting shortable shares for {symbol}: {e}")
-            return {"error": str(e)}
+            return {"symbol": symbol, "error": str(e)}
+        finally:
+            # Always cancel the subscription so we don't accumulate stale tickers.
+            if ticker is not None and contract is not None:
+                try:
+                    self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
 
-    @retry_on_failure(max_attempts=2)
-    async def get_margin_requirements(self, symbol: str, account: str = None) -> Dict:
-        """Get margin requirements for a symbol."""
+    async def get_margin_requirements(
+        self,
+        symbol: str,
+        account: str = None,
+        test_quantity: int = 100,
+    ) -> Dict:
+        """Get margin impact for a hypothetical BUY of `test_quantity` shares.
+
+        Bug #3 fix: previous implementation returned a placeholder dict and
+        never computed margin. Use `whatIfOrderAsync` which IB exposes
+        specifically for "what margin would this order require?" without
+        transmitting the order.
+
+        Important: returns *changes* to margin from placing this order, not
+        absolute account margin. Field names reflect this. A typical reading:
+          - initial_margin_change > 0 means your initial-margin requirement
+            would *increase* by that amount if the order filled.
+        """
         try:
             if not await self._ensure_connected():
-                raise ConnectionError("Not connected to IBKR")
-                
-            # Create contract
+                return {"symbol": symbol, "error": "Not connected to IBKR"}
+
             contract = Stock(symbol, 'SMART', 'USD')
-            await self.ib.qualifyContractsAsync([contract])
-            
-            if not contract.conId:
-                return {"error": f"Invalid symbol: {symbol}"}
-            
-            # Get margin requirements - simplified for now
-            # Note: IBKR API doesn't provide direct margin requirements
-            # This would typically require additional market data subscriptions
-            margin_info = {
+            qualified = await self._bounded(
+                self.ib.qualifyContractsAsync(contract),
+                timeout=self.QUALIFY_TIMEOUT,
+                op=f"qualify_margin:{symbol}",
+            )
+            if not qualified or not contract.conId:
+                return {"symbol": symbol, "error": "Contract not qualifiable"}
+
+            order = MarketOrder("BUY", test_quantity)
+            state = await self._bounded(
+                self.ib.whatIfOrderAsync(contract, order),
+                timeout=self.DEFAULT_IB_TIMEOUT,
+                op=f"whatif:{symbol}",
+            )
+
+            return {
                 "symbol": symbol,
+                "test_quantity": test_quantity,
+                "initial_margin_change": safe_float(getattr(state, "initMarginChange", 0)),
+                "maintenance_margin_change": safe_float(getattr(state, "maintMarginChange", 0)),
+                "equity_with_loan_change": safe_float(getattr(state, "equityWithLoanChange", 0)),
+                "commission": safe_float(getattr(state, "commission", 0)),
                 "contract_id": contract.conId,
                 "exchange": contract.exchange,
-                "margin_requirement": "Market data subscription required",
-                "note": "Use TWS for detailed margin calculations"
+                "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "note": "values are CHANGES from a hypothetical BUY, not absolute margin",
             }
-            
-            return margin_info
-            
+
+        except asyncio.TimeoutError:
+            return {"symbol": symbol, "error": "IB call timed out; connection reset"}
         except Exception as e:
             self.logger.error(f"Error getting margin info for {symbol}: {e}")
-            return {"error": str(e)}
+            return {"symbol": symbol, "error": str(e)}
 
     async def short_selling_analysis(self, symbols: List[str], account: str = None) -> Dict:
-        """Complete short selling analysis for multiple symbols."""
+        """Combined short-selling availability + margin analysis.
+
+        Bug #4 fix: previous implementation only caught *raised* exceptions
+        and missed errors returned as `{"error": "..."}` from child calls,
+        which made `summary.errors` always empty. The new aggregator walks
+        both shortable_data and margin_data, surfaces any per-symbol error
+        keys, tags them with their source, and adds a `had_errors` boolean
+        for one-line client branching.
+        """
         try:
             if not await self._ensure_connected():
-                raise ConnectionError("Not connected to IBKR")
-            
-            analysis = {
+                return {"error": "Not connected to IBKR"}
+
+            shortable_data: Dict[str, Dict] = {}
+            margin_data: Dict[str, Dict] = {}
+
+            for symbol in symbols:
+                try:
+                    shortable_data[symbol] = await self.get_shortable_shares(symbol, account)
+                except Exception as e:
+                    shortable_data[symbol] = {"symbol": symbol, "error": str(e)}
+
+            for symbol in symbols:
+                try:
+                    margin_data[symbol] = await self.get_margin_requirements(symbol, account)
+                except Exception as e:
+                    margin_data[symbol] = {"symbol": symbol, "error": str(e)}
+
+            # Surface ALL per-symbol errors from the nested dicts (the previous
+            # code missed these — it only caught Python exceptions, not
+            # error-dict returns from the child handlers).
+            errors: List[Dict] = []
+            for sym, data in shortable_data.items():
+                if isinstance(data, dict) and "error" in data:
+                    errors.append({"symbol": sym, "source": "shortable", "error": data["error"]})
+            for sym, data in margin_data.items():
+                if isinstance(data, dict) and "error" in data:
+                    errors.append({"symbol": sym, "source": "margin", "error": data["error"]})
+
+            # Count truly-shortable symbols using the classification.
+            shortable_count = sum(
+                1 for d in shortable_data.values()
+                if isinstance(d, dict)
+                and "error" not in d
+                and d.get("classification") in ("easy_to_borrow", "hard_to_borrow")
+            )
+
+            return {
                 "account": account or self.current_account,
+                "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "symbols_analyzed": symbols,
-                "shortable_data": {},
-                "margin_data": {},
+                "shortable_data": shortable_data,
+                "margin_data": margin_data,
                 "summary": {
                     "total_symbols": len(symbols),
-                    "shortable_count": 0,
-                    "errors": []
-                }
+                    "shortable_count": shortable_count,
+                    "errors": errors,
+                    "had_errors": len(errors) > 0,
+                },
             }
-            
-            # Get shortable shares data
-            for symbol in symbols:
-                try:
-                    shortable_info = await self.get_shortable_shares(symbol, account)
-                    analysis["shortable_data"][symbol] = shortable_info
-                    
-                    if "error" not in shortable_info:
-                        analysis["summary"]["shortable_count"] += 1
-                except Exception as e:
-                    analysis["summary"]["errors"].append(f"{symbol}: {str(e)}")
-            
-            # Get margin requirements
-            for symbol in symbols:
-                try:
-                    margin_info = await self.get_margin_requirements(symbol, account)
-                    analysis["margin_data"][symbol] = margin_info
-                except Exception as e:
-                    analysis["summary"]["errors"].append(f"{symbol} margin: {str(e)}")
-            
-            return analysis
-            
+
         except Exception as e:
             self.logger.error(f"Error in short selling analysis: {e}")
             return {"error": str(e)}
@@ -403,18 +631,26 @@ class IBKRClient:
             raise IBKRConnectionError("Not connected to IBKR")
 
         contract = Stock(symbol, "SMART", "USD")
-        await self.ib.qualifyContractsAsync(contract)
+        await self._bounded(
+            self.ib.qualifyContractsAsync(contract),
+            timeout=self.QUALIFY_TIMEOUT,
+            op=f"qualify_hist:{symbol}",
+        )
         if not contract.conId:
             raise RuntimeError(f"Could not qualify contract for {symbol}")
 
-        bars = await self.ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime="",
-            durationStr=f"{lookback_days} D",
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
+        bars = await self._bounded(
+            self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr=f"{lookback_days} D",
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            ),
+            timeout=self.HISTDATA_TIMEOUT,
+            op=f"histdata:{symbol}",
         )
         df = util.df(bars)
         if df is None or len(df) == 0:
@@ -706,9 +942,10 @@ class IBKRClient:
         }
 
     async def get_swing_status(self, symbol: str) -> Dict:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         state = self._swing_state_dict().get(symbol)
         if not state:
-            return {"status": "not_found", "symbol": symbol}
+            return {"status": "not_found", "symbol": symbol, "as_of": now}
         return {
             "symbol": symbol,
             "state": state.state.value,
@@ -725,6 +962,7 @@ class IBKRClient:
             "last_regime_enabled": state.last_regime_enabled,
             "started_at": state.started_at,
             "last_tick_at": state.last_tick_at,
+            "as_of": now,
         }
 
     # Parameters that affect *live* orders. Changing any of these means the
@@ -905,10 +1143,11 @@ class IBKRClient:
         }
 
     async def get_reversal_status(self, symbol: str) -> Dict:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         states = self._reversal_state_dict()
         state = states.get(symbol)
         if not state:
-            return {"status": "not_found", "symbol": symbol}
+            return {"status": "not_found", "symbol": symbol, "as_of": now}
         return {
             "symbol": symbol,
             "status": state.status.value,
@@ -928,6 +1167,7 @@ class IBKRClient:
             "started_at": state.started_at,
             "last_action_at": state.last_action_at,
             "protective_stop_order_id": state.protective_stop_order_id,
+            "as_of": now,
         }
 
     async def _reversal_loop(self, symbol: str, interval_seconds: int) -> None:
@@ -1067,18 +1307,28 @@ class IBKRClient:
             )
 
         try:
-            contract = Stock(req.symbol, "SMART", "USD")
-            qualified = await self.ib.qualifyContractsAsync(contract)
-            if not qualified or not contract.conId:
-                return self._order_response(
-                    "error",
-                    req=req,
-                    preview=preview,
-                    message=f"Could not qualify contract for {req.symbol}",
+            # Serialize order placements so a slow one can't block a parallel
+            # order. Reads are unaffected (no lock acquired by read endpoints).
+            async with self._order_lock:
+                contract = Stock(req.symbol, "SMART", "USD")
+                qualified = await self._bounded(
+                    self.ib.qualifyContractsAsync(contract),
+                    timeout=self.QUALIFY_TIMEOUT,
+                    op=f"qualify:{req.symbol}",
                 )
+                if not qualified or not contract.conId:
+                    return self._order_response(
+                        "error",
+                        req=req,
+                        preview=preview,
+                        message=f"Could not qualify contract for {req.symbol}",
+                    )
 
-            ib_order = build_order(req)
-            trade = self.ib.placeOrder(contract, ib_order)
+                ib_order = build_order(req)
+                # placeOrder() is synchronous in ib_async — returns a Trade
+                # immediately. No await needed; no timeout needed for this line.
+                trade = self.ib.placeOrder(contract, ib_order)
+
             return self._order_response(
                 "submitted",
                 req=req,
@@ -1086,6 +1336,16 @@ class IBKRClient:
                 order_id=getattr(trade.order, "orderId", None),
                 perm_id=getattr(trade.order, "permId", None) or None,
                 message="Order submitted",
+            )
+        except asyncio.TimeoutError:
+            return self._order_response(
+                "error",
+                req=req,
+                preview=preview,
+                message=(
+                    f"IB call timed out placing {req.order_type} on {req.symbol}; "
+                    "connection has been reset"
+                ),
             )
         except Exception as e:
             self.logger.error(f"place_order failed for {req.symbol}: {e}")
@@ -1101,8 +1361,15 @@ class IBKRClient:
         orders: List[Dict],
         oca_group_name: str,
         oca_type: int = 1,
+        dry_run: bool = False,
     ) -> Dict:
-        """Place 2+ linked orders that cancel each other on any fill."""
+        """Place 2+ linked orders that cancel each other on any fill.
+
+        `dry_run` (Phase 3 polish): when True at the group level, validates
+        every leg and returns a preview without any IB call. Equivalent to
+        setting `dry_run=True` on every leg individually. Useful for
+        validating brackets without transmission.
+        """
         try:
             requests = [OrderRequest.from_kwargs(**o) for o in orders]
             prepared = prepare_group(requests, group_name=oca_group_name, oca_type=oca_type)
@@ -1124,12 +1391,13 @@ class IBKRClient:
                 "message": "ENABLE_LIVE_TRADING=false; OCA group not transmitted",
             }
 
-        if any(r.dry_run for r in prepared):
+        # Group-level dry_run OR any leg with dry_run=True triggers preview mode.
+        if dry_run or any(r.dry_run for r in prepared):
             return {
                 "status": "dry_run",
                 "group_id": oca_group_name,
                 "orders": [{"preview": p, "order_id": None, "perm_id": None} for p in previews],
-                "message": "dry_run=true on one or more legs; OCA group not transmitted",
+                "message": "dry_run; OCA group not transmitted",
             }
 
         if not await self._ensure_connected():
@@ -1142,30 +1410,45 @@ class IBKRClient:
 
         results: List[Dict] = []
         try:
-            for req, preview in zip(prepared, previews):
-                contract = Stock(req.symbol, "SMART", "USD")
-                qualified = await self.ib.qualifyContractsAsync(contract)
-                if not qualified or not contract.conId:
-                    return {
-                        "status": "error",
-                        "group_id": oca_group_name,
-                        "orders": results,
-                        "message": f"Could not qualify contract for {req.symbol}",
-                    }
-                ib_order = build_order(req)
-                trade = self.ib.placeOrder(contract, ib_order)
-                results.append(
-                    {
-                        "preview": preview,
-                        "order_id": getattr(trade.order, "orderId", None),
-                        "perm_id": getattr(trade.order, "permId", None) or None,
-                    }
-                )
+            # Same lock as place_order: group submission is serialized so two
+            # concurrent group placements can't interleave and confuse the
+            # OCA-cancellation rules at the broker.
+            async with self._order_lock:
+                for req, preview in zip(prepared, previews):
+                    contract = Stock(req.symbol, "SMART", "USD")
+                    qualified = await self._bounded(
+                        self.ib.qualifyContractsAsync(contract),
+                        timeout=self.QUALIFY_TIMEOUT,
+                        op=f"qualify:{req.symbol}",
+                    )
+                    if not qualified or not contract.conId:
+                        return {
+                            "status": "error",
+                            "group_id": oca_group_name,
+                            "orders": results,
+                            "message": f"Could not qualify contract for {req.symbol}",
+                        }
+                    ib_order = build_order(req)
+                    trade = self.ib.placeOrder(contract, ib_order)
+                    results.append(
+                        {
+                            "preview": preview,
+                            "order_id": getattr(trade.order, "orderId", None),
+                            "perm_id": getattr(trade.order, "permId", None) or None,
+                        }
+                    )
             return {
                 "status": "submitted",
                 "group_id": oca_group_name,
                 "orders": results,
                 "message": f"OCA group of {len(results)} orders submitted",
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "group_id": oca_group_name,
+                "orders": results,
+                "message": "IB call timed out placing OCA group; connection has been reset",
             }
         except Exception as e:
             self.logger.error(f"place_oca_group failed: {e}")
