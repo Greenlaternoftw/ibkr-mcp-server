@@ -72,14 +72,19 @@ async def main() -> None:
     print(f"OK Test 4: OCA dry_run validates {len(result['orders'])} legs")
 
     # Test 5: pathological case — invalid LMT followed by 10 rapid reads.
+    # Use `get_swing_status("__NOPE__")` for the post-order reads — it's a
+    # pure in-memory lookup with no IB call and no rate-limiter, so the only
+    # thing that could slow it down is a wedged event loop. Previously this
+    # test used `get_portfolio`, but its `@rate_limit(calls_per_second=1.0)`
+    # decorator means 10 sequential calls take ~10s by design — not a wedge.
     await ibkr_client.place_order(
         symbol="AAPL", action="BUY", quantity=1, order_type="LMT"
     )
     t0 = time.time()
     for _ in range(10):
-        await ibkr_client.get_portfolio()
+        await ibkr_client.get_swing_status("__NOPE__")
     elapsed = time.time() - t0
-    assert elapsed < 5.0, f"10 reads took {elapsed:.2f}s; server appears wedged"
+    assert elapsed < 1.0, f"10 reads took {elapsed:.2f}s; server appears wedged"
     print(f"OK Test 5: 10 reads after bad order in {elapsed*1000:.0f}ms")
 
     print("\n=== ALL FIVE ASSERTIONS PASSED ===\n")
