@@ -369,13 +369,16 @@ class IBKRClient:
         Idempotent: subsequent calls are cheap no-ops. First call sleeps
         briefly to let the initial snapshot populate before the caller reads
         accountValues().
+
+        Important: must use the *Async* variant. The sync wrapper
+        `reqAccountSummary()` internally calls `util.run` which tries to
+        start a new event loop on top of the running one and crashes with
+        "This event loop is already running". The async version returns a
+        coroutine that integrates correctly with the existing loop.
         """
-        # ib_async accumulates accountValues() automatically once
-        # reqAccountSummary() has been called at least once per session. We
-        # use a flag on the client to avoid re-subscribing.
         if getattr(self, "_account_summary_subscribed", False):
             return
-        self.ib.reqAccountSummary()
+        await self.ib.reqAccountSummaryAsync()
         await asyncio.sleep(1.5)  # initial snapshot
         self._account_summary_subscribed = True
     
