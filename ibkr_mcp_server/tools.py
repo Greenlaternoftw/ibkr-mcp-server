@@ -404,11 +404,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 symbol_list = validate_symbols(symbols)
                 results = []
                 for symbol in symbol_list:
+                    # get_shortable_shares already returns a dict shaped with
+                    # symbol/shortable_shares/classification/... — pass it
+                    # through directly instead of double-nesting under another
+                    # "symbol"/"shortable_shares" wrapper.
                     shortable_info = await ibkr_client.get_shortable_shares(symbol, account)
-                    results.append({
-                        "symbol": symbol,
-                        "shortable_shares": shortable_info
-                    })
+                    results.append(shortable_info)
                 return [TextContent(
                     type="text",
                     text=json.dumps(results, indent=2)
@@ -426,11 +427,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 symbol_list = validate_symbols(symbols)
                 results = []
                 for symbol in symbol_list:
+                    # Same as check_shortable_shares: pass the structured
+                    # response from get_margin_requirements through directly.
                     margin_info = await ibkr_client.get_margin_requirements(symbol, account)
-                    results.append({
-                        "symbol": symbol,
-                        "margin_requirements": margin_info
-                    })
+                    results.append(margin_info)
                 return [TextContent(
                     type="text",
                     text=json.dumps(results, indent=2)
