@@ -128,6 +128,80 @@ daemon bounce.
   separate `.env` files, or stop the daemon before running ad-hoc commands
   that connect to IBKR.
 
+## Auto-recovery + daily maintenance (recommended)
+
+Two scripts in `scripts/` keep the daemon connected without manual intervention.
+
+### What they do
+
+- **`ibkr-watchdog.sh`** — every 5 minutes via cron, checks the chain:
+  1. Gateway's API port (4002) listening
+  2. Daemon's HTTP `/healthz` endpoint responding
+  3. `/healthz` reporting `ibkr_connected=true`
+
+  If any check fails, restarts what's broken (Gateway and/or the daemon).
+  Logs everything to `/home/trader/ibkr-watchdog.log`. Idempotent and
+  lock-guarded so concurrent runs can't conflict.
+
+- **`ibkr-daily-restart.sh`** — once a day at 04:30 UTC, bounces Gateway
+  and then the daemon. Catches IBC accumulation bugs that cause the silent
+  port-closed-after-nightly-logout failure mode by never letting Gateway
+  state age more than 24 hours.
+
+### Install (one-shot)
+
+On the VPS:
+
+```bash
+bash /home/trader/ibkr-mcp-server/scripts/install-ops.sh
+```
+
+This will:
+1. `chmod +x` both scripts
+2. Add a sudoers rule (`/etc/sudoers.d/ibkr-ops`) so cron can
+   `systemctl restart ibkr-mcp` without a password prompt
+3. Add two cron entries (skipping any that already exist)
+4. Print the resulting crontab
+
+Then verify:
+```bash
+tail -f /home/trader/ibkr-watchdog.log
+# wait 5 minutes; you should see one "OK: chain healthy" line on the first
+# run within the first 5-minute window of an hour.
+```
+
+### Configuration
+
+Both scripts read environment variables for paths/timeouts. Defaults
+match the layout described elsewhere in this README. Override by
+prepending vars to the cron line, e.g.:
+
+```cron
+*/5 * * * * IBKR_WATCHDOG_LOG=/var/log/ibkr.log /home/trader/ibkr-mcp-server/scripts/ibkr-watchdog.sh
+```
+
+Available overrides for the watchdog:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `IBKR_WATCHDOG_LOG` | `/home/trader/ibkr-watchdog.log` | Where to log |
+| `IBKR_WATCHDOG_ENV_FILE` | `/home/trader/ibkr-mcp-server/.env` | Where to read `MCP_AUTH_TOKEN` from |
+| `IBKR_WATCHDOG_GATEWAY_COMPOSE` | `/home/trader/ibkr-stack/docker-compose.yml` | Gateway compose file |
+| `IBKR_WATCHDOG_HEALTHZ_URL` | `http://127.0.0.1:8765/healthz` | Daemon health endpoint |
+| `IBKR_WATCHDOG_GATEWAY_PORT` | `4002` | Port to check for listening |
+| `IBKR_WATCHDOG_GATEWAY_WAIT` | `90` | Seconds to wait after Gateway restart |
+| `IBKR_WATCHDOG_DAEMON_WAIT` | `5` | Seconds to wait after daemon restart |
+
+Daily-restart accepts `IBKR_OPS_LOG`, `IBKR_GATEWAY_COMPOSE`,
+`IBKR_GATEWAY_WAIT` with equivalent meanings.
+
+### Disable / uninstall
+
+```bash
+crontab -e                            # remove the two ibkr-* lines
+sudo rm /etc/sudoers.d/ibkr-ops
+```
+
 ---
 
 # Layer 5b — Docker compose + HTTP MCP transport
