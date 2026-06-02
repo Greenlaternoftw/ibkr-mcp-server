@@ -98,6 +98,15 @@ def build_starlette_app(
         Route("/healthz", healthz, methods=["GET"]),
         Mount("/mcp", app=session_manager.handle_request),
     ]
+
+    # Layer 7 -- in-house chat wrapper mounts at /chat (only when
+    # CHAT_ENABLED=true; the handlers themselves return 503 with a
+    # helpful message if the API key isn't set). Routes are added
+    # unconditionally so the UI can render "chat disabled" instead of
+    # 404, but the agent isn't built until a real request comes in.
+    from .chat.routes import chat_routes
+    routes.extend(chat_routes())
+
     middleware = [Middleware(BearerAuthMiddleware, expected_token=auth_token)]
     return Starlette(routes=routes, middleware=middleware)
 

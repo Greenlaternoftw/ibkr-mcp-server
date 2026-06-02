@@ -276,6 +276,105 @@ same `.env` so a single toggle disables both paths.
 
 ---
 
+## Layer 7 — In-house chat wrapper
+
+A small chat app served at `http://<vps>:8765/chat` that calls **Anthropic
+API directly** instead of going through Claude Desktop / iOS / web. The
+reason it exists: those consumer products apply a safety overlay that
+refuses to invoke destructive trading tools regardless of how the
+operator-controlled daemon is configured. By calling the API directly
+with our own system prompt, the model honors the operator's intent and
+the daemon's confirmation gate becomes the actual safety mechanism — not
+the model's editorial judgment.
+
+### Setup (10 minutes)
+
+1. **Get an Anthropic API key.** Go to
+   [console.anthropic.com](https://console.anthropic.com/), Settings →
+   API Keys → "Create Key". This is separate from your Claude.ai
+   subscription. The key starts with `sk-ant-api...`. You only see it
+   once — copy it immediately.
+
+2. **Set a spend cap on the console.** Anthropic API is metered. A
+   $100/month cap is a sane starting point for chat-only use; lower if
+   you want to be conservative.
+
+3. **Add the new env vars to `.env` on the VPS:**
+
+   ```ini
+   CHAT_ENABLED=true
+   ANTHROPIC_API_KEY=sk-ant-api03-...
+   ANTHROPIC_MODEL=claude-sonnet-4-5
+   CHAT_MAX_ITERATIONS=12
+   ```
+
+4. **Install the new Python dep:**
+
+   ```bash
+   cd /home/trader/ibkr-mcp-server
+   git pull
+   .venv/bin/pip install -r requirements.txt   # adds `anthropic`
+   sudo systemctl restart ibkr-mcp
+   ```
+
+5. **Open the chat UI from anywhere on your Tailnet:**
+
+   On your laptop or phone browser:
+   ```
+   http://<vps-tailscale-ip>:8765/chat?token=<MCP_AUTH_TOKEN>
+   ```
+
+   The token is stripped from the URL after first load and saved in
+   localStorage. Bookmark the URL **without** the `?token=...` after
+   that — re-using it would put the token in browser history.
+
+6. **Phone: install as a PWA.** In Safari → Share → Add to Home Screen.
+   The icon appears alongside native apps and opens in full-screen mode.
+
+### What changes for you
+
+- **Claude refusing to place orders → gone.** The system prompt
+  explicitly authorizes destructive tool calls and explains the
+  confirmation gate. The agent loop surfaces the daemon's
+  `needs_confirmation` previews and waits for your "confirm".
+- **Existing surfaces still work.** Claude Desktop / iOS / Code can still
+  hit the MCP endpoint at `:8765/mcp`. Use whichever interface you
+  prefer for which task.
+- **Cost:** roughly $0.01-0.02 per chat turn at Sonnet pricing. At
+  ~100 turns/day that's ~$30-50/month. The console cap protects you.
+
+### Tuning
+
+| Env var | Purpose |
+|---|---|
+| `CHAT_ENABLED` | Master switch. False disables the `/chat` endpoint (returns 503). |
+| `ANTHROPIC_API_KEY` | The API key from console.anthropic.com. |
+| `ANTHROPIC_MODEL` | Defaults to `claude-sonnet-4-5`. Use `claude-haiku-4-5` to cut cost ~5×; use `claude-opus-4-5` for serious analysis. |
+| `CHAT_MAX_ITERATIONS` | Cap on consecutive tool-call iterations in one user turn. Default 12. Raise if the agent legitimately needs more chained calls; lower as a paranoid budget control. |
+
+The system prompt lives at `ibkr_mcp_server/chat/prompts.py`. Edit
+freely and restart the daemon. Common tweaks:
+
+- Make the model more verbose for portfolio explanations
+- Customize how the model formats numbers (currency, percentages)
+- Add personal trading-strategy preferences ("I prefer trailing stops
+  over hard stops; flag anything that would set a hard stop")
+
+### Architecture notes
+
+- The chat app shares the daemon's HTTP transport (port 8765) and
+  bearer-auth middleware. No new ports to firewall.
+- One process, shared `IBKRClient` instance — tool calls from chat hit
+  the same code path as MCP tool calls. The confirmation gate fires
+  identically.
+- Conversation lives in browser localStorage (Phase 1). Server-side
+  persistence is Phase 2 work.
+- All tool dispatch goes through the existing `tools.call_tool` MCP
+  handler, so a tool that works in Claude Desktop works in chat and
+  vice versa.
+
+---
+
 # Layer 5b — Docker compose + HTTP MCP transport
 
 Brings up Gateway and the MCP daemon together in two containers, with the

@@ -65,6 +65,21 @@ class Settings(BaseSettings):
     notify_enabled: bool = False
     ntfy_url: str = "https://ntfy.sh"
     ntfy_topic: Optional[str] = None
+
+    # Layer 7 — in-house chat wrapper (the /chat endpoint on the HTTP
+    # transport). Calls Anthropic API directly with our own system prompt
+    # so the consumer-product safety overlay (which refuses to call
+    # destructive trading tools) is not in the path. Off unless an API
+    # key is configured.
+    #
+    # Cost: ~$0.01-0.02 per chat message at Sonnet pricing. Set a spend
+    # cap in the Anthropic console.
+    chat_enabled: bool = False
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-sonnet-4-5"
+    # Hard cap on the agent loop so a runaway tool-call cycle can't burn
+    # tokens forever. Each iteration is one Anthropic API call.
+    chat_max_iterations: int = 12
     
     @field_validator('ibkr_managed_accounts')
     @classmethod

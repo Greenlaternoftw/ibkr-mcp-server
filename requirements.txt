@@ -10,3 +10,7 @@ rich>=13.0.0
 pandas>=2.0.0,<3.0.0
 pandas_ta==0.4.71b0
 numpy>=2.2.6
+# Layer 7: in-house chat wrapper. Calls Anthropic API directly so we
+# control the system prompt and bypass consumer-product safety overlays
+# that refuse to call destructive trading tools.
+anthropic>=0.40.0
