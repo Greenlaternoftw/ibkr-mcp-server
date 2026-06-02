@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     enable_live_trading: bool = False
     max_order_size: int = 1000
     require_order_confirmation: bool = True
+
+    # When True, tools that cancel orders, stop strategies, or transmit live
+    # orders return a "needs_confirmation" preview unless called with
+    # confirm=true. Designed to prevent unintended destructive actions from
+    # chat sessions (e.g., "stop my F swing" cancels protective stops without
+    # asking). Off by default — chat workflows expect single-shot tool calls.
+    require_confirmation_for_destructive_tools: bool = False
     
     # MCP Server
     mcp_server_name: str = "ibkr-mcp"

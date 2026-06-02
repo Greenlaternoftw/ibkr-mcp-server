@@ -132,6 +132,30 @@ class IBKRClient:
             self.logger.error(f"Failed to ensure connection: {e}")
             return False
 
+    # --- destructive-tool confirmation gate -------------------------------
+    #
+    # When settings.require_confirmation_for_destructive_tools is True, tools
+    # that cancel orders, stop strategies, or transmit live orders return a
+    # "needs_confirmation" preview unless called with confirm=True. Off by
+    # default. Designed to prevent chat sessions from issuing destructive
+    # actions without an explicit second step (e.g., "stop my F swing"
+    # cancelling a protective trail+stop pair in one shot, as happened
+    # 2026-05-17).
+
+    def _needs_confirmation(self, confirm: bool) -> bool:
+        """True if the gate is enabled and confirm wasn't passed."""
+        return bool(settings.require_confirmation_for_destructive_tools) and not confirm
+
+    @staticmethod
+    def _confirm_response(action: str, preview: Dict, hint: str) -> Dict:
+        """Standard response shape when a destructive call needs confirm."""
+        return {
+            "status": "needs_confirmation",
+            "action": action,
+            "preview": preview,
+            "message": hint,
+        }
+
     # --- IB call safety helpers (Bug #5/#6/#7 defences) -------------------
 
     # Default per-call timeouts. Tune per operation if needed.
@@ -753,18 +777,61 @@ class IBKRClient:
             "recheck_interval_seconds": recheck_interval_seconds,
         }
 
-    async def stop_reversal_entry(self, symbol: str, action: str = "cancel") -> Dict:
+    async def stop_reversal_entry(
+        self,
+        symbol: str,
+        action: str = "cancel",
+        confirm: bool = False,
+    ) -> Dict:
         """Stop a running reversal entry.
 
         `action`:
           - "cancel": stop the tick, leave filled tranches alone
           - "liquidate_filled": stop the tick AND market-sell everything filled
-          - "convert_to_swing_loop": NOT YET IMPLEMENTED (Layer 4)
+          - "convert_to_swing_loop": hands filled tranches to swing loop
+
+        When env var REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on, this
+        returns a `needs_confirmation` preview unless called with confirm=True.
         """
         states = self._reversal_state_dict()
         state = states.get(symbol)
         if not state:
             return {"status": "error", "message": f"no reversal entry for {symbol}"}
+
+        # Destructive-tool gate. Surface what would happen for each action.
+        if self._needs_confirmation(confirm):
+            filled_count = len(state.filled_tranches)
+            filled_shares = sum(t.shares for t in state.filled_tranches)
+            if action == "cancel":
+                impact = (
+                    f"would stop watching for {symbol} signals; "
+                    f"{filled_count} filled tranche(s) ({filled_shares} shares) left alone"
+                )
+            elif action == "liquidate_filled":
+                impact = (
+                    f"would stop watching AND market-sell {filled_shares} "
+                    f"shares across {filled_count} filled tranche(s)"
+                )
+            elif action == "convert_to_swing_loop":
+                impact = (
+                    f"would hand {filled_shares} shares to swing strategy management"
+                )
+            else:
+                impact = f"unknown action: {action}"
+            return self._confirm_response(
+                action=f"stop_reversal_entry:{action}",
+                preview={
+                    "symbol": symbol,
+                    "current_status": state.status.value,
+                    "filled_tranches": filled_count,
+                    "filled_shares": filled_shares,
+                    "would_do": impact,
+                },
+                hint=(
+                    f"REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on. {impact}. "
+                    "Re-call with confirm=true to proceed."
+                ),
+            )
 
         task = self._reversal_tasks.pop(symbol, None)
         if task and not task.done():
@@ -901,12 +968,44 @@ class IBKRClient:
             "recheck_interval_seconds": recheck_interval_seconds,
         }
 
-    async def stop_swing_strategy(self, symbol: str) -> Dict:
-        """Cancel any open swing orders and stop the loop."""
+    async def stop_swing_strategy(self, symbol: str, confirm: bool = False) -> Dict:
+        """Cancel any open swing orders and stop the loop.
+
+        When env var REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on, this
+        returns a `needs_confirmation` preview unless called with confirm=True.
+        Designed to prevent chat sessions from cancelling protective stops
+        without an explicit second step.
+        """
         states = self._swing_state_dict()
         state = states.get(symbol)
         if not state:
             return {"status": "error", "message": f"no swing strategy for {symbol}"}
+
+        # Destructive-tool gate: stopping cancels live protective orders.
+        if self._needs_confirmation(confirm):
+            order_ids = [
+                getattr(state, f)
+                for f in ("protective_trail_order_id", "protective_stop_order_id", "dip_buy_order_id")
+                if getattr(state, f)
+            ]
+            return self._confirm_response(
+                action="stop_swing_strategy",
+                preview={
+                    "symbol": symbol,
+                    "current_state": state.state.value,
+                    "quantity": state.quantity,
+                    "cost_basis": state.cost_basis,
+                    "orders_that_would_be_cancelled": order_ids,
+                    "oca_group": state.oca_group,
+                },
+                hint=(
+                    f"REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on. "
+                    f"This would cancel {len(order_ids)} protective order(s) "
+                    f"({order_ids}) on {symbol} ({state.quantity} shares) "
+                    "and stop the swing loop. "
+                    "Re-call with confirm=true to proceed."
+                ),
+            )
 
         task = self._swing_tasks.pop(symbol, None)
         if task and not task.done():
@@ -986,17 +1085,54 @@ class IBKRClient:
         immediately so the new params reach the broker within a second.
         Non-structural params (regime_filter_enabled, cooldown_hours, etc.)
         take effect on the next regularly-scheduled tick.
+
+        When env var REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on, a
+        structural change requires `confirm=True` because it cancels live
+        protective orders. Non-structural changes don't require confirm
+        even when the gate is on (they don't touch live orders).
         """
+        # Pull confirm out so it doesn't get applied to SwingConfig fields.
+        confirm = bool(params.pop("confirm", False))
+
         state = self._swing_state_dict().get(symbol)
         if not state:
             return {"status": "error", "message": f"no swing strategy for {symbol}"}
 
+        # Pre-compute what would change so we can decide whether to gate.
         valid = {f for f in SwingConfig.__dataclass_fields__}
+        proposed = {k: v for k, v in params.items() if k in valid}
+        proposed_structural = set(proposed.keys()) & self._STRUCTURAL_SWING_PARAMS
+
+        # Destructive-tool gate — only for structural changes that would cancel
+        # live broker orders. Non-structural updates aren't gated.
+        if proposed_structural and self._needs_confirmation(confirm):
+            live_order_ids = [
+                getattr(state, f)
+                for f in ("protective_trail_order_id", "protective_stop_order_id", "dip_buy_order_id")
+                if getattr(state, f)
+            ]
+            return self._confirm_response(
+                action="update_swing_params:structural",
+                preview={
+                    "symbol": symbol,
+                    "structural_changes": {k: proposed[k] for k in proposed_structural},
+                    "non_structural_changes": {
+                        k: proposed[k] for k in proposed if k not in proposed_structural
+                    },
+                    "live_orders_that_would_be_cancelled": live_order_ids,
+                },
+                hint=(
+                    "REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on. "
+                    f"Structural change would cancel {len(live_order_ids)} live order(s) "
+                    f"on {symbol} and re-place them with new parameters. "
+                    "Re-call with confirm=true to proceed."
+                ),
+            )
+
         applied: Dict[str, Any] = {}
-        for k, v in params.items():
-            if k in valid:
-                setattr(state.config, k, v)
-                applied[k] = v
+        for k, v in proposed.items():
+            setattr(state.config, k, v)
+            applied[k] = v
 
         structural_changed = bool(set(applied.keys()) & self._STRUCTURAL_SWING_PARAMS)
         cancelled: list[int] = []
@@ -1276,7 +1412,15 @@ class IBKRClient:
 
         All Layer 1 order types are supported (MKT, LMT, STP, STP LMT, TRAIL,
         TRAIL LIMIT, LOO, MOO, LOC, MOC). See `orders.py` for validation rules.
+
+        When `REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS` env var is set,
+        non-dry-run calls return a `needs_confirmation` preview unless
+        called with `confirm=True`.
         """
+        # Strip confirm before passing the rest to OrderRequest (which would
+        # reject it as an unknown parameter).
+        confirm = bool(kwargs.pop("confirm", False))
+
         try:
             req = OrderRequest.from_kwargs(**kwargs)
             validate_request(req)
@@ -1299,6 +1443,18 @@ class IBKRClient:
                 req=req,
                 preview=preview,
                 message="dry_run=true; order not transmitted",
+            )
+
+        # Destructive-tool gate: live-transmission requires explicit confirm.
+        if self._needs_confirmation(confirm):
+            return self._confirm_response(
+                action="place_order",
+                preview=preview,
+                hint=(
+                    f"REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on. "
+                    f"This would {preview.get('intent', 'place an order')}. "
+                    "Re-call with confirm=true to actually transmit."
+                ),
             )
 
         if not await self._ensure_connected():
@@ -1365,13 +1521,16 @@ class IBKRClient:
         oca_group_name: str,
         oca_type: int = 1,
         dry_run: bool = False,
+        confirm: bool = False,
     ) -> Dict:
         """Place 2+ linked orders that cancel each other on any fill.
 
         `dry_run` (Phase 3 polish): when True at the group level, validates
-        every leg and returns a preview without any IB call. Equivalent to
-        setting `dry_run=True` on every leg individually. Useful for
-        validating brackets without transmission.
+        every leg and returns a preview without any IB call.
+
+        `confirm` (destructive-tool gate): when env var
+        REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on, non-dry-run calls
+        require confirm=True to actually transmit.
         """
         try:
             requests = [OrderRequest.from_kwargs(**o) for o in orders]
@@ -1402,6 +1561,21 @@ class IBKRClient:
                 "orders": [{"preview": p, "order_id": None, "perm_id": None} for p in previews],
                 "message": "dry_run; OCA group not transmitted",
             }
+
+        # Destructive-tool gate.
+        if self._needs_confirmation(confirm):
+            return self._confirm_response(
+                action="place_oca_group",
+                preview={
+                    "group_id": oca_group_name,
+                    "legs": previews,
+                },
+                hint=(
+                    "REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on. "
+                    f"This would transmit an OCA group of {len(previews)} linked orders. "
+                    "Re-call with confirm=true to actually transmit."
+                ),
+            )
 
         if not await self._ensure_connected():
             return {

@@ -130,6 +130,11 @@ TOOLS = [
                 "outside_rth": {"type": "boolean"},
                 "account": {"type": "string"},
                 "dry_run": {"type": "boolean"},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on; otherwise ignored.",
+                },
             },
             "required": ["symbol", "action", "quantity", "order_type"],
             "additionalProperties": False,
@@ -220,6 +225,11 @@ TOOLS = [
                     "enum": ["cancel", "liquidate_filled", "convert_to_swing_loop"],
                     "default": "cancel",
                 },
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on.",
+                },
             },
             "required": ["symbol"],
             "additionalProperties": False,
@@ -269,7 +279,14 @@ TOOLS = [
         description="Cancel all open swing orders and stop the loop for `symbol`.",
         inputSchema={
             "type": "object",
-            "properties": {"symbol": {"type": "string"}},
+            "properties": {
+                "symbol": {"type": "string"},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on.",
+                },
+            },
             "required": ["symbol"],
             "additionalProperties": False,
         },
@@ -320,6 +337,11 @@ TOOLS = [
                 "require_volume_confirmation": {"type": "boolean"},
                 "volume_threshold_multiplier": {"type": "number"},
                 "cooldown_hours": {"type": "integer"},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on AND a structural param is being changed.",
+                },
             },
             "required": ["symbol"],
             "additionalProperties": False,
@@ -345,6 +367,11 @@ TOOLS = [
                     "type": "boolean",
                     "default": False,
                     "description": "Validate every leg and return a preview without transmission.",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on.",
                 },
             },
             "required": ["oca_group_name", "orders"],
@@ -480,7 +507,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         elif name == "stop_reversal_entry":
             symbol = arguments.pop("symbol")
             action = arguments.get("action", "cancel")
-            result = await ibkr_client.stop_reversal_entry(symbol, action)
+            confirm = arguments.get("confirm", False)
+            result = await ibkr_client.stop_reversal_entry(symbol, action, confirm=confirm)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "get_reversal_status":
@@ -497,7 +525,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "stop_swing_strategy":
-            result = await ibkr_client.stop_swing_strategy(arguments["symbol"])
+            confirm = arguments.get("confirm", False)
+            result = await ibkr_client.stop_swing_strategy(arguments["symbol"], confirm=confirm)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "get_swing_status":
@@ -520,6 +549,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 oca_group_name=arguments["oca_group_name"],
                 oca_type=arguments.get("oca_type", 1),
                 dry_run=arguments.get("dry_run", False),
+                confirm=arguments.get("confirm", False),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
