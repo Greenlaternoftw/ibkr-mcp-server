@@ -191,6 +191,7 @@ Available overrides for the watchdog:
 | `IBKR_WATCHDOG_GATEWAY_PORT` | `4002` | Port to check for listening |
 | `IBKR_WATCHDOG_GATEWAY_WAIT` | `90` | Seconds to wait after Gateway restart |
 | `IBKR_WATCHDOG_DAEMON_WAIT` | `5` | Seconds to wait after daemon restart |
+| `IBKR_WATCHDOG_STATE_FILE` | `/tmp/ibkr-watchdog.last-state` | Tracks last-known state so we only alert on transitions |
 
 Daily-restart accepts `IBKR_OPS_LOG`, `IBKR_GATEWAY_COMPOSE`,
 `IBKR_GATEWAY_WAIT` with equivalent meanings.
@@ -201,6 +202,77 @@ Daily-restart accepts `IBKR_OPS_LOG`, `IBKR_GATEWAY_COMPOSE`,
 crontab -e                            # remove the two ibkr-* lines
 sudo rm /etc/sudoers.d/ibkr-ops
 ```
+
+---
+
+## Phone alerts (ntfy.sh)
+
+The daemon will push an iOS/Android notification to your phone when:
+
+1. **The daemon loses its IBKR connection** — fired from inside the daemon by
+   `IBKRClient._on_disconnect`. De-duplicated so a single physical drop produces
+   one alert even if ib_async re-emits the event during retries.
+2. **The daemon HTTP is unreachable** ("hang up of server") — fired from
+   `scripts/ibkr-watchdog.sh`. The daemon obviously can't notify when it's the
+   wedged thing, so the watchdog doubles as the alarm.
+3. **The chain recovers** — single "✅ IBKR reconnected" when the daemon's
+   connection is restored, and a "chain recovered" message from the watchdog
+   when whatever it was healing comes back.
+
+Watchdog alerts are debounced via a `/tmp/ibkr-watchdog.last-state` token so
+a 6-hour outage is one alert, not 72.
+
+### Setup (5 minutes)
+
+1. Install the **ntfy** app on your phone (free, App Store / Play Store).
+2. Pick a topic name you can subscribe to. Topic names are PUBLIC — anyone
+   who knows the topic can read its messages, so make it unguessable:
+   ```bash
+   echo "ibkr-$(openssl rand -hex 4)"
+   # -> e.g. ibkr-a3f7c129
+   ```
+3. In the ntfy app, tap "+" and subscribe to that topic.
+4. On the VPS, edit `.env`:
+   ```ini
+   NOTIFY_ENABLED=true
+   NTFY_URL=https://ntfy.sh
+   NTFY_TOPIC=ibkr-a3f7c129     # whatever you generated above
+   ```
+5. Restart the daemon so it picks up the new env:
+   ```bash
+   sudo systemctl restart ibkr-mcp
+   ```
+6. Verify with a test push:
+   ```bash
+   curl -d "test alert from VPS" \
+        -H "Title: IBKR alerts wired" \
+        -H "Priority: 3" \
+        https://ntfy.sh/ibkr-a3f7c129
+   ```
+   You should get a push within ~2 seconds.
+
+### Verify the watchdog path
+
+Force a "daemon down" alert by stopping the daemon briefly. The watchdog
+will detect it on its next 5-minute tick and:
+- POST an alert to your topic (title "IBKR daemon HTTP wedged")
+- Restart the daemon
+- POST a "chain recovered" alert on the following tick
+
+```bash
+sudo systemctl stop ibkr-mcp
+# wait for the next */5 cron tick, then check:
+tail -n 20 /home/trader/ibkr-watchdog.log
+```
+
+If you see the watchdog log entries but no push: the daemon's notify path
+is failure-silent on purpose, so confirm `NOTIFY_ENABLED` and `NTFY_TOPIC`
+are set in `.env` and that the manual `curl` test above worked.
+
+### Disabling alerts
+
+`NOTIFY_ENABLED=false` in `.env` + daemon restart. The watchdog reads the
+same `.env` so a single toggle disables both paths.
 
 ---
 

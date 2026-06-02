@@ -41,6 +41,7 @@ from .swing import (
 )
 from .oca import make_group_id
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
+from . import notify
 
 
 def _classify_shortable(raw: Optional[float]) -> str:
@@ -88,6 +89,15 @@ class IBKRClient:
         # Connection state
         self._connected = False
         self._connecting = False
+        # _had_prior_connection: distinguishes "first connect since process
+        # start" from "reconnect after a drop". Only the latter fires a
+        # reconnect alert — we don't want a notification every time the
+        # daemon boots cleanly. Flipped True by _on_disconnect.
+        self._had_prior_connection = False
+        # Guard against double-firing the disconnect alert during ib_async's
+        # built-in retry storms (it can re-emit disconnectedEvent multiple
+        # times for a single physical drop). Reset by a successful connect.
+        self._disconnect_alert_sent = False
 
         # Layer 3 — reversal entry: per-symbol state + background tasks.
         # Loaded lazily on first access (so tests with isolated state paths
@@ -252,8 +262,16 @@ class IBKRClient:
             
             self._connected = True
             self.reconnect_attempts = 0
+
+            # Phone alert: fire ONLY if this connect follows a prior drop,
+            # not on the daemon's initial boot. The _on_disconnect handler
+            # sets _had_prior_connection=True; we reset _disconnect_alert_sent
+            # here so the next disconnect can alert again.
+            if self._had_prior_connection and self._disconnect_alert_sent:
+                notify.alert_reconnect()
+            self._disconnect_alert_sent = False
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Failed to connect to IBKR: {e}")
             raise IBKRConnectionError(f"Connection failed: {e}")
@@ -271,6 +289,15 @@ class IBKRClient:
         """Handle disconnection with automatic reconnection."""
         self._connected = False
         self.logger.warning("IBKR disconnected, scheduling reconnection...")
+        # Phone alert: fire at most once per disconnect episode. ib_async
+        # can re-emit disconnectedEvent during its own retry loop, so the
+        # _disconnect_alert_sent flag de-dupes until a fresh connect() resets
+        # it. _had_prior_connection arms the next connect() to fire a
+        # "reconnected" alert.
+        if not self._disconnect_alert_sent:
+            self._disconnect_alert_sent = True
+            self._had_prior_connection = True
+            notify.alert_disconnect()
         asyncio.create_task(self._reconnect())
     
     def _on_error(self, reqId, errorCode, errorString, contract):

@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     mcp_bind_host: str = "127.0.0.1"
     mcp_bind_port: int = 8765
     mcp_auth_token: Optional[str] = None
+
+    # Phone alerts via ntfy.sh.
+    #
+    # Two events are wired today:
+    #   * daemon loses its IBKR connection (from ibkr_mcp_server.client)
+    #   * daemon HTTP becomes unresponsive (from scripts/ibkr-watchdog.sh)
+    #
+    # The watchdog reads NTFY_URL/NTFY_TOPIC straight out of the .env file —
+    # keep the names in sync if you rename here.
+    #
+    # Topic names are PUBLIC: anyone who knows the topic can read its
+    # messages. Pick something unguessable (e.g. `ibkr-<8 random hex>`).
+    notify_enabled: bool = False
+    ntfy_url: str = "https://ntfy.sh"
+    ntfy_topic: Optional[str] = None
     
     @field_validator('ibkr_managed_accounts')
     @classmethod
