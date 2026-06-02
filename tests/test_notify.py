@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -224,3 +224,77 @@ class TestClientWiring:
             c._on_disconnect()
         assert alert.call_count == 1
         assert c._had_prior_connection is True
+
+
+# --- persistent reconnect loop --------------------------------------------
+#
+# These cover the bug that motivated the loop: the old single-shot
+# _reconnect gave up at T+8s, so IBKR-Gateway restarts (which take ~90s
+# to IBC-relogin) left the daemon stuck until cron noticed. Behavior we
+# need now: keep trying until success or max_duration, then alert.
+
+
+class TestPersistentReconnect:
+    @pytest.fixture
+    def reconnect_client(self):
+        """Bare client wired so _reconnect can run quickly under unit-test
+        budgets. We monkey-patch the class attributes to ~0 so the loop's
+        own sleeps don't actually pause the test."""
+        from ibkr_mcp_server.client import IBKRClient
+
+        c = IBKRClient()
+        c.reconnect_delay = 0  # skip the initial pause
+        c.RECONNECT_RETRY_INTERVAL = 0.01
+        c.RECONNECT_MAX_DURATION = 1.0  # plenty for the test cases
+        return c
+
+    @pytest.mark.asyncio
+    async def test_succeeds_on_first_attempt(self, reconnect_client):
+        """Happy path: connect() works immediately, loop exits without
+        firing the failure alert."""
+        c = reconnect_client
+        connect_mock = AsyncMock(return_value=True)
+        with patch.object(c, "connect", connect_mock), \
+             patch("ibkr_mcp_server.client.notify.alert_reconnect_failed") as failed:
+            await c._reconnect()
+        assert connect_mock.await_count == 1
+        assert not failed.called
+
+    @pytest.mark.asyncio
+    async def test_succeeds_after_several_failures(self, reconnect_client):
+        """Realistic IBC scenario: first few connect() attempts raise
+        (Gateway still booting), then one succeeds. Loop must keep going
+        and NOT fire the failure alert."""
+        c = reconnect_client
+
+        attempts = {"n": 0}
+
+        async def flaky():
+            attempts["n"] += 1
+            if attempts["n"] < 4:
+                raise ConnectionError("gateway not ready")
+            return True
+
+        with patch.object(c, "connect", side_effect=flaky), \
+             patch("ibkr_mcp_server.client.notify.alert_reconnect_failed") as failed:
+            await c._reconnect()
+        assert attempts["n"] == 4
+        assert not failed.called
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_duration(self, reconnect_client):
+        """If connect() never succeeds within RECONNECT_MAX_DURATION, the
+        loop exits and fires alert_reconnect_failed with attempt count."""
+        c = reconnect_client
+        c.RECONNECT_MAX_DURATION = 0.05  # tiny ceiling — guarantees exhaustion
+
+        connect_mock = AsyncMock(side_effect=ConnectionError("never recovers"))
+        with patch.object(c, "connect", connect_mock), \
+             patch("ibkr_mcp_server.client.notify.alert_reconnect_failed") as failed:
+            await c._reconnect()
+        assert connect_mock.await_count >= 1
+        assert failed.called
+        # The alert should report SOMETHING for attempts and duration.
+        kwargs = failed.call_args.kwargs
+        assert kwargs.get("attempts", 0) >= 1
+        assert kwargs.get("duration_seconds", -1) >= 0

@@ -153,3 +153,23 @@ def alert_reconnect() -> None:
         priority=2,
         tags=["white_check_mark"],
     )
+
+
+def alert_reconnect_failed(attempts: int, duration_seconds: int) -> None:
+    """Daemon's persistent reconnect loop gave up.
+
+    Means we tried for the configured ceiling (default 10 minutes) and
+    couldn't get IBKR back. At this point the watchdog cron is the
+    next line of defence — it'll restart the daemon process from
+    scratch, which often clears whatever was stuck.
+    """
+    send(
+        title="IBKR reconnect failed",
+        message=(
+            f"Daemon retried {attempts} times over {duration_seconds}s without "
+            "restoring IBKR. Watchdog will restart the daemon on its next tick. "
+            "If this keeps recurring, check Gateway container logs."
+        ),
+        priority=5,
+        tags=["rotating_light", "x"],
+    )

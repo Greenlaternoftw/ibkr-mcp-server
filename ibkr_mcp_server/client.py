@@ -3,6 +3,7 @@
 import asyncio
 import datetime as dt
 import logging
+import time
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 from decimal import Decimal
@@ -175,6 +176,14 @@ class IBKRClient:
     HISTDATA_TIMEOUT = 20.0
     SUMMARY_TIMEOUT = 5.0
 
+    # _reconnect() loop tuning. The default retry_on_failure decorator on
+    # connect() gives up after 3 attempts in ~8 seconds — far too short for
+    # an IBKR-Gateway restart, where IBC needs 60-90 seconds to re-login.
+    # The persistent loop below keeps polling until connect() succeeds or
+    # RECONNECT_MAX_DURATION elapses.
+    RECONNECT_RETRY_INTERVAL = 5.0   # seconds between attempts
+    RECONNECT_MAX_DURATION = 600.0   # 10 min ceiling, then alert + give up
+
     async def _bounded(self, coro, *, timeout: float, op: str):
         """Run an IB coroutine with a hard timeout.
 
@@ -309,12 +318,60 @@ class IBKRClient:
             self.logger.error(f"IBKR Error {errorCode}: {errorString} (reqId: {reqId})")
     
     async def _reconnect(self):
-        """Background reconnection task."""
-        try:
-            await asyncio.sleep(self.reconnect_delay)
-            await self.connect()
-        except Exception as e:
-            self.logger.error(f"Reconnection failed: {e}")
+        """Persistent background reconnect after a drop.
+
+        Why this is a loop and not just one connect() call:
+
+        connect() is decorated with @retry_on_failure(max_attempts=3),
+        which does ~8s of fast retries and then raises. That's fine for
+        transient TCP blips but useless for the common IBKR-Gateway
+        scenario where IBC needs 60-90s to log back in after a container
+        restart or nightly server reset. The old single-shot _reconnect
+        would give up at T+8s and leave the daemon stuck disconnected
+        until the watchdog cron noticed 5 minutes later. That's a
+        5-10 minute blind window in the middle of trading hours.
+
+        New behavior: poll every RECONNECT_RETRY_INTERVAL seconds until
+        either connect() succeeds (the success path in connect() fires
+        the "reconnected" phone alert) or RECONNECT_MAX_DURATION elapses
+        (then we alert + give up; the watchdog will daemon-restart us
+        from a clean state).
+        """
+        start = time.monotonic()
+        attempt = 0
+
+        # Brief initial pause so we don't slam the broker at T+0; gives
+        # Gateway a moment to start its own recovery.
+        await asyncio.sleep(self.reconnect_delay)
+
+        while time.monotonic() - start < self.RECONNECT_MAX_DURATION:
+            attempt += 1
+            try:
+                if await self.connect():
+                    # connect() success path fires alert_reconnect() and
+                    # clears _disconnect_alert_sent. Nothing more to do.
+                    self.logger.info(
+                        f"Reconnect succeeded on attempt {attempt} "
+                        f"after {int(time.monotonic() - start)}s"
+                    )
+                    return
+            except Exception as e:
+                # connect()'s @retry_on_failure already burned ~3-8s of
+                # internal retries before raising, so we just log and
+                # wait for the next outer-loop tick.
+                self.logger.warning(
+                    f"Reconnect attempt {attempt} failed: {e}. "
+                    f"Will retry in {self.RECONNECT_RETRY_INTERVAL:.0f}s."
+                )
+
+            await asyncio.sleep(self.RECONNECT_RETRY_INTERVAL)
+
+        elapsed = int(time.monotonic() - start)
+        self.logger.error(
+            f"Reconnect gave up after {attempt} attempts over {elapsed}s -- "
+            "watchdog should daemon-restart us on its next cron tick"
+        )
+        notify.alert_reconnect_failed(attempts=attempt, duration_seconds=elapsed)
     
     def is_connected(self) -> bool:
         """Check connection status."""
