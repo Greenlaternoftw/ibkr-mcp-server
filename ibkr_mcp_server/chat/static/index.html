@@ -2218,8 +2218,8 @@
     <div>
       <h2>Chat with Claude</h2>
       <div class="chat-view-meta">
-        IBKR MCP: <span id="mcpStatusBadge" style="color:var(--muted);">not configured</span> ·
-        <a href="#" onclick="openSettings(); return false;" style="color: var(--accent); text-decoration:none; font-weight:500;">Configure</a>
+        Daemon-routed · IBKR MCP attached server-side ·
+        <a href="#" onclick="openSettings(); return false;" style="color: var(--accent); text-decoration:none; font-weight:500;">Settings</a>
       </div>
     </div>
     <button class="portfolio-btn" onclick="clearChatHistory()">Clear chat</button>
@@ -2487,68 +2487,46 @@ document.addEventListener('keydown', e => {
 });
 
 /* ============================================================
-   SETTINGS / MCP CONFIG
+   SETTINGS — daemon health + PWA status only
+   Was previously a form for an external MCP URL. In this build the
+   local daemon IS the MCP -- nothing for the user to configure here,
+   so the panel is read-only status + a lock button.
 ============================================================ */
-async function loadMcpConfig() {
-  try {
-    const raw = await storage.get('mcpConfig');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      mcpConfig.url = parsed.url || '';
-      mcpConfig.name = parsed.name || 'ibkr';
-    }
-  } catch (e) { /* first run */ }
-  updateMcpStatusBadge();
-}
-
-async function saveMcpConfig() {
-  await storage.set('mcpConfig', JSON.stringify(mcpConfig));
-}
-
 function openSettings() {
-  document.getElementById('settingsMcpUrl').value = mcpConfig.url || '';
-  document.getElementById('settingsMcpName').value = mcpConfig.name || 'ibkr';
-  document.getElementById('settingsEnv').textContent = isClaudeStorage ? 'Claude.ai artifact' : 'Standalone (PWA / file)';
-  document.getElementById('settingsStorage').textContent = isClaudeStorage ? 'window.storage' : 'localStorage';
-  document.getElementById('settingsMcpConfigured').textContent = mcpConfig.url ? '✓ ' + new URL(mcpConfig.url).host : '— not configured';
-  document.getElementById('settingsMcpConfigured').style.color = mcpConfig.url ? 'var(--go)' : 'var(--muted)';
+  // Default values; populated by the live probe below.
+  document.getElementById('settingsDaemon').textContent = '— checking…';
+  document.getElementById('settingsDaemon').style.color = 'var(--muted)';
+  document.getElementById('settingsModel').textContent = '—';
+  document.getElementById('settingsTools').textContent = '—';
   const isPwa = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
-  document.getElementById('settingsPwa').textContent = isPwa ? '✓ Running as installed app' : 'Running in browser';
+  document.getElementById('settingsPwa').textContent = isPwa
+    ? '✓ Running as installed app'
+    : 'Running in browser';
+  document.getElementById('settingsPwa').style.color = isPwa ? 'var(--go)' : 'var(--muted)';
   document.getElementById('testMcpResult').textContent = '';
   document.getElementById('settingsOverlay').classList.add('show');
+
+  // Live probe -- so the panel reflects current daemon state every open.
+  daemonGet('/chat/api/health').then(j => {
+    const ok = j.chat_enabled && j.has_api_key;
+    document.getElementById('settingsDaemon').textContent = ok ? '✓ ready' : '⚠ not fully configured';
+    document.getElementById('settingsDaemon').style.color = ok ? 'var(--go)' : 'var(--warn)';
+    document.getElementById('settingsModel').textContent = j.model || '—';
+    document.getElementById('settingsTools').textContent = (j.tool_count != null) ? String(j.tool_count) : '—';
+  }).catch(() => {
+    document.getElementById('settingsDaemon').textContent = '✗ unreachable';
+    document.getElementById('settingsDaemon').style.color = 'var(--stop)';
+  });
 }
 
 function closeSettings() {
   document.getElementById('settingsOverlay').classList.remove('show');
 }
 
-async function saveSettings() {
-  const url = document.getElementById('settingsMcpUrl').value.trim();
-  const name = document.getElementById('settingsMcpName').value.trim() || 'ibkr';
-  if (url && !/^https?:\/\//i.test(url)) {
-    alert('MCP URL must start with http:// or https://');
-    return;
-  }
-  if (url && /localhost|127\.0\.0\.1/i.test(url)) {
-    const ok = confirm(
-      'WARNING: localhost URLs are not reachable from the Anthropic API.\n\n' +
-      'This MCP will not work for chat-driven actions until you expose it via a tunnel.\n\n' +
-      'Save anyway?'
-    );
-    if (!ok) return;
-  }
-  mcpConfig.url = url;
-  mcpConfig.name = name;
-  await saveMcpConfig();
-  updateMcpStatusBadge();
-  closeSettings();
-}
-
 async function testMcpConnection() {
-  // The Settings panel still exists for legacy MCP-URL display, but in
-  // this build the daemon IS the MCP -- there's no separate URL to
-  // configure. This button now runs the same daemon health probe
-  // diagnoseAPI does, scoped to the chat engine being ready.
+  // The daemon IS the MCP -- this is a chat-readiness probe. Same call
+  // openSettings() runs, surfaced as an explicit button so the operator
+  // can re-check after a daemon restart without closing the panel.
   const out = document.getElementById('testMcpResult');
   const btn = document.getElementById('testMcpBtn');
   btn.disabled = true;
@@ -2568,24 +2546,6 @@ async function testMcpConnection() {
   } finally {
     btn.disabled = false;
     btn.textContent = 'Test Daemon';
-  }
-}
-
-function updateMcpStatusBadge() {
-  const badge = document.getElementById('mcpStatusBadge');
-  if (badge) {
-    if (mcpConfig.url) {
-      try {
-        badge.textContent = new URL(mcpConfig.url).host;
-        badge.style.color = 'var(--go)';
-      } catch (e) {
-        badge.textContent = 'invalid URL';
-        badge.style.color = 'var(--stop)';
-      }
-    } else {
-      badge.textContent = 'not configured';
-      badge.style.color = 'var(--muted)';
-    }
   }
 }
 
@@ -2674,12 +2634,6 @@ const portfolios = {
   data: {},
 };
 
-// MCP configuration — points API calls at the user's IBKR MCP server
-const mcpConfig = {
-  url: '',
-  name: 'ibkr',
-};
-
 // Conversation history for the interactive Chat View
 const chatHistory = [];
 let pendingImage = null;        // { mediaType, data, name } for the next message
@@ -2764,7 +2718,6 @@ async function daemonDelete(path) {
    it lives in localStorage because we need it before we can hit
    any /chat/api/* endpoint.
 ============================================================ */
-const isClaudeStorage = false;   // legacy flag kept for the Settings modal label
 const _prefsCache = { loaded: false, data: {} };
 async function _ensurePrefsLoaded() {
   if (_prefsCache.loaded) return;
@@ -3058,23 +3011,45 @@ function switchPortfolio(alias) {
   renderPortfolios();
 }
 
-async function addPortfolio() {
-  const alias = prompt('New tab alias (e.g. "Trading", "Roth IRA", "Speculation"):');
-  if (!alias || !alias.trim()) return;
-  const a = alias.trim();
-  if (portfolios.data[a]) {
-    alert('Tab "' + a + '" already exists.');
+// Open the inline "Add a watchlist or portfolio" modal. Replaces the
+// old native prompt() which iOS Safari renders as an ugly system dialog
+// and PWA standalone mode handles inconsistently.
+function addPortfolio() {
+  const input = document.getElementById('addPortfolioName');
+  const err   = document.getElementById('addPortfolioError');
+  if (input) input.value = '';
+  if (err)   err.textContent = '';
+  document.getElementById('addPortfolioOverlay').classList.add('show');
+  // Focus once the modal is painted -- iOS otherwise misses the keypad pop.
+  requestAnimationFrame(() => input && input.focus());
+}
+
+function closeAddPortfolio() {
+  document.getElementById('addPortfolioOverlay').classList.remove('show');
+}
+
+async function confirmAddPortfolio() {
+  const input = document.getElementById('addPortfolioName');
+  const err   = document.getElementById('addPortfolioError');
+  const raw   = (input.value || '').trim();
+  if (!raw) {
+    err.textContent = 'Enter a name first.';
+    return;
+  }
+  if (portfolios.data[raw]) {
+    err.textContent = `Tab "${raw}" already exists.`;
     return;
   }
   try {
-    const wl = await daemonPost('/chat/api/watchlists', { name: a });
-    const type = a.toLowerCase().includes('watch') ? 'watchlist' : 'portfolio';
-    portfolios.data[a] = { id: wl.id, alias: a, type, accountId: '', stocks: {} };
-    portfolios.active = a;
+    const wl = await daemonPost('/chat/api/watchlists', { name: raw });
+    const type = raw.toLowerCase().includes('watch') ? 'watchlist' : 'portfolio';
+    portfolios.data[raw] = { id: wl.id, alias: raw, type, accountId: '', stocks: {} };
+    portfolios.active = raw;
     await savePortfolios();
     renderPortfolios();
+    closeAddPortfolio();
   } catch (e) {
-    alert('Could not create tab: ' + e.message);
+    err.textContent = 'Could not create tab: ' + (e.message || 'unknown error');
   }
 }
 
@@ -3331,6 +3306,7 @@ document.addEventListener('keydown', e => {
     if (document.getElementById('qxOverlay')?.classList.contains('show')) closeQuickExit();
     if (document.getElementById('qbOverlay')?.classList.contains('show')) closeQuickBuy();
     if (document.getElementById('settingsOverlay')?.classList.contains('show')) closeSettings();
+    if (document.getElementById('addPortfolioOverlay')?.classList.contains('show')) closeAddPortfolio();
   }
 });
 
@@ -4907,7 +4883,6 @@ function startLiveSyncStream() {
 // bearer token. The post-PIN bootApp callback will fire when the
 // user unlocks (or the cached token validates).
 recalc();
-loadMcpConfig();
 // PIN gate runs and, on success, calls bootAppPostPin() which loads
 // portfolios + starts the account-summary + live-sync streams.
 pinLoadConfig();
@@ -5065,6 +5040,36 @@ pinLoadConfig();
 </div>
 
 <!-- ============ SETTINGS MODAL ============ -->
+<!-- ============ ADD-PORTFOLIO OVERLAY (replaces native prompt) ============ -->
+<div class="qx-overlay" id="addPortfolioOverlay" onclick="if(event.target===this) closeAddPortfolio()">
+  <div class="qx-modal" style="border-top-color: var(--accent-deep); max-width: 420px;" role="dialog" aria-labelledby="addPortfolioTitle">
+    <div class="qx-header">
+      <div>
+        <div class="qx-eyebrow" style="color: var(--accent-deep);">NEW TAB</div>
+        <h2 class="qx-title" id="addPortfolioTitle">Add a watchlist or portfolio</h2>
+      </div>
+      <button class="qx-close" onclick="closeAddPortfolio()" aria-label="Close">✕</button>
+    </div>
+    <div class="qx-body">
+      <div class="qx-row">
+        <label class="qx-label" for="addPortfolioName">Name</label>
+        <input type="text" id="addPortfolioName" class="qx-qty-input"
+               placeholder='e.g. "Trading", "Roth IRA", "Watchlist 2"'
+               autocomplete="off" autocapitalize="words"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();confirmAddPortfolio();} if(event.key==='Escape'){closeAddPortfolio();}" />
+        <div style="margin-top:8px; font-size:11px; color: var(--text-2); line-height:1.5;">
+          Tabs containing "watch" become watchlists; everything else is treated as a portfolio.
+        </div>
+        <div id="addPortfolioError" style="margin-top:10px; font-size:12px; color: var(--stop); min-height:14px;"></div>
+      </div>
+    </div>
+    <div class="qx-footer">
+      <button class="qx-cancel" onclick="closeAddPortfolio()">Cancel</button>
+      <button class="qx-execute" onclick="confirmAddPortfolio()" style="background:var(--accent-deep);">Add</button>
+    </div>
+  </div>
+</div>
+
 <div class="qx-overlay" id="settingsOverlay" onclick="if(event.target===this) closeSettings()">
   <div class="qx-modal" style="border-top-color: var(--accent-deep); max-width: 580px;" role="dialog">
     <div class="qx-header">
@@ -5076,34 +5081,22 @@ pinLoadConfig();
     </div>
 
     <div class="qx-body">
-      <div class="qx-row">
-        <label class="qx-label">IBKR MCP Server URL</label>
-        <input type="url" id="settingsMcpUrl" class="qx-qty-input" placeholder="https://your-tunnel.example.com/mcp" style="font-size:13px;" />
-        <div style="margin-top: 10px; font-size: 12px; color: var(--text-2); line-height: 1.6;">
-          The Anthropic API needs to reach this URL to use your MCP.
-          <strong style="color: var(--stop);">Localhost URLs won't work</strong> — expose your local MCP via
-          Cloudflare Tunnel, ngrok, or a hosted endpoint.
-        </div>
-      </div>
-
-      <div class="qx-row">
-        <label class="qx-label">MCP Name</label>
-        <input type="text" id="settingsMcpName" class="qx-qty-input" placeholder="ibkr" style="font-size:13px;" />
-        <div style="margin-top: 6px; font-size: 11px; color: var(--text-2);">
-          Used to identify the server in API calls. Keep it short and lowercase.
-        </div>
+      <div style="margin: 0 0 14px; font-size:12px; color: var(--text-2); line-height: 1.55;">
+        This build talks to the IBKR MCP via the local daemon — no external
+        tunnel needed. The browser only holds your bearer token; everything
+        else is server-side.
       </div>
 
       <div class="qx-construct" id="settingsStatus">
         <div class="qx-label" style="margin-bottom:8px;">Current Status</div>
-        <div class="qx-construct-row"><span class="qx-c-key">Environment</span><span class="qx-c-val" id="settingsEnv">—</span></div>
-        <div class="qx-construct-row"><span class="qx-c-key">Storage</span><span class="qx-c-val" id="settingsStorage">—</span></div>
-        <div class="qx-construct-row"><span class="qx-c-key">MCP configured</span><span class="qx-c-val" id="settingsMcpConfigured">—</span></div>
+        <div class="qx-construct-row"><span class="qx-c-key">Daemon</span><span class="qx-c-val" id="settingsDaemon">—</span></div>
+        <div class="qx-construct-row"><span class="qx-c-key">Model</span><span class="qx-c-val" id="settingsModel">—</span></div>
+        <div class="qx-construct-row"><span class="qx-c-key">Tools loaded</span><span class="qx-c-val" id="settingsTools">—</span></div>
         <div class="qx-construct-row"><span class="qx-c-key">PWA install</span><span class="qx-c-val" id="settingsPwa">—</span></div>
       </div>
 
       <div style="margin-top: 16px;">
-        <button class="portfolio-btn" onclick="testMcpConnection()" id="testMcpBtn" style="width:100%;">Test MCP Connection</button>
+        <button class="portfolio-btn" onclick="testMcpConnection()" id="testMcpBtn" style="width:100%;">Test Daemon</button>
         <div id="testMcpResult" style="margin-top:10px; font-family:'JetBrains Mono', monospace; font-size:11px; line-height:1.5; min-height:14px;"></div>
       </div>
 
@@ -5117,8 +5110,7 @@ pinLoadConfig();
     </div>
 
     <div class="qx-footer">
-      <button class="qx-cancel" onclick="closeSettings()">Cancel</button>
-      <button class="qx-execute" onclick="saveSettings()" style="background:var(--accent-deep);">Save</button>
+      <button class="qx-execute" onclick="closeSettings()" style="background:var(--accent-deep);">Close</button>
     </div>
   </div>
 </div>
