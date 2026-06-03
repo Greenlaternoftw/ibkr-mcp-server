@@ -302,6 +302,69 @@ TOOLS = [
         },
     ),
     Tool(
+        name="get_regime_chart",
+        description=(
+            "Render a price chart with the regime filter's verdict overlaid. "
+            "Title shows ENABLED / DISABLED + which gates failed (trend, "
+            "trend strength, volatility). Text result includes the gate "
+            "numbers (ADX, ATR%, SMA slope). Use when the user asks why "
+            "the regime is on/off, why no trades are firing, or wants to "
+            "see the regime's reasoning visually."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Calendar days of history. Default 250 (regime needs ADX/ATR warmup).",
+                    "default": 250,
+                    "minimum": 60,
+                    "maximum": 730,
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["dark", "light"],
+                    "default": "dark",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="get_reversal_visualization",
+        description=(
+            "Render a price chart with the reversal entry's tranche fills "
+            "overlaid: one marker per filled tranche (labeled with index "
+            "and fill price), an average-fill horizontal line, and a text "
+            "summary of remaining budget + unrealized P&L. Use when the "
+            "user asks about a reversal entry in progress -- 'how's my "
+            "TSLA reversal', 'what tranches have filled', etc. Errors if "
+            "no active reversal exists for the symbol."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Calendar days of history. Default 180.",
+                    "default": 180,
+                    "minimum": 5,
+                    "maximum": 730,
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["dark", "light"],
+                    "default": "dark",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="get_swing_visualization",
         description=(
             "Render the swing strategy's state on top of a candlestick chart. "
@@ -618,6 +681,54 @@ async def call_tool(
             )
             if result.get("status") != "ok":
                 # Error path -- return text only so the model can surface it.
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                )]
+            png_b64 = result.pop("image_png_b64")
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                ),
+                ImageContent(
+                    type="image",
+                    data=png_b64,
+                    mimeType="image/png",
+                ),
+            ]
+
+        elif name == "get_regime_chart":
+            result = await ibkr_client.get_regime_chart(
+                arguments["symbol"],
+                lookback_days=arguments.get("lookback_days", 250),
+                theme=arguments.get("theme", "dark"),
+            )
+            if result.get("status") != "ok":
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                )]
+            png_b64 = result.pop("image_png_b64")
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                ),
+                ImageContent(
+                    type="image",
+                    data=png_b64,
+                    mimeType="image/png",
+                ),
+            ]
+
+        elif name == "get_reversal_visualization":
+            result = await ibkr_client.get_reversal_visualization(
+                arguments["symbol"],
+                lookback_days=arguments.get("lookback_days", 180),
+                theme=arguments.get("theme", "dark"),
+            )
+            if result.get("status") != "ok":
                 return [TextContent(
                     type="text",
                     text=json.dumps(result, indent=2, default=str),

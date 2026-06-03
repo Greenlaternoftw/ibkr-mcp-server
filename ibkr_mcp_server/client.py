@@ -988,6 +988,202 @@ class IBKRClient:
             "image_png_b64": base64.b64encode(png).decode("ascii"),
         }
 
+    async def get_regime_chart(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 250,
+        theme: str = "dark",
+        **regime_overrides,
+    ) -> Dict:
+        """Render a chart annotated with the regime filter's current verdict.
+
+        Shows the price + SMA50 (the period used by the trend gate),
+        with the regime classification surfaced in the text summary:
+        which of the three gates pass / fail, the underlying numbers
+        (ADX, ATR%, SMA slope), and the overall ENABLED / DISABLED
+        verdict the trading loop would act on right now.
+
+        Lookback defaults to 250 days because the regime gates have
+        warmup requirements (ADX needs 28+, ATR% rolling avg uses 100,
+        SMA50 needs 50). 250 gives comfortable headroom + plenty of
+        chart history.
+        """
+        from . import charts as _charts
+        from .regime import RegimeConfig, evaluate_gates, aggregate_enabled
+        import base64
+
+        bars = await self.get_historical_bars(symbol, lookback_days=lookback_days)
+        if bars is None or len(bars) == 0:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": "No historical bars returned",
+            }
+
+        cfg = RegimeConfig(**regime_overrides) if regime_overrides else RegimeConfig()
+
+        # Evaluate the gates against the same bars we're going to chart.
+        try:
+            gates = evaluate_gates(bars, cfg)
+            enabled = aggregate_enabled(gates, cfg.require_all_gates)
+        except ValueError as e:
+            # Not enough bars for the regime computation -- still render
+            # the chart but note the limitation.
+            self.logger.warning(f"regime gates failed for {symbol}: {e}")
+            gates = {}
+            enabled = None
+
+        # Build a list of which gates failed for the title / overlay label.
+        if gates:
+            failures = [g for g, info in gates.items() if not info["pass"]]
+            verdict_text = "ENABLED" if enabled else "DISABLED"
+            if failures and not enabled:
+                verdict_text += f" ({', '.join(failures)})"
+        else:
+            verdict_text = "INSUFFICIENT_DATA"
+
+        # Overlay the SMA50 explicitly via the chart's SMA support; the
+        # chart already draws SMA20 + SMA50 by default. We add a "verdict"
+        # text overlay by setting it in the title via the summary.
+        png = await asyncio.to_thread(
+            _charts.render_ohlc_chart,
+            bars,
+            symbol=f"{symbol}  [{verdict_text}]",
+            sma_periods=(20, cfg.sma_period),  # SMA50 by default
+            theme=theme,
+        )
+
+        last = float(bars["close"].iloc[-1])
+        result: Dict = {
+            "status": "ok",
+            "symbol": symbol,
+            "regime_enabled": enabled,
+            "verdict": verdict_text,
+            "gates": gates,
+            "lookback_days": lookback_days,
+            "bars_returned": int(len(bars)),
+            "last_close": round(last, 2),
+            "summary": (
+                f"{symbol} regime: {verdict_text}. Last close ${last:.2f}. "
+                f"Gates: {sum(g['pass'] for g in gates.values())}/{len(gates)} passing."
+                if gates else
+                f"{symbol}: insufficient data for regime computation."
+            ),
+            "image_png_b64": base64.b64encode(png).decode("ascii"),
+        }
+        return result
+
+    async def get_reversal_visualization(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 180,
+        theme: str = "dark",
+    ) -> Dict:
+        """Render a chart with reversal-strategy tranche fills overlaid.
+
+        Shows:
+          * standard candlestick + SMAs
+          * a marker at each filled tranche (green dot, labeled with
+            tranche index and fill price)
+          * a horizontal line at the average fill price (weighted by
+            shares)
+
+        Falls back to a clean error when no active reversal entry
+        exists for the symbol; the dispatcher surfaces this so Claude
+        can suggest get_chart for a generic view.
+        """
+        from . import charts as _charts
+        import base64
+
+        # Load reversal state via the same lazy initializer the rest of
+        # the daemon uses.
+        reversal_states = self._reversal_state_dict()
+        state = reversal_states.get(symbol)
+        if state is None:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": f"No active reversal entry for {symbol}. "
+                           "Use start_reversal_entry first, or use get_chart "
+                           "for a generic price chart.",
+            }
+
+        bars = await self.get_historical_bars(symbol, lookback_days=lookback_days)
+        if bars is None or len(bars) == 0:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": "No historical bars returned",
+            }
+
+        overlays: list[dict] = []
+
+        # Per-tranche markers + compute average fill price (share-weighted).
+        total_shares = 0
+        total_cost = 0.0
+        for t in state.filled_tranches:
+            overlays.append({
+                "type": "marker",
+                "x": t.filled_at[:10],
+                "y": t.fill_price,
+                "label": f"T{t.index} ${t.fill_price:.2f} ({t.shares}sh)",
+                "color": "#10b981",   # green (entry)
+            })
+            total_shares += t.shares
+            total_cost += t.shares * t.fill_price
+
+        avg_fill: float | None = None
+        if total_shares > 0:
+            avg_fill = total_cost / total_shares
+            overlays.append({
+                "type": "hline",
+                "y": avg_fill,
+                "label": f"avg fill ${avg_fill:.2f}",
+                "color": "#38bdf8",   # accent blue
+            })
+
+        png = await asyncio.to_thread(
+            _charts.render_ohlc_chart,
+            bars,
+            symbol=symbol,
+            sma_periods=(20, 50),
+            overlays=overlays,
+            theme=theme,
+        )
+
+        last = float(bars["close"].iloc[-1])
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "reversal_status": state.status.value,
+            "total_dollars_budget": state.total_dollars,
+            "tranches_filled": len(state.filled_tranches),
+            "tranches_total": state.config.tranche_count,
+            "total_shares": total_shares,
+            "total_invested": round(total_cost, 2),
+            "average_fill_price": round(avg_fill, 2) if avg_fill else None,
+            "remaining_budget": round(state.total_dollars - total_cost, 2),
+            "last_close": round(last, 2),
+            "unrealized_pnl_pct": (
+                round((last - avg_fill) / avg_fill * 100, 2) if avg_fill else None
+            ),
+            "lookback_days": lookback_days,
+            "bars_returned": int(len(bars)),
+            "summary": (
+                f"{symbol} reversal: {state.status.value}, "
+                f"{len(state.filled_tranches)}/{state.config.tranche_count} tranches filled. "
+                + (
+                    f"Avg fill ${avg_fill:.2f}, now ${last:.2f} "
+                    f"({(last - avg_fill) / avg_fill * 100:+.1f}%)."
+                    if avg_fill else
+                    f"No fills yet. Watching for signals."
+                )
+            ),
+            "image_png_b64": base64.b64encode(png).decode("ascii"),
+        }
+
     async def check_regime(self, symbol: str, **overrides) -> Dict:
         """Evaluate the Layer 2 regime filter against `symbol`'s recent bars.
 
