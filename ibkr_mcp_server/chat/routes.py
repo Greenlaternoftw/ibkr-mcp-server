@@ -34,11 +34,14 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+import asyncio
+
 from ..config import settings
 from ..tools import TOOLS, call_tool as mcp_call_tool
 from .agent import AnthropicAgent, ChatError, StreamEvent
 from .persistence import ChatStore
 from .prompts import SYSTEM_PROMPT
+from .pubsub import ThreadEventBus
 from .schemas import mcp_tools_to_anthropic
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,48 @@ def reset_store() -> None:
     monkey-patched chat_db_path is picked up)."""
     global _store
     _store = None
+
+
+# Singleton ThreadEventBus per daemon process. Subscribers (open SSE
+# connections) receive every event published from any mutating endpoint.
+# In-memory only -- no cross-process fanout. See chat/pubsub.py for the
+# design rationale.
+_bus: Optional[ThreadEventBus] = None
+
+
+def _get_bus() -> ThreadEventBus:
+    global _bus
+    if _bus is None:
+        _bus = ThreadEventBus()
+    return _bus
+
+
+def reset_bus() -> None:
+    """Test hook -- forces a fresh bus on next request."""
+    global _bus
+    _bus = None
+
+
+async def _publish(event_type: str, *, client_id: Optional[str] = None, **fields) -> None:
+    """Publish a thread event to the bus.
+
+    All sync events go through this helper so the shape stays consistent
+    and originating_client_id is always populated (or None) -- the client
+    relies on that field to skip its own echoes.
+    """
+    try:
+        await _get_bus().publish(
+            {
+                "type": event_type,
+                "originating_client_id": client_id,
+                **fields,
+            }
+        )
+    except Exception:
+        # Publishing must never break the user-facing request. The
+        # browser will resync on next user action even if a push is
+        # missed.
+        logger.exception("failed to publish %s event", event_type)
 
 
 def _build_agent() -> AnthropicAgent:
@@ -101,6 +146,49 @@ def _get_agent() -> AnthropicAgent:
 # --- handlers -------------------------------------------------------------
 
 
+async def events_stream(request: Request) -> Response:
+    """Long-lived SSE stream of thread mutation events.
+
+    Browsers open one connection per tab on page load and keep it open
+    for the life of the tab. Events are pushed as
+    ``data: <json>\\n\\n`` lines; each JSON has at least ``type`` and
+    ``originating_client_id`` (the latter so the originating tab can
+    ignore its own echoes).
+
+    Heartbeat every 25s (well under typical proxy 30s read timeouts
+    and well under iOS's 30s background-tab kill).
+    """
+    bus = _get_bus()
+
+    async def event_source():
+        async with bus.subscribe() as queue:
+            # Initial line so the client knows the connection is live.
+            # Comment lines (starting with `:`) are ignored by EventSource
+            # but flushed through the proxy chain, so they confirm the
+            # full path is unbuffered.
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    # Heartbeat. Doesn't fire an EventSource.onmessage.
+                    yield ": ping\n\n"
+                    continue
+                except asyncio.CancelledError:
+                    return
+                yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 async def list_threads(request: Request) -> Response:
     """List all conversation threads, most-recent first."""
     threads = _get_store().list_threads()
@@ -108,13 +196,19 @@ async def list_threads(request: Request) -> Response:
 
 
 async def create_thread(request: Request) -> Response:
-    """Create a new thread. Body: ``{"title": "..."}`` (title optional)."""
+    """Create a new thread. Body: ``{"title": "...", "client_id": "..."}``."""
     try:
         body = await request.json() if await request.body() else {}
     except json.JSONDecodeError:
         body = {}
     title = (body.get("title") or "").strip() or "New chat"
+    client_id = body.get("client_id")
     thread = _get_store().create_thread(title)
+    await _publish(
+        "thread_created",
+        client_id=client_id,
+        thread_id=thread["id"],
+    )
     return JSONResponse(thread, status_code=201)
 
 
@@ -131,7 +225,7 @@ async def get_thread_messages(request: Request) -> Response:
 
 
 async def rename_thread(request: Request) -> Response:
-    """Rename a thread. Body: ``{"title": "..."}``."""
+    """Rename a thread. Body: ``{"title": "...", "client_id": "..."}``."""
     thread_id = request.path_params["thread_id"]
     try:
         body = await request.json()
@@ -142,14 +236,30 @@ async def rename_thread(request: Request) -> Response:
         return JSONResponse({"error": "title required"}, status_code=400)
     if not _get_store().rename_thread(thread_id, new_title):
         return JSONResponse({"error": "thread not found"}, status_code=404)
+    await _publish(
+        "thread_renamed",
+        client_id=body.get("client_id"),
+        thread_id=thread_id,
+        title=new_title,
+    )
     return JSONResponse({"ok": True, "id": thread_id, "title": new_title})
 
 
 async def delete_thread(request: Request) -> Response:
-    """Hard-delete a thread and all its messages."""
+    """Hard-delete a thread and all its messages.
+
+    ``client_id`` accepted as a query param (since DELETE bodies aren't
+    universally supported by every browser fetch implementation).
+    """
     thread_id = request.path_params["thread_id"]
+    client_id = request.query_params.get("client_id")
     if not _get_store().delete_thread(thread_id):
         return JSONResponse({"error": "thread not found"}, status_code=404)
+    await _publish(
+        "thread_deleted",
+        client_id=client_id,
+        thread_id=thread_id,
+    )
     return Response(status_code=204)
 
 
@@ -225,6 +335,8 @@ async def chat_message_stream(request: Request) -> Response:
     except ChatError as e:
         return JSONResponse({"error": str(e)}, status_code=503)
 
+    client_id = body.get("client_id")
+
     async def event_source():
         # Outer try is the last line of defence -- if the agent crashes
         # before yielding anything, the client still gets an error event
@@ -233,7 +345,8 @@ async def chat_message_stream(request: Request) -> Response:
             async for event in agent.run_stream(messages):
                 # Snapshot the conversation on `done` so we can persist
                 # the canonical post-turn state (includes any tool_use
-                # / tool_result blocks the agent appended).
+                # / tool_result blocks the agent appended), then publish
+                # so other tabs/devices see the change.
                 if event.type == "done" and thread_id:
                     try:
                         _get_store().replace_messages(
@@ -243,6 +356,11 @@ async def chat_message_stream(request: Request) -> Response:
                         logger.exception(
                             "failed to persist chat thread %s", thread_id
                         )
+                    await _publish(
+                        "thread_updated",
+                        client_id=client_id,
+                        thread_id=thread_id,
+                    )
                 yield event.to_sse()
         except Exception as e:
             logger.exception("unexpected error in chat stream")
@@ -311,6 +429,11 @@ async def chat_message(request: Request) -> Response:
             _get_store().replace_messages(thread_id, result.conversation)
         except Exception:
             logger.exception("failed to persist chat thread %s", thread_id)
+        await _publish(
+            "thread_updated",
+            client_id=body.get("client_id"),
+            thread_id=thread_id,
+        )
 
     return JSONResponse(
         {
@@ -374,6 +497,8 @@ def chat_routes() -> List:
             delete_thread,
             methods=["DELETE"],
         ),
+        # Long-lived SSE event stream for live multi-tab/-device sync.
+        Route("/chat/api/events/stream", events_stream, methods=["GET"]),
     ]
 
     if static_dir.exists():

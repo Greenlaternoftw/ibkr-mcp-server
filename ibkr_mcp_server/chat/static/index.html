@@ -256,6 +256,13 @@
   // Future improvement: a real login form. Phase 1 is operator-only.
   const STORAGE_KEY_TOKEN = 'ibkr-chat-token';
 
+  // Per-tab identity. Used to skip self-echoes from the server's pub/sub
+  // bus and from BroadcastChannel (otherwise the tab that just sent a
+  // message would react to its own notification and double-render).
+  // Regenerated on every page load -- no need to persist.
+  const CLIENT_ID = (window.crypto?.randomUUID && crypto.randomUUID()) ||
+                    ('cid-' + Math.random().toString(36).slice(2, 12));
+
   function getStoredToken() {
     return localStorage.getItem(STORAGE_KEY_TOKEN) || '';
   }
@@ -373,7 +380,7 @@
       const r = await fetch('/chat/api/threads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ title: 'New chat' }),
+        body: JSON.stringify({ title: 'New chat', client_id: CLIENT_ID }),
       });
       if (!r.ok) {
         appendMessage('assistant', '❌ Could not create new thread', 'error');
@@ -395,7 +402,8 @@
     if (!currentThreadId) return;
     if (!confirm('Delete this conversation? This cannot be undone.')) return;
     try {
-      await fetch('/chat/api/threads/' + encodeURIComponent(currentThreadId), {
+      await fetch('/chat/api/threads/' + encodeURIComponent(currentThreadId) +
+                  '?client_id=' + encodeURIComponent(CLIENT_ID), {
         method: 'DELETE',
         headers: authHeaders(),
       });
@@ -506,6 +514,10 @@
     const sendBtn = document.getElementById('send');
     const input = document.getElementById('input');
     sendBtn.disabled = true; input.disabled = true;
+    // Mute live-sync refreshes while we're streaming -- our own
+    // thread_updated push (sent at end-of-turn) would otherwise trigger
+    // an unnecessary re-fetch. Other tabs still receive and react to it.
+    isStreamingTurn = true;
 
     // Auto-create a thread on the first message. We don't create empty
     // threads upfront -- that would clutter the list.
@@ -552,6 +564,7 @@
         body: JSON.stringify({
           messages: conversation,
           thread_id: currentThreadId,
+          client_id: CLIENT_ID,
         }),
       });
 
@@ -634,6 +647,7 @@
       conversation.pop();
     } finally {
       sendBtn.disabled = false; input.disabled = false;
+      isStreamingTurn = false;
       input.focus();
     }
   }
@@ -677,6 +691,98 @@
     if (id && id !== currentThreadId) await loadThread(id);
   });
 
+  // -------- live sync (SSE + BroadcastChannel) --------
+  //
+  // Two channels feeding the same handler:
+  //   * EventSource on /chat/api/events/stream gets pushes from the
+  //     daemon any time a thread is created/renamed/deleted/updated by
+  //     ANY connected client (other tabs, other devices, anything).
+  //   * BroadcastChannel relays events between same-origin tabs on this
+  //     device at microsecond latency, so two tabs on the same laptop
+  //     stay in sync slightly faster than via the server roundtrip.
+  //
+  // De-dupe: every event carries `originating_client_id`. We ignore
+  // events from CLIENT_ID so the tab that just sent a message doesn't
+  // re-render against its own echo.
+  //
+  // The active stream is muted while the user is mid-turn (sending),
+  // since the streaming response is already updating the view live --
+  // a thread_updated push for our own message would re-fetch and clobber
+  // the in-progress render.
+  let isStreamingTurn = false;
+  let eventSource = null;
+  const channel = ('BroadcastChannel' in window)
+      ? new BroadcastChannel('ibkr-chat-sync') : null;
+
+  function handleSyncEvent(event) {
+    if (!event || event.originating_client_id === CLIENT_ID) return;
+
+    // Always keep the thread list fresh -- the sender just renamed a
+    // thread, deleted one, created one, or bumped its updated_at.
+    refreshThreadList();
+
+    if (event.type === 'thread_deleted' && event.thread_id === currentThreadId) {
+      // The thread we're looking at was deleted in another tab. Reset
+      // and pick something else if available.
+      setActiveThread(null);
+      conversation = [];
+      rerender();
+      // refreshThreadList already fired; wait a tick then pick the
+      // most recent remaining thread if any.
+      setTimeout(async () => {
+        if (threadsCache.length > 0 && !currentThreadId) {
+          await loadThread(threadsCache[0].id);
+        }
+      }, 50);
+      return;
+    }
+
+    if (event.type === 'thread_updated' &&
+        event.thread_id === currentThreadId &&
+        !isStreamingTurn) {
+      // Someone added a message to the thread we're viewing. Re-fetch.
+      loadThread(currentThreadId);
+    }
+  }
+
+  function startLiveSync() {
+    // EventSource can't send Authorization headers, but our auth
+    // middleware accepts ?token=... as a fallback (same trick the
+    // /chat page navigation uses).
+    const token = getStoredToken();
+    if (!token) return;
+
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource(
+      '/chat/api/events/stream?token=' + encodeURIComponent(token)
+    );
+    eventSource.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        handleSyncEvent(event);
+        // Forward to other same-origin tabs (BroadcastChannel sends
+        // synchronously within this device; ~1ms latency).
+        if (channel) channel.postMessage(event);
+      } catch (err) {
+        console.warn('sync event parse failed:', err);
+      }
+    };
+    eventSource.onerror = (e) => {
+      // EventSource auto-reconnects on transient errors; we only get
+      // here for genuine failures. Reset and try again in a moment.
+      console.warn('event stream error -- will reconnect');
+      // Browser handles reconnect automatically when readyState ==
+      // CONNECTING. If it goes to CLOSED, we re-open manually.
+      if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+        setTimeout(startLiveSync, 5000);
+      }
+    };
+  }
+
+  if (channel) {
+    channel.onmessage = (e) => handleSyncEvent(e.data);
+  }
+
   // --- bootstrap ---
   // Resolve the active thread on first load:
   //   1. localStorage has an ID -> load that thread from the server
@@ -696,6 +802,10 @@
       // one when the user types their first message.
       rerender();
     }
+    // Open the live-sync stream once we have a token. Pushed events
+    // start flowing immediately; we'll already be on the right thread
+    // for the first updates.
+    startLiveSync();
   })();
   </script>
 </body>

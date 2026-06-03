@@ -30,6 +30,7 @@ runaway tool-call cycle can't burn budget unbounded.
 from .agent import AgentResult, AnthropicAgent, ChatError, StreamEvent
 from .persistence import ChatStore
 from .prompts import SYSTEM_PROMPT
+from .pubsub import ThreadEventBus
 from .schemas import mcp_tools_to_anthropic, extract_tool_result_text
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "ChatStore",
     "StreamEvent",
     "SYSTEM_PROMPT",
+    "ThreadEventBus",
     "mcp_tools_to_anthropic",
     "extract_tool_result_text",
 ]
