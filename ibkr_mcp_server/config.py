@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # Hard cap on the agent loop so a runaway tool-call cycle can't burn
     # tokens forever. Each iteration is one Anthropic API call.
     chat_max_iterations: int = 12
+    # Where the SQLite conversation store lives. Defaults to a file
+    # alongside the other daemon state files. Override only if you
+    # want to put it on a different volume or share with another
+    # process.
+    chat_db_path: str = "/home/trader/ibkr-mcp-server/chat.db"
     
     @field_validator('ibkr_managed_accounts')
     @classmethod

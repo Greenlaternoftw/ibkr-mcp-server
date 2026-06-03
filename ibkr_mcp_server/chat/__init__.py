@@ -27,13 +27,17 @@ when `chat_max_iterations` iterations have run (whichever first), so a
 runaway tool-call cycle can't burn budget unbounded.
 """
 
-from .agent import AnthropicAgent, ChatError
+from .agent import AgentResult, AnthropicAgent, ChatError, StreamEvent
+from .persistence import ChatStore
 from .prompts import SYSTEM_PROMPT
 from .schemas import mcp_tools_to_anthropic, extract_tool_result_text
 
 __all__ = [
+    "AgentResult",
     "AnthropicAgent",
     "ChatError",
+    "ChatStore",
+    "StreamEvent",
     "SYSTEM_PROMPT",
     "mcp_tools_to_anthropic",
     "extract_tool_result_text",

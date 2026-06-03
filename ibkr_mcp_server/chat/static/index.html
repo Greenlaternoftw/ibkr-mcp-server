@@ -86,8 +86,9 @@
     }
     .status.ok { color: #10b981; }
     .status.err { color: #f87171; }
-    .header-actions { display: flex; gap: 8px; }
-    .header-actions button {
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+    .header-actions button,
+    .header-actions select {
       background: transparent;
       color: var(--text-dim);
       border: 1px solid var(--border);
@@ -95,8 +96,21 @@
       padding: 4px 10px;
       font-size: 12px;
       cursor: pointer;
+      font-family: inherit;
+      max-width: 140px;
     }
     .header-actions button:active { background: var(--bg); }
+    .header-actions select {
+      /* native select styling is ugly; keep it minimal */
+      -webkit-appearance: none;
+      appearance: none;
+      padding-right: 24px;
+      background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+                        linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+      background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+      background-size: 4px 4px;
+      background-repeat: no-repeat;
+    }
 
     #thread {
       flex: 1 1 auto; overflow-y: auto;
@@ -218,7 +232,9 @@
       <div id="status" class="status">connecting...</div>
     </div>
     <div class="header-actions">
-      <button id="reset" type="button" title="Start a new thread">New</button>
+      <select id="thread-picker" title="Switch conversation"></select>
+      <button id="new-thread" type="button" title="Start a new conversation">+</button>
+      <button id="delete-thread" type="button" title="Delete current conversation">🗑</button>
     </div>
   </header>
 
@@ -239,7 +255,6 @@
   //   (b) entered in a prompt if not present.
   // Future improvement: a real login form. Phase 1 is operator-only.
   const STORAGE_KEY_TOKEN = 'ibkr-chat-token';
-  const STORAGE_KEY_THREAD = 'ibkr-chat-thread';
 
   function getStoredToken() {
     return localStorage.getItem(STORAGE_KEY_TOKEN) || '';
@@ -273,22 +288,129 @@
   }
 
   // -------- thread state --------
-  // Conversation lives in localStorage so refresh doesn't lose context.
-  // Trimmed to last N messages to keep token cost bounded.
-  let conversation = JSON.parse(localStorage.getItem(STORAGE_KEY_THREAD) || '[]');
+  // Conversation now lives server-side (SQLite). The browser still
+  // keeps the active thread's messages in-memory so render is instant
+  // and intra-turn deltas update without round-tripping; persistence
+  // happens on each completed turn via thread_id passed to the server.
+  //
+  // STORAGE_KEY_THREAD (localStorage) holds ONLY the active thread ID,
+  // not the messages. Refreshing the page re-fetches messages from the
+  // server, which means you can switch devices and keep the same chat.
+  const STORAGE_KEY_ACTIVE_THREAD = 'ibkr-chat-active-thread';
 
-  function persistThread() {
-    // Keep the last ~30 messages (assistant tool-use threads can balloon).
-    if (conversation.length > 30) {
-      conversation = conversation.slice(-30);
-    }
-    localStorage.setItem(STORAGE_KEY_THREAD, JSON.stringify(conversation));
+  let conversation = [];        // in-memory messages for the active thread
+  let currentThreadId = null;   // server-side thread ID
+  let threadsCache = [];        // most-recent-first list for the picker
+
+  function setActiveThread(threadId) {
+    currentThreadId = threadId;
+    if (threadId) localStorage.setItem(STORAGE_KEY_ACTIVE_THREAD, threadId);
+    else localStorage.removeItem(STORAGE_KEY_ACTIVE_THREAD);
   }
 
-  function clearThread() {
+  // Fetch the thread list and re-populate the picker. Keep selection
+  // pointed at the current thread when possible.
+  async function refreshThreadList() {
+    try {
+      const r = await fetch('/chat/api/threads', { headers: authHeaders() });
+      if (!r.ok) return;
+      const j = await r.json();
+      threadsCache = j.threads || [];
+    } catch (e) {
+      // Don't break the UI if the listing call fails -- the chat itself
+      // is more important than the picker.
+      console.warn('failed to list threads:', e);
+      return;
+    }
+
+    const picker = document.getElementById('thread-picker');
+    picker.innerHTML = '';
+    if (threadsCache.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '(no chats)';
+      picker.appendChild(opt);
+      return;
+    }
+    for (const t of threadsCache) {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      const date = t.updated_at ? ' · ' + t.updated_at.slice(5, 10) : '';
+      opt.textContent = t.title + date;
+      if (t.id === currentThreadId) opt.selected = true;
+      picker.appendChild(opt);
+    }
+  }
+
+  async function loadThread(threadId) {
+    try {
+      const r = await fetch('/chat/api/threads/' + encodeURIComponent(threadId), {
+        headers: authHeaders(),
+      });
+      if (!r.ok) {
+        if (r.status === 404) {
+          // Thread was deleted elsewhere -- fall back to no-thread state.
+          setActiveThread(null);
+          conversation = [];
+          rerender();
+          await refreshThreadList();
+          return;
+        }
+        appendMessage('assistant', '❌ Failed to load thread', 'error');
+        return;
+      }
+      const j = await r.json();
+      conversation = j.messages || [];
+      setActiveThread(threadId);
+      rerender();
+    } catch (e) {
+      appendMessage('assistant', '❌ ' + e.message, 'error');
+    }
+  }
+
+  async function createNewThread() {
+    try {
+      const r = await fetch('/chat/api/threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ title: 'New chat' }),
+      });
+      if (!r.ok) {
+        appendMessage('assistant', '❌ Could not create new thread', 'error');
+        return null;
+      }
+      const t = await r.json();
+      setActiveThread(t.id);
+      conversation = [];
+      rerender();
+      await refreshThreadList();
+      return t.id;
+    } catch (e) {
+      appendMessage('assistant', '❌ ' + e.message, 'error');
+      return null;
+    }
+  }
+
+  async function deleteCurrentThread() {
+    if (!currentThreadId) return;
+    if (!confirm('Delete this conversation? This cannot be undone.')) return;
+    try {
+      await fetch('/chat/api/threads/' + encodeURIComponent(currentThreadId), {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+    } catch (e) {
+      console.warn('delete failed:', e);
+    }
+    setActiveThread(null);
     conversation = [];
-    persistThread();
-    document.getElementById('thread').innerHTML = '';
+    rerender();
+    await refreshThreadList();
+    // If other threads exist, switch to the most recent. Otherwise leave
+    // the user on an empty state -- their next message will auto-create.
+    if (threadsCache.length > 0) {
+      await loadThread(threadsCache[0].id);
+    }
   }
 
   // -------- rendering --------
@@ -385,9 +507,18 @@
     const input = document.getElementById('input');
     sendBtn.disabled = true; input.disabled = true;
 
+    // Auto-create a thread on the first message. We don't create empty
+    // threads upfront -- that would clutter the list.
+    if (!currentThreadId) {
+      const id = await createNewThread();
+      if (!id) {
+        sendBtn.disabled = false; input.disabled = false;
+        return;
+      }
+    }
+
     conversation.push({ role: 'user', content: text });
     appendMessage('user', text);
-    persistThread();
 
     // Placeholder bubble we'll mutate in place as text deltas arrive.
     let assistantDiv = appendMessage('assistant', '…', 'assistant thinking');
@@ -418,7 +549,10 @@
       const r = await fetch('/chat/api/message/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ messages: conversation }),
+        body: JSON.stringify({
+          messages: conversation,
+          thread_id: currentThreadId,
+        }),
       });
 
       if (!r.ok) {
@@ -426,7 +560,6 @@
         assistantDiv.remove();
         appendMessage('assistant', '❌ ' + (errBody.error || ('HTTP ' + r.status)), 'error');
         conversation.pop();
-        persistThread();
         return;
       }
 
@@ -477,7 +610,7 @@
             }
             case 'done':
               conversation = event.conversation;
-              persistThread();
+              // Persistence is server-side now; nothing to do here.
               // Final bubble is the assistant's last text turn. If we
               // already streamed text into the current bubble, keep it.
               // Otherwise (e.g. last turn was tool_use with no text), drop
@@ -490,7 +623,7 @@
               // Server didn't update the conversation, so drop the user
               // message we optimistically added so the user can retry.
               conversation.pop();
-              persistThread();
+              // Persistence is server-side now; nothing to do here.
               break;
           }
         }
@@ -499,7 +632,6 @@
       if (!gotAnyText) assistantDiv.remove();
       appendMessage('assistant', '❌ ' + e.message, 'error');
       conversation.pop();
-      persistThread();
     } finally {
       sendBtn.disabled = false; input.disabled = false;
       input.focus();
@@ -532,12 +664,39 @@
     }
   });
 
-  document.getElementById('reset').addEventListener('click', () => {
-    if (confirm('Clear conversation? (token stays saved)')) clearThread();
+  document.getElementById('new-thread').addEventListener('click', async () => {
+    await createNewThread();
   });
 
-  rerender();
-  refreshStatus();
+  document.getElementById('delete-thread').addEventListener('click', async () => {
+    await deleteCurrentThread();
+  });
+
+  document.getElementById('thread-picker').addEventListener('change', async (e) => {
+    const id = e.target.value;
+    if (id && id !== currentThreadId) await loadThread(id);
+  });
+
+  // --- bootstrap ---
+  // Resolve the active thread on first load:
+  //   1. localStorage has an ID -> load that thread from the server
+  //      (and fall back to the most-recent thread if it 404s)
+  //   2. no localStorage but server has threads -> open the most recent
+  //   3. otherwise empty state; first message will auto-create a thread
+  (async function bootstrap() {
+    refreshStatus();
+    await refreshThreadList();
+    const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_THREAD);
+    if (saved && threadsCache.find(t => t.id === saved)) {
+      await loadThread(saved);
+    } else if (threadsCache.length > 0) {
+      await loadThread(threadsCache[0].id);
+    } else {
+      // No threads yet -- leave currentThreadId null. send() will create
+      // one when the user types their first message.
+      rerender();
+    }
+  })();
   </script>
 </body>
 </html>

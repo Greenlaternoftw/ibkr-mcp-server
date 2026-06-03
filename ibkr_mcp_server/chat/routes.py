@@ -37,6 +37,7 @@ from starlette.staticfiles import StaticFiles
 from ..config import settings
 from ..tools import TOOLS, call_tool as mcp_call_tool
 from .agent import AnthropicAgent, ChatError, StreamEvent
+from .persistence import ChatStore
 from .prompts import SYSTEM_PROMPT
 from .schemas import mcp_tools_to_anthropic
 
@@ -47,6 +48,25 @@ logger = logging.getLogger(__name__)
 # without an API key (chat is opt-in). Reset to None when settings change
 # so a config reload picks up the new key/model.
 _agent: Optional[AnthropicAgent] = None
+
+# Singleton ChatStore. Lazy so the SQLite file is created on first use
+# (not at import time); tests can swap in their own store path.
+_store: Optional[ChatStore] = None
+
+
+def _get_store() -> ChatStore:
+    global _store
+    if _store is None:
+        from pathlib import Path
+        _store = ChatStore(Path(settings.chat_db_path))
+    return _store
+
+
+def reset_store() -> None:
+    """Test hook -- forces a fresh ChatStore on next request (so a
+    monkey-patched chat_db_path is picked up)."""
+    global _store
+    _store = None
 
 
 def _build_agent() -> AnthropicAgent:
@@ -81,6 +101,58 @@ def _get_agent() -> AnthropicAgent:
 # --- handlers -------------------------------------------------------------
 
 
+async def list_threads(request: Request) -> Response:
+    """List all conversation threads, most-recent first."""
+    threads = _get_store().list_threads()
+    return JSONResponse({"threads": threads})
+
+
+async def create_thread(request: Request) -> Response:
+    """Create a new thread. Body: ``{"title": "..."}`` (title optional)."""
+    try:
+        body = await request.json() if await request.body() else {}
+    except json.JSONDecodeError:
+        body = {}
+    title = (body.get("title") or "").strip() or "New chat"
+    thread = _get_store().create_thread(title)
+    return JSONResponse(thread, status_code=201)
+
+
+async def get_thread_messages(request: Request) -> Response:
+    """Get the message list for a thread. Used on thread-switch to
+    populate the UI from server state."""
+    thread_id = request.path_params["thread_id"]
+    store = _get_store()
+    thread = store.get_thread(thread_id)
+    if thread is None:
+        return JSONResponse({"error": "thread not found"}, status_code=404)
+    messages = store.get_messages(thread_id)
+    return JSONResponse({"thread": thread, "messages": messages})
+
+
+async def rename_thread(request: Request) -> Response:
+    """Rename a thread. Body: ``{"title": "..."}``."""
+    thread_id = request.path_params["thread_id"]
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    new_title = (body.get("title") or "").strip()
+    if not new_title:
+        return JSONResponse({"error": "title required"}, status_code=400)
+    if not _get_store().rename_thread(thread_id, new_title):
+        return JSONResponse({"error": "thread not found"}, status_code=404)
+    return JSONResponse({"ok": True, "id": thread_id, "title": new_title})
+
+
+async def delete_thread(request: Request) -> Response:
+    """Hard-delete a thread and all its messages."""
+    thread_id = request.path_params["thread_id"]
+    if not _get_store().delete_thread(thread_id):
+        return JSONResponse({"error": "thread not found"}, status_code=404)
+    return Response(status_code=204)
+
+
 async def chat_index(request: Request) -> Response:
     """Serve the chat UI HTML page."""
     static_dir = Path(__file__).parent / "static"
@@ -108,10 +180,16 @@ async def chat_health(request: Request) -> Response:
 async def chat_message_stream(request: Request) -> Response:
     """Stream one chat turn over SSE.
 
-    Same input shape as ``chat_message`` -- POST body is
-    ``{"messages": [...]}``. Response is ``text/event-stream``; each event
-    is ``data: <json>\\n\\n`` where the JSON has a ``type`` field
-    (``text`` / ``tool_call`` / ``tool_result`` / ``done`` / ``error``).
+    Body: ``{"messages": [...], "thread_id": "thr_..." (optional)}``.
+
+    Response is ``text/event-stream``; each event is ``data: <json>\\n\\n``
+    where the JSON has a ``type`` field (``text`` / ``tool_call`` /
+    ``tool_result`` / ``done`` / ``error``).
+
+    When ``thread_id`` is supplied, the final conversation (including
+    any tool_use / tool_result blocks the agent added) is persisted to
+    the SQLite store atomically after the turn completes -- the client
+    no longer has to be the sole source of truth.
 
     Client-side: consume via ``fetch`` + ``ReadableStream`` (browsers
     don't let ``EventSource`` send POST bodies, so we don't use it).
@@ -129,6 +207,19 @@ async def chat_message_stream(request: Request) -> Response:
             status_code=400,
         )
 
+    thread_id = body.get("thread_id")
+    if thread_id is not None:
+        # If a thread_id was supplied, the thread must exist before we
+        # accept the turn. Otherwise a successful save here would create
+        # a phantom orphan and the next list_threads call would surface
+        # it confusingly.
+        store = _get_store()
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                {"error": f"thread not found: {thread_id}"},
+                status_code=404,
+            )
+
     try:
         agent = _get_agent()
     except ChatError as e:
@@ -140,6 +231,18 @@ async def chat_message_stream(request: Request) -> Response:
         # instead of an opaque connection close.
         try:
             async for event in agent.run_stream(messages):
+                # Snapshot the conversation on `done` so we can persist
+                # the canonical post-turn state (includes any tool_use
+                # / tool_result blocks the agent appended).
+                if event.type == "done" and thread_id:
+                    try:
+                        _get_store().replace_messages(
+                            thread_id, event.payload.get("conversation") or []
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to persist chat thread %s", thread_id
+                        )
                 yield event.to_sse()
         except Exception as e:
             logger.exception("unexpected error in chat stream")
@@ -160,7 +263,12 @@ async def chat_message_stream(request: Request) -> Response:
 
 
 async def chat_message(request: Request) -> Response:
-    """Run one chat turn. Stateless -- caller sends full conversation."""
+    """Run one chat turn (non-streaming).
+
+    Body: ``{"messages": [...], "thread_id": "thr_..." (optional)}``.
+    Same persistence semantics as the streaming endpoint: pass thread_id
+    to have the canonical post-turn conversation saved server-side.
+    """
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
@@ -172,6 +280,15 @@ async def chat_message(request: Request) -> Response:
             {"error": "body must include a non-empty 'messages' list"},
             status_code=400,
         )
+
+    thread_id = body.get("thread_id")
+    if thread_id is not None:
+        store = _get_store()
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                {"error": f"thread not found: {thread_id}"},
+                status_code=404,
+            )
 
     try:
         agent = _get_agent()
@@ -185,6 +302,15 @@ async def chat_message(request: Request) -> Response:
     except Exception as e:
         logger.exception("unexpected error in chat turn")
         return JSONResponse({"error": f"internal error: {e}"}, status_code=500)
+
+    # Persist the canonical post-turn state. We swallow persistence
+    # failures into the log -- the user already has a valid response;
+    # losing a save is recoverable on the next turn.
+    if thread_id:
+        try:
+            _get_store().replace_messages(thread_id, result.conversation)
+        except Exception:
+            logger.exception("failed to persist chat thread %s", thread_id)
 
     return JSONResponse(
         {
@@ -229,6 +355,24 @@ def chat_routes() -> List:
             "/chat/api/message/stream",
             chat_message_stream,
             methods=["POST"],
+        ),
+        # Thread CRUD for server-side conversation persistence.
+        Route("/chat/api/threads", list_threads, methods=["GET"]),
+        Route("/chat/api/threads", create_thread, methods=["POST"]),
+        Route(
+            "/chat/api/threads/{thread_id}",
+            get_thread_messages,
+            methods=["GET"],
+        ),
+        Route(
+            "/chat/api/threads/{thread_id}",
+            rename_thread,
+            methods=["PATCH"],
+        ),
+        Route(
+            "/chat/api/threads/{thread_id}",
+            delete_thread,
+            methods=["DELETE"],
         ),
     ]
 
