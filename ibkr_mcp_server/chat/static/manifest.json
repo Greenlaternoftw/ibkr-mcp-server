@@ -1,0 +1,20 @@
+{
+  "name": "IBKR Chat",
+  "short_name": "IBKR",
+  "description": "Self-hosted chat interface to IBKR trading server.",
+  "start_url": "/chat",
+  "scope": "/chat",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "categories": ["finance", "productivity"],
+  "icons": [
+    {
+      "src": "/chat/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

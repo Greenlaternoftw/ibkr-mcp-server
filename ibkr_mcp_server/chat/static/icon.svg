@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  IBKR Chat app icon. Rendered at any size via SVG; iOS home-screen
+  install picks this up via the manifest. The design is two stylised
+  candlesticks (one green up-bar, one red down-bar) on the same dark
+  background as the chat UI, so the launcher icon feels continuous
+  with the app it opens.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background: matches the chat UI dark theme. Rounded corners are
+       applied by iOS itself, so we keep the SVG square. -->
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+
+  <!-- Up candle (green) on the left. Wick is a thin vertical line; body is a tall thick block. -->
+  <line x1="172" y1="96" x2="172" y2="416" stroke="#10b981" stroke-width="14" stroke-linecap="round"/>
+  <rect x="128" y="160" width="88" height="208" rx="8" fill="#10b981"/>
+
+  <!-- Down candle (red) on the right. -->
+  <line x1="340" y1="96" x2="340" y2="416" stroke="#f87171" stroke-width="14" stroke-linecap="round"/>
+  <rect x="296" y="200" width="88" height="176" rx="8" fill="#f87171"/>
+
+  <!-- Subtle accent: a small chat bubble in the corner to hint at the
+       text-interface, not just a chart. Keeps the icon legible at small sizes. -->
+  <circle cx="408" cy="408" r="56" fill="#38bdf8"/>
+  <circle cx="408" cy="408" r="40" fill="#0f172a"/>
+  <circle cx="392" cy="408" r="4" fill="#38bdf8"/>
+  <circle cx="408" cy="408" r="4" fill="#38bdf8"/>
+  <circle cx="424" cy="408" r="4" fill="#38bdf8"/>
+</svg>
