@@ -160,6 +160,29 @@ class ChatStore:
                 )
                 """
             )
+            # Portfolio equity snapshots for the equity-curve chart tool.
+            # One row per snapshot interval; account scoping lets us
+            # support paper + live accounts side by side later. We keep
+            # the values denormalized (cash + positions_value alongside
+            # the top-line net_liquidation) so the chart can also show
+            # the cash/positions split if we want it.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp        TEXT NOT NULL,
+                    account          TEXT NOT NULL,
+                    net_liquidation  REAL NOT NULL,
+                    total_cash       REAL,
+                    positions_value  REAL,
+                    buying_power     REAL
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_account_ts "
+                "ON portfolio_snapshots(account, timestamp)"
+            )
             c.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -267,6 +290,81 @@ class ChatStore:
         """Remove the stored PIN (forces fallback to env-var)."""
         with self._conn() as c:
             c.execute("DELETE FROM auth_config WHERE key = 'pin'")
+
+    # --- portfolio snapshots -------------------------------------------
+
+    def record_snapshot(
+        self,
+        *,
+        account: str,
+        net_liquidation: float,
+        total_cash: Optional[float] = None,
+        positions_value: Optional[float] = None,
+        buying_power: Optional[float] = None,
+    ) -> None:
+        """Record one equity snapshot. Caller decides cadence (typically
+        hourly via the background snapshot task)."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO portfolio_snapshots(
+                    timestamp, account, net_liquidation,
+                    total_cash, positions_value, buying_power
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _utc_now_iso(),
+                    account,
+                    float(net_liquidation),
+                    None if total_cash is None else float(total_cash),
+                    None if positions_value is None else float(positions_value),
+                    None if buying_power is None else float(buying_power),
+                ),
+            )
+
+    def get_snapshots(
+        self,
+        *,
+        account: str,
+        lookback_days: Optional[int] = None,
+    ) -> List[dict]:
+        """Oldest-first list of snapshots for one account.
+
+        ``lookback_days`` filters to the most-recent N days; None returns
+        the full history. Chart tool uses lookback to keep the X axis
+        readable on long-running accounts.
+        """
+        query = (
+            "SELECT timestamp, net_liquidation, total_cash, "
+            "positions_value, buying_power "
+            "FROM portfolio_snapshots WHERE account = ? "
+        )
+        params: list = [account]
+        if lookback_days:
+            from datetime import datetime, timedelta, timezone
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            ).isoformat(timespec="milliseconds")
+            query += "AND timestamp >= ? "
+            params.append(cutoff)
+        query += "ORDER BY timestamp ASC"
+        with self._conn() as c:
+            rows = c.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshot_count(self, account: Optional[str] = None) -> int:
+        """For health / debug. Total snapshots, optionally per-account."""
+        with self._conn() as c:
+            if account:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM portfolio_snapshots WHERE account = ?",
+                    (account,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM portfolio_snapshots"
+                ).fetchone()
+        return int(row["n"])
 
     # --- messages -------------------------------------------------------
 

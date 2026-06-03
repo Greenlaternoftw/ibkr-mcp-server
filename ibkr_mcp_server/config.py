@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     # Brute-force resistance comes from the rate-limit + lockout
     # logic, not from the storage format.
     chat_pin: Optional[str] = None
+
+    # How often the background task records a portfolio equity snapshot
+    # into chat.db. 0 disables snapshotting entirely. Default 1 hour --
+    # gives a clean equity curve without producing thousands of rows
+    # per day. The chart tool reads from these rows.
+    portfolio_snapshot_interval_seconds: int = 3600
     
     @field_validator('ibkr_managed_accounts')
     @classmethod

@@ -243,3 +243,67 @@ def render_ohlc_chart(
     fig.tight_layout(pad=0.5)
 
     return _fig_to_png_bytes(fig)
+
+
+# --- equity curve --------------------------------------------------------
+
+
+def render_equity_curve(
+    snapshots: list[dict],
+    *,
+    account: str,
+    theme: str = "dark",
+    width_px: int = 800,
+    height_px: int = 400,
+) -> bytes:
+    """Render a portfolio-equity curve from chat.db snapshot rows.
+
+    ``snapshots`` is a list of dicts with ``timestamp`` (ISO 8601) and
+    ``net_liquidation`` (the headline number). Other columns
+    (``total_cash``, ``positions_value``) are ignored here -- we keep
+    this chart purposefully focused on one line so it stays legible.
+
+    Caller is expected to pass at least 2 snapshots; with 1 the line
+    will be a single dot, which is correct but not interesting.
+    """
+    plt, palette = _setup_mpl(theme)
+
+    fig_w = width_px / 130.0
+    fig_h = height_px / 130.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # Parse timestamps. We accept either ISO with timezone (the
+    # _utc_now_iso format) or naive datetime strings -- pandas handles
+    # both. matplotlib understands datetime64 objects directly.
+    import pandas as pd
+    times = pd.to_datetime([s["timestamp"] for s in snapshots])
+    values = [float(s["net_liquidation"]) for s in snapshots]
+
+    first = values[0]
+    last = values[-1]
+    pct = (last - first) / first * 100 if first else 0
+    up = last >= first
+    line_color = palette["up"] if up else palette["down"]
+
+    # Line + light fill underneath to give the chart some weight.
+    ax.plot(times, values, color=line_color, linewidth=1.8, alpha=0.95)
+    ax.fill_between(times, values, min(values), color=line_color, alpha=0.12)
+
+    # Title shows total change and current value.
+    title = (
+        f"{account}  ·  ${last:,.0f}  ·  {pct:+.2f}% "
+        f"({len(snapshots)} snapshots over "
+        f"{(times[-1] - times[0]).total_seconds() / 86400:.1f} days)"
+    )
+    ax.set_title(title, color=line_color, loc="left", pad=8)
+
+    # Y axis formatted as currency.
+    from matplotlib.ticker import FuncFormatter
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
+
+    # X axis: short date labels, auto-spaced.
+    fig.autofmt_xdate(rotation=0, ha="center")
+
+    ax.margins(x=0.01)
+    fig.tight_layout(pad=0.5)
+    return _fig_to_png_bytes(fig)

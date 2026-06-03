@@ -176,6 +176,12 @@ async def run_daemon_http():
         except Exception as e:
             logger.warning(f"matplotlib pre-warm failed: {e}")
 
+        # Background task: portfolio equity snapshots for the equity-curve
+        # chart tool. Records account NetLiquidation to chat.db on the
+        # configured interval (default 1h). The task survives Gateway
+        # hiccups -- a failed tick logs and retries on the next interval.
+        snapshot_task = asyncio.create_task(ibkr_client._snapshot_loop())
+
         await run_http_server(
             host=settings.mcp_bind_host,
             port=settings.mcp_bind_port,
@@ -188,6 +194,13 @@ async def run_daemon_http():
         logger.exception(f"daemon error: {e}")
         raise
     finally:
+        # Stop the snapshot loop so it doesn't keep trying to call
+        # IBKR after we tear down the connection.
+        try:
+            snapshot_task.cancel()
+            await asyncio.wait_for(snapshot_task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, NameError):
+            pass
         try:
             await ibkr_client.disconnect()
         except Exception:

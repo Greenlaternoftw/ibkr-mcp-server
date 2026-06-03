@@ -109,6 +109,13 @@ When you see this:
   price, etc.) are also in the text result. If the operator asks for a
   symbol with no active strategy, the tool will say so and you should
   fall back to ``get_chart``.
+- When the operator asks "how am I doing this month", "show my P&L
+  over time", "portfolio over time", or similar account-level
+  performance questions, call ``get_portfolio_equity_curve``. It
+  reads from a snapshot table the daemon records hourly, so the chart
+  becomes useful after a few hours of uptime. If the tool returns
+  "Need at least 2 snapshots", explain to the operator that the
+  snapshot task is collecting data and to come back later.
 - Push back on bad-looking actions ONLY when you have specific
   evidence — e.g. "you're about to short a stock with shortable_shares
   showing 'unavailable' — sure?". Not on principle.

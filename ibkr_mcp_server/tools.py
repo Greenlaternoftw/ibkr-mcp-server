@@ -302,6 +302,41 @@ TOOLS = [
         },
     ),
     Tool(
+        name="get_portfolio_equity_curve",
+        description=(
+            "Render the account's equity curve from accumulated daily/hourly "
+            "snapshots. Shows NetLiquidation over time as a single line, "
+            "title carries total % change. Default lookback is 30 days. "
+            "Requires at least 2 snapshots in the window -- the background "
+            "snapshot task records one every hour by default, so the chart "
+            "becomes useful after a few hours of daemon uptime. Use when "
+            "the user asks 'how am I doing this month', 'show my P&L', "
+            "'portfolio over time', etc."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string",
+                    "description": "Account ID. Defaults to current account.",
+                },
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Calendar days of snapshot history to plot. Default 30.",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 365,
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["dark", "light"],
+                    "default": "dark",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="get_regime_chart",
         description=(
             "Render a price chart with the regime filter's verdict overlaid. "
@@ -681,6 +716,30 @@ async def call_tool(
             )
             if result.get("status") != "ok":
                 # Error path -- return text only so the model can surface it.
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                )]
+            png_b64 = result.pop("image_png_b64")
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                ),
+                ImageContent(
+                    type="image",
+                    data=png_b64,
+                    mimeType="image/png",
+                ),
+            ]
+
+        elif name == "get_portfolio_equity_curve":
+            result = await ibkr_client.get_portfolio_equity_curve(
+                account=arguments.get("account"),
+                lookback_days=arguments.get("lookback_days", 30),
+                theme=arguments.get("theme", "dark"),
+            )
+            if result.get("status") != "ok":
                 return [TextContent(
                     type="text",
                     text=json.dumps(result, indent=2, default=str),

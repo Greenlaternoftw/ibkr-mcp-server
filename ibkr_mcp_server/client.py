@@ -1184,6 +1184,154 @@ class IBKRClient:
             "image_png_b64": base64.b64encode(png).decode("ascii"),
         }
 
+    async def record_portfolio_snapshot(self) -> Dict:
+        """Record one equity snapshot to chat.db.
+
+        Pulls the account summary and inserts a row. Idempotent in the
+        sense that you can call this any number of times -- you just
+        get more rows. Returns the snapshot fields so the snapshot
+        background task can log a brief summary.
+        """
+        summary = await self.get_account_summary()
+        account = summary.get("account") or self.current_account or "unknown"
+
+        # AccountSummary tag names from IBKR. Defaults for missing keys.
+        def _num(tag: str) -> Optional[float]:
+            v = summary.get(tag)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        net_liq = _num("NetLiquidation")
+        if net_liq is None:
+            return {"status": "error", "message": "NetLiquidation missing from account summary"}
+
+        cash = _num("TotalCashValue")
+        positions = (net_liq - cash) if (net_liq is not None and cash is not None) else None
+        buying = _num("BuyingPower")
+
+        # Lazy import: ChatStore lives in the chat package. We don't
+        # depend on it at module-import time so test fixtures can run
+        # without the chat package wired up.
+        from .chat.persistence import ChatStore
+        from .config import settings
+        store = ChatStore(settings.chat_db_path)
+        store.record_snapshot(
+            account=account,
+            net_liquidation=net_liq,
+            total_cash=cash,
+            positions_value=positions,
+            buying_power=buying,
+        )
+        return {
+            "status": "ok",
+            "account": account,
+            "net_liquidation": net_liq,
+            "total_cash": cash,
+            "positions_value": positions,
+            "buying_power": buying,
+        }
+
+    async def get_portfolio_equity_curve(
+        self,
+        *,
+        account: Optional[str] = None,
+        lookback_days: int = 30,
+        theme: str = "dark",
+    ) -> Dict:
+        """Render the account-equity curve from accumulated snapshots.
+
+        Returns a structured error when fewer than 2 snapshots are
+        available -- a single dot isn't useful and the user needs the
+        snapshot task to have collected data over time.
+        """
+        from . import charts as _charts
+        from .chat.persistence import ChatStore
+        from .config import settings
+        import base64
+
+        account = account or self.current_account or "unknown"
+        store = ChatStore(settings.chat_db_path)
+        snapshots = store.get_snapshots(account=account, lookback_days=lookback_days)
+
+        if len(snapshots) < 2:
+            return {
+                "status": "error",
+                "account": account,
+                "snapshots_available": len(snapshots),
+                "message": (
+                    f"Need at least 2 snapshots for an equity curve; "
+                    f"have {len(snapshots)}. The snapshot task runs every "
+                    f"{settings.portfolio_snapshot_interval_seconds // 60} min "
+                    "by default -- come back after a few hours of data has "
+                    "been collected."
+                ),
+            }
+
+        png = await asyncio.to_thread(
+            _charts.render_equity_curve,
+            snapshots,
+            account=account,
+            theme=theme,
+        )
+
+        first_v = float(snapshots[0]["net_liquidation"])
+        last_v = float(snapshots[-1]["net_liquidation"])
+        pct = (last_v - first_v) / first_v * 100 if first_v else 0
+        return {
+            "status": "ok",
+            "account": account,
+            "lookback_days": lookback_days,
+            "snapshots_in_window": len(snapshots),
+            "first_value": round(first_v, 2),
+            "last_value": round(last_v, 2),
+            "pct_change": round(pct, 2),
+            "summary": (
+                f"{account} equity: ${last_v:,.0f} ({pct:+.2f}% over "
+                f"{len(snapshots)} snapshots, last {lookback_days} days)."
+            ),
+            "image_png_b64": base64.b64encode(png).decode("ascii"),
+        }
+
+    async def _snapshot_loop(self) -> None:
+        """Background task: records a portfolio snapshot every
+        ``portfolio_snapshot_interval_seconds`` seconds. Started by
+        the daemon startup path; exits gracefully on cancellation.
+
+        We DON'T snapshot at startup -- that would record a value
+        before the user's morning trading activity settles. The first
+        snapshot fires one interval after the daemon starts.
+        """
+        from .config import settings
+        interval = settings.portfolio_snapshot_interval_seconds
+        if interval <= 0:
+            self.logger.info("portfolio snapshot task disabled (interval=0)")
+            return
+
+        self.logger.info(
+            f"portfolio snapshot task: recording every {interval}s"
+        )
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                result = await self.record_portfolio_snapshot()
+                if result.get("status") == "ok":
+                    self.logger.info(
+                        f"portfolio snapshot: ${result['net_liquidation']:,.0f}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"portfolio snapshot failed: {result.get('message')}"
+                    )
+            except asyncio.CancelledError:
+                self.logger.info("portfolio snapshot task cancelled")
+                return
+            except Exception as e:
+                # Don't let a transient failure (Gateway hiccup, etc.)
+                # crash the background task. Log and try again next tick.
+                self.logger.exception(f"portfolio snapshot tick failed: {e}")
+
     async def check_regime(self, symbol: str, **overrides) -> Dict:
         """Evaluate the Layer 2 regime filter against `symbol`'s recent bars.
 
