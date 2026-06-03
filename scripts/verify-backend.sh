@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Backend verification battery for the IBKR Command Center daemon.
-# Run on the VPS where the daemon is reachable on 127.0.0.1:8765.
+# Run on the VPS. Auto-discovers the daemon URL from MCP_BIND_HOST /
+# MCP_BIND_PORT in .env (so it works whether you bind to localhost or
+# a Tailscale interface). Override with HOST= or ENV_FILE= env vars.
 #
 # Each numbered test prints PASS/FAIL + the relevant evidence.
 # Exits 0 even on partial fail so the full battery always completes.
 
 set -u
-HOST="${HOST:-http://127.0.0.1:8765}"
-TOKEN="$(grep ^MCP_AUTH_TOKEN ~/ibkr-mcp-server/.env | cut -d= -f2)"
+ENV_FILE="${ENV_FILE:-$HOME/ibkr-mcp-server/.env}"
+BIND_HOST="$(grep ^MCP_BIND_HOST "$ENV_FILE" 2>/dev/null | cut -d= -f2)"
+BIND_PORT="$(grep ^MCP_BIND_PORT "$ENV_FILE" 2>/dev/null | cut -d= -f2)"
+[ -z "$BIND_HOST" ] && BIND_HOST="127.0.0.1"
+[ -z "$BIND_PORT" ] && BIND_PORT="8765"
+HOST="${HOST:-http://${BIND_HOST}:${BIND_PORT}}"
+echo "Driving daemon at: $HOST"
+TOKEN="$(grep ^MCP_AUTH_TOKEN "$ENV_FILE" | cut -d= -f2)"
 AUTH="Authorization: Bearer $TOKEN"
-PIN="$(grep ^CHAT_PIN ~/ibkr-mcp-server/.env | cut -d= -f2)"
+PIN="$(grep ^CHAT_PIN "$ENV_FILE" | cut -d= -f2)"
 PASS=0
 FAIL=0
 TMPDIR=$(mktemp -d)
