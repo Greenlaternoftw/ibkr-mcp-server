@@ -26,17 +26,30 @@ from ibkr_mcp_server.http_server import (
 
 
 def _build_app(token: str | None) -> Starlette:
-    """Tiny Starlette app with healthz + a protected /tools endpoint.
+    """Tiny Starlette app with healthz + a protected /tools endpoint
+    + chat HTML/static/API stand-ins so we can test public-path logic.
 
-    We can't test the real /mcp mount easily without a full MCP session, so
-    we substitute a stand-in route that the middleware will treat the same way.
+    The middleware allows /chat, /chat/static/*, and /healthz unconditionally.
+    Everything else (including /tools and /chat/api/*) requires auth.
     """
     async def tools_endpoint(request):
         return JSONResponse({"tools": ["one", "two"]})
 
+    async def chat_html_endpoint(request):
+        return JSONResponse({"page": "html"})
+
+    async def chat_static_endpoint(request):
+        return JSONResponse({"asset": request.path_params.get("file")})
+
+    async def chat_api_endpoint(request):
+        return JSONResponse({"api": "ok"})
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/tools", tools_endpoint, methods=["GET"]),
+        Route("/chat", chat_html_endpoint, methods=["GET"]),
+        Route("/chat/static/{file:path}", chat_static_endpoint, methods=["GET"]),
+        Route("/chat/api/threads", chat_api_endpoint, methods=["GET"]),
     ]
     return Starlette(
         routes=routes,
@@ -129,6 +142,42 @@ class TestBearerAuth:
         client = TestClient(_build_app(token="secret"))
         r = client.get("/tools?token=")
         assert r.status_code == 401
+
+    # --- public-path bypass ----------------------------------------------
+    #
+    # The chat HTML shell + its static assets must be reachable without
+    # any auth at all -- it's an SPA bootstrap that asks the user for
+    # the token via a JS prompt, then uses that token for the
+    # /chat/api/* fetches it makes. Browser users often can't get a
+    # 64-char hex token correctly into the URL bar; the prompt path is
+    # the reliable fallback.
+
+    def test_chat_html_page_is_public(self):
+        """GET /chat must succeed without auth (no Bearer, no ?token=)."""
+        client = TestClient(_build_app(token="secret"))
+        r = client.get("/chat")
+        assert r.status_code == 200
+        assert r.json() == {"page": "html"}
+
+    def test_chat_static_assets_are_public(self):
+        """Static assets (CSS, JS, manifest, icon) must be public so the
+        chat page can load them before the user enters a token."""
+        client = TestClient(_build_app(token="secret"))
+        for asset in ("manifest.json", "icon.svg", "chat.js"):
+            r = client.get(f"/chat/static/{asset}")
+            assert r.status_code == 200, f"asset {asset} should be public"
+
+    def test_chat_api_endpoints_still_require_auth(self):
+        """Page is public; APIs are not. The whole point of the split."""
+        client = TestClient(_build_app(token="secret"))
+        # No header, no query token -> 401
+        r = client.get("/chat/api/threads")
+        assert r.status_code == 401
+        # Valid bearer -> 200
+        r = client.get(
+            "/chat/api/threads", headers={"Authorization": "Bearer secret"}
+        )
+        assert r.status_code == 200
 
 
 # --- startup-binding validation --------------------------------------------

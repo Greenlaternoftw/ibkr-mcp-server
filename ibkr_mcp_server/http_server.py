@@ -37,25 +37,51 @@ logger = logging.getLogger(__name__)
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Verify `Authorization: Bearer <token>` matches the configured token.
 
-    - `/healthz` is always allowed (monitoring, watchdog probes).
-    - When `expected_token` is None, every other route is also allowed
-      (localhost-only dev mode).
-    - Falls back to `?token=<...>` query parameter when the
-      Authorization header is absent. This is necessary for the browser
-      chat UI at /chat: browsers cannot attach an Authorization header
-      to a navigation GET, only to fetch() calls. The chat HTML strips
-      the token from the URL and saves it to localStorage on first
-      load, so the query parameter is only ever needed for the very
-      first page request. All subsequent /chat/api/* calls go through
-      the Authorization header path.
+    Public paths (always allowed, no auth needed):
+
+      * ``/healthz``             -- monitoring, watchdog probes
+      * ``/chat``                -- chat UI HTML shell (no secrets in
+                                   the page itself; the actual API
+                                   calls it makes ARE authenticated)
+      * ``/chat/static/*``       -- CSS, JS, icons, manifest
+
+    Everything else (notably ``/mcp`` and ``/chat/api/*``) requires
+    either a Bearer header OR ``?token=...`` query parameter when
+    ``expected_token`` is set. The query-param fallback exists for
+    browser EventSource (which can't set custom headers) and as a
+    URL-shareable entry point.
+
+    When ``expected_token`` is None (localhost-only dev mode) all
+    routes are open.
+
+    Why the chat HTML page is unauthenticated: the HTML contains no
+    secrets -- it's a single-page app shell. The page's JavaScript
+    fetches the token from ``localStorage``; if none is stored, it
+    prompts the user. All ``/chat/api/*`` calls the page makes after
+    that DO require the token. This keeps token entry off the URL
+    bar (where copy/paste can mangle a 64-char hex string) and makes
+    the surface area behave like any modern web app.
     """
+
+    # Paths that bypass auth entirely. Match by prefix for the static
+    # mount; exact match for the others.
+    _PUBLIC_EXACT = frozenset({"/healthz", "/chat"})
+    _PUBLIC_PREFIXES = ("/chat/static/",)
 
     def __init__(self, app, expected_token: str | None):
         super().__init__(app)
         self.expected_token = expected_token
 
+    def _is_public_path(self, path: str) -> bool:
+        if path in self._PUBLIC_EXACT:
+            return True
+        for prefix in self._PUBLIC_PREFIXES:
+            if path.startswith(prefix):
+                return True
+        return False
+
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/healthz":
+        if self._is_public_path(request.url.path):
             return await call_next(request)
         if not self.expected_token:
             return await call_next(request)
@@ -66,8 +92,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if header.startswith("Bearer "):
             token = header[7:].strip()
 
-        # Browser-navigation fallback: ?token=... in the URL.
-        # See class docstring for why this is required.
+        # Query-param fallback: ?token=... for EventSource and URL entry.
         if not token:
             token = request.query_params.get("token")
 
