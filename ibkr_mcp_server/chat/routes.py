@@ -147,6 +147,25 @@ def _get_agent() -> AnthropicAgent:
 # --- handlers -------------------------------------------------------------
 
 
+def _effective_pin() -> Optional[str]:
+    """Return the currently active PIN.
+
+    Resolution order:
+      1. SQLite ``auth_config.pin`` -- set via the change-PIN UI; once
+         present, it always wins (operator's most recent intent).
+      2. ``settings.chat_pin`` -- the CHAT_PIN env var, used as the
+         initial seed before anyone has changed it via the UI.
+
+    Returns None when neither has a PIN configured -- in which case
+    pin_status reports configured=false and the UI falls back to the
+    raw-token prompt.
+    """
+    db_pin = _get_store().get_pin()
+    if db_pin:
+        return db_pin
+    return settings.chat_pin or None
+
+
 async def pin_status(request: Request) -> Response:
     """PUBLIC. Tells the UI whether a PIN is configured.
 
@@ -155,7 +174,7 @@ async def pin_status(request: Request) -> Response:
     which is something a determined network observer could infer anyway
     (e.g., by attempting unlock and seeing 404 vs 401).
     """
-    return JSONResponse({"configured": bool(settings.chat_pin)})
+    return JSONResponse({"configured": bool(_effective_pin())})
 
 
 async def pin_unlock(request: Request) -> Response:
@@ -173,9 +192,10 @@ async def pin_unlock(request: Request) -> Response:
       * **404** ``{error: "not configured"}`` CHAT_PIN env var is unset
       * **429** ``{error}``                   rate-limited or locked out
     """
-    if not settings.chat_pin:
+    effective_pin = _effective_pin()
+    if not effective_pin:
         return JSONResponse(
-            {"error": "PIN not configured; set CHAT_PIN in .env"},
+            {"error": "PIN not configured; set CHAT_PIN in .env or use the change-PIN UI"},
             status_code=404,
         )
 
@@ -211,7 +231,7 @@ async def pin_unlock(request: Request) -> Response:
     # attacks are theoretically possible. ``secrets.compare_digest``
     # avoids leaking how many leading chars matched.
     import secrets as _secrets
-    if not _secrets.compare_digest(pin, settings.chat_pin):
+    if not _secrets.compare_digest(pin, effective_pin):
         new_status = auth_pin.record_failure()
         if new_status == "locked_out":
             auth_pin.maybe_alert_lockout()
@@ -221,6 +241,84 @@ async def pin_unlock(request: Request) -> Response:
     # inherit a near-miss attacker's counters.
     auth_pin.record_success()
     return JSONResponse({"token": settings.mcp_auth_token or ""})
+
+
+async def pin_change(request: Request) -> Response:
+    """REQUIRES BEARER AUTH. Rotate the PIN.
+
+    Body: ``{"old_pin": "1234", "new_pin": "5678"}``.
+
+    Goes through the middleware's normal bearer auth (Authorization
+    header, NOT the public PIN-status/unlock path), so an attacker
+    without the bearer token can't change the PIN even if they guess
+    the old one. The old PIN check is belt-and-suspenders for cases
+    where the bearer token leaks but the operator's phone is intact --
+    they still need a moment of physical access.
+
+    On success the new PIN immediately takes effect for all future
+    unlock attempts (no daemon restart needed -- next call to
+    _effective_pin() reads the new value from SQLite).
+
+    Status semantics:
+      * **200** ``{ok: true}``                       PIN changed
+      * **400** ``{error}``                          bad body / new_pin too short
+      * **401** ``{error}``                          old_pin wrong
+      * **404** ``{error}``                          no PIN currently set (use unlock-first flow)
+      * **429** ``{error}``                          rate-limited / locked out
+    """
+    effective = _effective_pin()
+    if not effective:
+        return JSONResponse(
+            {"error": "no PIN configured to change; set CHAT_PIN in .env first"},
+            status_code=404,
+        )
+
+    # Reuse the unlock throttle so a "guess old PIN" attack costs the
+    # same as a "guess current PIN" attack.
+    pre_status = auth_pin.status()
+    if pre_status == "locked_out":
+        return JSONResponse(
+            {"error": "PIN endpoints locked for the rest of the hour"},
+            status_code=429,
+        )
+    if pre_status == "rate_limited":
+        return JSONResponse(
+            {"error": "too many recent PIN attempts -- wait a minute"},
+            status_code=429,
+        )
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    old_pin = body.get("old_pin")
+    new_pin = body.get("new_pin")
+    if not isinstance(old_pin, str) or not isinstance(new_pin, str):
+        return JSONResponse(
+            {"error": "body must include 'old_pin' and 'new_pin' strings"},
+            status_code=400,
+        )
+    new_pin = new_pin.strip()
+    if len(new_pin) < 4:
+        return JSONResponse(
+            {"error": "new_pin must be at least 4 characters"},
+            status_code=400,
+        )
+
+    import secrets as _secrets
+    if not _secrets.compare_digest(old_pin, effective):
+        new_status = auth_pin.record_failure()
+        if new_status == "locked_out":
+            auth_pin.maybe_alert_lockout()
+        return JSONResponse({"error": "old PIN is incorrect"}, status_code=401)
+
+    # Old PIN verified, new PIN meets length requirement. Persist.
+    _get_store().set_pin(new_pin)
+    # Reset throttle counters on success -- treat this as a "verified
+    # operator action" the same way pin_unlock does.
+    auth_pin.record_success()
+    return JSONResponse({"ok": True, "message": "PIN updated"})
 
 
 async def events_stream(request: Request) -> Response:
@@ -581,6 +679,10 @@ def chat_routes() -> List:
         # browser URLs or prompts.
         Route("/chat/api/pin/status", pin_status, methods=["GET"]),
         Route("/chat/api/pin/unlock", pin_unlock, methods=["POST"]),
+        # PIN change (requires bearer auth -- the middleware enforces it).
+        # Takes old + new PIN; on success the new PIN is persisted to
+        # SQLite and takes effect immediately.
+        Route("/chat/api/pin/change", pin_change, methods=["POST"]),
     ]
 
     if static_dir.exists():

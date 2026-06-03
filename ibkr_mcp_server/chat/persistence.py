@@ -146,6 +146,20 @@ class ChatStore:
                 "CREATE INDEX IF NOT EXISTS idx_messages_thread "
                 "ON messages(thread_id, id)"
             )
+            # Mutable auth config (PIN). Stored here rather than in .env
+            # so it can be rotated from the UI without an SSH session +
+            # daemon restart. Plaintext PIN -- same security floor as
+            # the bearer token in .env; rate-limiter is what makes the
+            # short PIN brute-force-safe.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_config (
+                    key         TEXT PRIMARY KEY,
+                    value       TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                )
+                """
+            )
             c.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -229,6 +243,32 @@ class ChatStore:
             {"role": r["role"], "content": json.loads(r["content_json"])}
             for r in rows
         ]
+
+    # --- auth config (PIN) ---------------------------------------------
+
+    def get_pin(self) -> Optional[str]:
+        """Return the currently active PIN, or None if none is set."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM auth_config WHERE key = 'pin'"
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_pin(self, pin: str) -> None:
+        """Insert or overwrite the active PIN."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO auth_config(key, value, updated_at) "
+                "VALUES('pin', ?, ?)",
+                (pin, _utc_now_iso()),
+            )
+
+    def clear_pin(self) -> None:
+        """Remove the stored PIN (forces fallback to env-var)."""
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_config WHERE key = 'pin'")
+
+    # --- messages -------------------------------------------------------
 
     def replace_messages(self, thread_id: str, conversation: List[dict]) -> None:
         """Overwrite a thread's messages with the given conversation.

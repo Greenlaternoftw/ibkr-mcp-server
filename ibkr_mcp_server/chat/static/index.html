@@ -235,6 +235,7 @@
       <select id="thread-picker" title="Switch conversation"></select>
       <button id="new-thread" type="button" title="Start a new conversation">+</button>
       <button id="delete-thread" type="button" title="Delete current conversation">🗑</button>
+      <button id="change-pin" type="button" title="Change PIN">🔑</button>
     </div>
   </header>
 
@@ -758,6 +759,48 @@
 
   document.getElementById('delete-thread').addEventListener('click', async () => {
     await deleteCurrentThread();
+  });
+
+  // PIN rotation. Three prompts: current PIN -> new PIN -> confirm new PIN.
+  // Send to /chat/api/pin/change with the bearer token from localStorage;
+  // the middleware enforces auth so a stranger can't change the PIN even
+  // if they reach this page.
+  document.getElementById('change-pin').addEventListener('click', async () => {
+    if (!getStoredToken()) {
+      alert('You need to be signed in (with the bearer token) to change the PIN.');
+      return;
+    }
+    const oldPin = window.prompt('Current PIN:');
+    if (!oldPin) return;
+    const newPin = window.prompt('New PIN (4+ characters):');
+    if (!newPin) return;
+    const confirmPin = window.prompt('Confirm new PIN:');
+    if (newPin !== confirmPin) {
+      alert("PINs don't match -- not changed.");
+      return;
+    }
+    if (newPin.trim().length < 4) {
+      alert('PIN must be at least 4 characters.');
+      return;
+    }
+    try {
+      const r = await fetch('/chat/api/pin/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          old_pin: oldPin.trim(),
+          new_pin: newPin.trim(),
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) {
+        alert('PIN updated. Next sign-in on any device will need the new PIN.');
+      } else {
+        alert('Could not change PIN: ' + (j.error || ('HTTP ' + r.status)));
+      }
+    } catch (e) {
+      alert('Could not change PIN: ' + e.message);
+    }
   });
 
   document.getElementById('thread-picker').addEventListener('change', async (e) => {
