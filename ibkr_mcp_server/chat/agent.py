@@ -161,7 +161,7 @@ class AnthropicAgent:
         that just came in. Returns an AgentResult whose `.conversation`
         is the updated thread (caller should persist it).
         """
-        from .schemas import extract_tool_result_text
+        from .schemas import extract_tool_result_content
 
         # We mutate a copy so a caller-side reference stays clean even
         # if the agent fails mid-loop.
@@ -353,15 +353,37 @@ class AnthropicAgent:
                     # JSON portfolios can be 50KB+ and the model is the
                     # real consumer. Preview is enough for the operator
                     # to see "the call succeeded".
+                    #
+                    # EXCEPTION: image content (charts). We DO ship the
+                    # full base64 PNG so the UI can render it inline --
+                    # that's the whole point of the chart tools.
                     content = r.get("content") or ""
-                    yield StreamEvent(
-                        "tool_result",
-                        {
-                            "id": r.get("tool_use_id"),
-                            "ok": not r.get("is_error", False),
-                            "preview": content[:200],
-                        },
-                    )
+                    payload = {
+                        "id": r.get("tool_use_id"),
+                        "ok": not r.get("is_error", False),
+                    }
+                    if isinstance(content, list):
+                        # Mixed content (text + image). Extract the
+                        # first image block's data + take any text as
+                        # preview text.
+                        text_parts = []
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text") or "")
+                            elif block.get("type") == "image":
+                                src = block.get("source") or {}
+                                if src.get("type") == "base64":
+                                    payload["image_b64"] = src.get("data")
+                                    payload["image_mime"] = (
+                                        src.get("media_type") or "image/png"
+                                    )
+                        payload["preview"] = "\n".join(text_parts)[:400]
+                    else:
+                        # Plain string content -- truncate for the preview.
+                        payload["preview"] = str(content)[:200]
+                    yield StreamEvent("tool_result", payload)
                 continue
 
             # end_turn (most common) or any other non-tool stop -- we're done.
@@ -394,7 +416,7 @@ class AnthropicAgent:
 
     async def _run_tool_blocks(self, content_blocks) -> List[dict]:
         """Execute every tool_use block; return the matching tool_result list."""
-        from .schemas import extract_tool_result_text
+        from .schemas import extract_tool_result_content
 
         results: List[dict] = []
         for block in content_blocks:
@@ -412,21 +434,23 @@ class AnthropicAgent:
             is_error = False
             try:
                 raw = await self.tool_dispatcher(tool_name, dict(tool_input))
-                text = extract_tool_result_text(raw)
+                # `content` is EITHER a string OR a list of typed blocks
+                # (text + image). Anthropic accepts both shapes; we use
+                # the list shape when the tool returned image data
+                # (e.g. get_chart) so the model can SEE the chart.
+                content = extract_tool_result_content(raw)
             except Exception as e:
                 logger.exception("tool dispatch failed: %s", tool_name)
                 # Don't raise -- let the model see the error so it can
-                # recover or explain it to the user. This is also how
-                # the Anthropic tool-use spec recommends handling tool
-                # failures.
-                text = json.dumps({"tool_error": str(e), "tool": tool_name})
+                # recover or explain it to the user.
+                content = json.dumps({"tool_error": str(e), "tool": tool_name})
                 is_error = True
 
             results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": text,
+                    "content": content,
                     "is_error": is_error,
                 }
             )

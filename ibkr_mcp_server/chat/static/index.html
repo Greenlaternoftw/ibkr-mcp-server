@@ -673,6 +673,26 @@
               const ok = event.ok ? '✓' : '✗';
               const preview = (event.preview || '').slice(0, 200);
               appendMessage('tool', ok + ' ' + preview, 'tool');
+              // If the tool returned an image (e.g. get_chart), render
+              // it inline below the tool_result line.
+              if (event.image_b64) {
+                const thread = document.getElementById('thread');
+                const wrap = document.createElement('div');
+                wrap.className = 'msg assistant';
+                wrap.style.padding = '6px';
+                wrap.style.maxWidth = '95%';
+                const img = document.createElement('img');
+                img.src = 'data:' + (event.image_mime || 'image/png') +
+                          ';base64,' + event.image_b64;
+                img.alt = 'chart';
+                img.style.display = 'block';
+                img.style.width = '100%';
+                img.style.height = 'auto';
+                img.style.borderRadius = '6px';
+                wrap.appendChild(img);
+                thread.appendChild(wrap);
+                thread.scrollTop = thread.scrollHeight;
+              }
               break;
             }
             case 'done':

@@ -14,3 +14,9 @@ numpy>=2.2.6
 # control the system prompt and bypass consumer-product safety overlays
 # that refuse to call destructive trading tools.
 anthropic>=0.40.0
+# Layer 8: server-side chart rendering for get_chart / get_swing_visualization
+# / etc. PNG bytes get base64-encoded into MCP ImageContent blocks so the
+# chat UI (and Claude itself) can see them inline. Matplotlib only -- no
+# mplfinance, since candlesticks aren't that hard to draw by hand and one
+# less dep is one less surprise.
+matplotlib>=3.7.0

@@ -4,7 +4,7 @@ import json
 from typing import Any, Sequence
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent, CallToolRequest
+from mcp.types import Tool, TextContent, ImageContent, CallToolRequest
 
 from .client import ibkr_client
 from .utils import validate_symbols, IBKRError
@@ -302,6 +302,38 @@ TOOLS = [
         },
     ),
     Tool(
+        name="get_chart",
+        description=(
+            "Fetch historical price bars for a symbol and render a candlestick "
+            "chart with moving averages, returned as both a PNG image (shown "
+            "inline in the chat UI) and a short numeric summary. Use this "
+            "whenever the user asks 'show me X', 'chart X', or wants to see "
+            "what a stock has been doing visually. Defaults to ~180 calendar "
+            "days of daily bars with SMA20 + SMA50 overlays."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Ticker symbol, e.g. AAPL"},
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Calendar days of history. Default 180.",
+                    "default": 180,
+                    "minimum": 5,
+                    "maximum": 730,
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["dark", "light"],
+                    "default": "dark",
+                    "description": "Chart theme. Default dark matches the chat UI.",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="tick_now",
         description=(
             "Force an immediate tick on an active swing or reversal strategy. "
@@ -390,7 +422,9 @@ async def list_tools() -> list[Tool]:
 
 # Register tool call handler  
 @server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent]:
+async def call_tool(
+    name: str, arguments: dict[str, Any]
+) -> Sequence[TextContent | ImageContent]:
     """Handle tool calls."""
     try:
         if name == "get_portfolio":
@@ -537,6 +571,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             kind = arguments.get("kind", "swing")
             result = await ibkr_client.tick_now(arguments["symbol"], kind=kind)
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "get_chart":
+            # Returns BOTH a text summary (Claude reads + can quote it)
+            # AND an inline image block (rendered in the chat UI).
+            result = await ibkr_client.get_chart(
+                arguments["symbol"],
+                lookback_days=arguments.get("lookback_days", 180),
+                theme=arguments.get("theme", "dark"),
+            )
+            if result.get("status") != "ok":
+                # Error path -- return text only so the model can surface it.
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                )]
+            png_b64 = result.pop("image_png_b64")
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                ),
+                ImageContent(
+                    type="image",
+                    data=png_b64,
+                    mimeType="image/png",
+                ),
+            ]
 
         elif name == "update_swing_params":
             symbol = arguments.pop("symbol")

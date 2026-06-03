@@ -768,6 +768,66 @@ class IBKRClient:
             raise RuntimeError(f"No historical bars returned for {symbol}")
         return df
 
+    async def get_chart(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 180,
+        sma_periods: tuple[int, ...] = (20, 50),
+        theme: str = "dark",
+    ) -> Dict:
+        """Fetch bars + render a candlestick chart with moving averages.
+
+        Returns a dict shaped for the MCP tool dispatcher to convert
+        into a mixed text + ImageContent response. The text block carries
+        a short numeric summary so Claude (and a screen-reader user)
+        can reason about what the chart shows; the image block is the
+        PNG itself.
+
+        Shape:
+            {
+              "image_png_b64": "<base64>",
+              "summary": "AAPL ... last close $XXX (+N%) over M bars",
+              "lookback_days": 180,
+              "symbol": "AAPL",
+              "bars_returned": M,
+            }
+        """
+        from . import charts as _charts
+        import base64
+
+        bars = await self.get_historical_bars(symbol, lookback_days=lookback_days)
+        if bars is None or len(bars) == 0:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": "No historical bars returned",
+            }
+
+        png = _charts.render_ohlc_chart(
+            bars,
+            symbol=symbol,
+            sma_periods=sma_periods,
+            theme=theme,
+        )
+
+        last = float(bars["close"].iloc[-1])
+        first = float(bars["close"].iloc[0])
+        pct = (last - first) / first * 100 if first else 0
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "lookback_days": lookback_days,
+            "bars_returned": int(len(bars)),
+            "last_close": round(last, 2),
+            "pct_change": round(pct, 2),
+            "summary": (
+                f"{symbol}: ${last:.2f} ({pct:+.1f}% over {len(bars)} bars, "
+                f"~{lookback_days} calendar days)"
+            ),
+            "image_png_b64": base64.b64encode(png).decode("ascii"),
+        }
+
     async def check_regime(self, symbol: str, **overrides) -> Dict:
         """Evaluate the Layer 2 regime filter against `symbol`'s recent bars.
 
