@@ -62,14 +62,15 @@ nl=$(echo "$out" | jq -r .net_liquidation 2>/dev/null)
 [ -n "$nl" ] && [ "$nl" != "null" ] && ok "net_liquidation=$nl" || bad "no net_liquidation: $out"
 
 # 6. user_prefs CRUD round-trip
+# Response shape: {"prefs": {key: value, ...}}
 step "6. /chat/api/prefs CRUD round-trip"
 testkey="verifyKey$(date +%s)"
 curl -s -H "$AUTH" -H "Content-Type: application/json" -X POST \
   -d "{\"key\":\"$testkey\",\"value\":\"verifyVal\"}" "$HOST/chat/api/prefs" >/dev/null
-got=$(curl -s -H "$AUTH" "$HOST/chat/api/prefs" | jq -r ".[\"$testkey\"]")
+got=$(curl -s -H "$AUTH" "$HOST/chat/api/prefs" | jq -r ".prefs[\"$testkey\"]")
 [ "$got" = "verifyVal" ] && ok "set+list round-trip ($testkey=verifyVal)" || bad "got '$got'"
 curl -s -H "$AUTH" -X DELETE "$HOST/chat/api/prefs/$testkey" >/dev/null
-got=$(curl -s -H "$AUTH" "$HOST/chat/api/prefs" | jq -r ".[\"$testkey\"] // \"GONE\"")
+got=$(curl -s -H "$AUTH" "$HOST/chat/api/prefs" | jq -r ".prefs[\"$testkey\"] // \"GONE\"")
 [ "$got" = "GONE" ] && ok "delete removes key" || bad "delete didn't take ($got)"
 
 # 7. Watchlist CRUD round-trip
@@ -80,9 +81,10 @@ wlid=$(curl -s -H "$AUTH" -H "Content-Type: application/json" -X POST \
 [ -n "$wlid" ] && [ "$wlid" != "null" ] && ok "POST created id=$wlid" || bad "create failed"
 
 # 7b. add a stock
+# Response shape: {"stocks": [...]} on list endpoint
 curl -s -H "$AUTH" -H "Content-Type: application/json" -X POST \
   -d '{"symbol":"AAPL"}' "$HOST/chat/api/watchlists/$wlid/stocks" >/dev/null
-syms=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq -r '[.[].symbol] | @csv')
+syms=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq -r '[.stocks[].symbol] | @csv')
 [ "$syms" = '"AAPL"' ] && ok "added AAPL, list shows: $syms" || bad "got: $syms"
 
 # 7c. duplicate add → 409
@@ -95,17 +97,18 @@ probe "POST duplicate AAPL → $code (expect 409)"
 curl -s -H "$AUTH" -H "Content-Type: application/json" -X PATCH \
   -d '{"rating":"BUY","current_price":189.50,"target_price":210.0}' \
   "$HOST/chat/api/watchlists/$wlid/stocks/AAPL" >/dev/null
-got=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq -r '.[0].rating')
+got=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq -r '.stocks[0].rating')
 [ "$got" = "BUY" ] && ok "PATCH rating saved" || bad "got '$got'"
 
 # 7e. DELETE stock → list empty
 curl -s -H "$AUTH" -X DELETE "$HOST/chat/api/watchlists/$wlid/stocks/AAPL" >/dev/null
-n=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq 'length')
+n=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists/$wlid/stocks" | jq '.stocks | length')
 [ "$n" = "0" ] && ok "DELETE removed AAPL" || bad "list still has $n entries"
 
 # 7f. DELETE watchlist (cleanup)
+# Response shape: {"watchlists": [...]}
 curl -s -H "$AUTH" -X DELETE "$HOST/chat/api/watchlists/$wlid" >/dev/null
-gone=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists" | jq -r ".[] | select(.id==$wlid) | .id")
+gone=$(curl -s -H "$AUTH" "$HOST/chat/api/watchlists" | jq -r ".watchlists[] | select(.id==$wlid) | .id")
 [ -z "$gone" ] && ok "watchlist deleted cleanly" || bad "still listed (id=$gone)"
 
 # 8. Threads CRUD (the persistence fix relies on this)
@@ -119,13 +122,15 @@ listed=$(curl -s -H "$AUTH" "$HOST/chat/api/threads" | jq -r ".threads[] | selec
 [ "$listed" = "$tid" ] && ok "list returns the new thread" || bad "thread not in list"
 
 # 8c. fetch messages of new thread → empty
-nmsgs=$(curl -s -H "$AUTH" "$HOST/chat/api/threads/$tid/messages" | jq '.messages | length')
+# Endpoint is /chat/api/threads/{id} (no /messages suffix); body shape
+# is {"thread": {...}, "messages": [...]}.
+nmsgs=$(curl -s -H "$AUTH" "$HOST/chat/api/threads/$tid" | jq '.messages | length')
 [ "$nmsgs" = "0" ] && ok "fresh thread has 0 messages" || bad "expected 0, got $nmsgs"
 
 # 8d. fetch nonexistent thread → 404
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" \
-  "$HOST/chat/api/threads/thr_nope_nope_nope/messages")
-probe "GET messages of nonexistent thread → $code (expect 404)"
+  "$HOST/chat/api/threads/thr_nope_nope_nope")
+probe "GET nonexistent thread → $code (expect 404)"
 [ "$code" = "404" ] && ok "404 for missing thread" || bad "expected 404 got $code"
 
 # 8e. DELETE thread (cleanup)

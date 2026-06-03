@@ -368,8 +368,12 @@ async def account_summary(request: Request) -> Response:
         logger.exception("account summary fetch failed")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+    # get_account_summary() returns {"account": ..., "as_of": ..., "summary": {tag: value}}
+    # -- the IBKR tag/value pairs are nested under `summary`, NOT at the top level.
+    summary = raw.get("summary") or {}
+
     def _num(key):
-        v = raw.get(key)
+        v = summary.get(key)
         try:
             return float(v) if v is not None else None
         except (TypeError, ValueError):

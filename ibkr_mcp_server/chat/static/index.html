@@ -2508,7 +2508,10 @@ async function _ensureActiveThread() {
   let tid = await storage.get('activeThreadId');
   if (tid) {
     try {
-      const j = await daemonGet('/chat/api/threads/' + encodeURIComponent(tid) + '/messages');
+      // The server route is /chat/api/threads/{thread_id} -- returns
+      // {thread: {...}, messages: [...]}. (There is NO /messages suffix
+      // variant; that was a mis-guess in the first cut of this fix.)
+      const j = await daemonGet('/chat/api/threads/' + encodeURIComponent(tid));
       state.activeThreadId = tid;
       chatHistory.length = 0;
       const expanded = _expandConversationToHistory(j.messages || []);
