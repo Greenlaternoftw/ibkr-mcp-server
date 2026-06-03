@@ -2518,8 +2518,18 @@ async function _ensureActiveThread() {
       for (const m of expanded) chatHistory.push(m);
       return;
     } catch (e) {
-      // 404 -- thread vanished; fall through to create a fresh one.
-      tid = null;
+      // ONLY abandon the cached thread id if it's specifically gone
+      // (404). A transient 5xx / network blip used to fall through here
+      // and clobber the pref with a fresh thread, causing devices to
+      // drift apart. Now we keep the id; the SSE stream + next manual
+      // send will retry the fetch.
+      if (e && e.status === 404) {
+        tid = null;
+      } else {
+        console.warn('Thread fetch transient failure -- keeping cached id:', e);
+        state.activeThreadId = tid;
+        return;
+      }
     }
   }
   // Need a new thread.
@@ -2534,6 +2544,43 @@ async function _ensureActiveThread() {
   } catch (e) {
     console.error('Could not create chat thread:', e);
     state.activeThreadId = null;
+  }
+}
+
+/**
+ * Force-refresh the prefs cache from the server. Used by the SSE
+ * handler on thread_created so a fresh device that booted in parallel
+ * with another active session picks up the right activeThreadId.
+ */
+async function _refreshActivePrefFromServer() {
+  try {
+    const r = await daemonGet('/chat/api/prefs');
+    _prefsCache.data = r.prefs || {};
+    _prefsCache.loaded = true;
+    const tid = _prefsCache.data.activeThreadId;
+    if (tid && tid !== state.activeThreadId) {
+      state.activeThreadId = tid;
+      _refreshActiveThreadMessages();
+    }
+  } catch (_) {}
+}
+
+/**
+ * Re-fetch the active thread's messages from the server and rebuild
+ * chatHistory. Used by the SSE handler when another device appends a
+ * turn, and by visibility-change so a backgrounded tab catches up
+ * when it foregrounds.
+ */
+async function _refreshActiveThreadMessages() {
+  if (!state.activeThreadId) return;
+  try {
+    const j = await daemonGet('/chat/api/threads/' + encodeURIComponent(state.activeThreadId));
+    chatHistory.length = 0;
+    const expanded = _expandConversationToHistory(j.messages || []);
+    for (const m of expanded) chatHistory.push(m);
+    renderChatMessages();
+  } catch (e) {
+    console.warn('Could not refresh thread messages:', e);
   }
 }
 
@@ -2839,7 +2886,9 @@ const storage = {
     }
     const str = String(value);
     _prefsCache.data[key] = str;
-    try { await daemonPost('/chat/api/prefs', { key, value: str }); }
+    // Pass client_id so the server's pref_changed broadcast suppresses
+    // our own echo -- other devices pick this up, we don't double-fire.
+    try { await daemonPost('/chat/api/prefs', { key, value: str, client_id: DAEMON_CLIENT_ID }); }
     catch (e) { /* server is source of truth; cache will resync on reload */ }
   },
   async delete(key) {
@@ -2848,7 +2897,10 @@ const storage = {
       return;
     }
     delete _prefsCache.data[key];
-    try { await daemonDelete('/chat/api/prefs/' + encodeURIComponent(key)); }
+    try {
+      await daemonDelete('/chat/api/prefs/' + encodeURIComponent(key)
+        + '?client_id=' + encodeURIComponent(DAEMON_CLIENT_ID));
+    }
     catch(_) {}
   },
 };
@@ -4980,8 +5032,49 @@ function startLiveSyncStream() {
       const evt = JSON.parse(e.data);
       // Ignore our own echoes -- the originating tab already updated its UI.
       if (evt.originating_client_id === DAEMON_CLIENT_ID) return;
-      // Conservative response: any thread event might mean watchlists
-      // changed too. Re-pull both. Cheap on the daemon side.
+
+      const t = evt.type || '';
+      if (t === 'thread_updated') {
+        // Another device appended a turn. If it was OUR active thread,
+        // re-pull its messages so the chat panel mirrors theirs in real
+        // time. Otherwise ignore -- not the thread we're viewing.
+        if (evt.thread_id && evt.thread_id === state.activeThreadId) {
+          _refreshActiveThreadMessages();
+        }
+        return;
+      }
+      if (t === 'pref_changed') {
+        // Another device wrote a pref. Invalidate our cache so the
+        // next storage.get() reflects the new value. If activeThreadId
+        // specifically changed, switch to the new active thread now
+        // (this is how a fresh device picks up the thread the other
+        // device created).
+        if (evt.key) {
+          if (evt.value === null) {
+            delete _prefsCache.data[evt.key];
+          } else {
+            _prefsCache.data[evt.key] = String(evt.value);
+          }
+        }
+        if (evt.key === 'activeThreadId' && evt.value && evt.value !== state.activeThreadId) {
+          state.activeThreadId = evt.value;
+          _refreshActiveThreadMessages();
+        }
+        if (evt.key === 'activeView') {
+          // Don't force-flip the user's view if they're in a different
+          // mode locally -- just update the cache so next reload honors
+          // their most-recent choice.
+        }
+        return;
+      }
+      if (t === 'thread_created' || t === 'thread_renamed' || t === 'thread_deleted') {
+        // Less time-critical, but a fresh device on first boot can lose
+        // a race against an active session creating its first thread.
+        // Best response: re-pull the activeThreadId pref so we converge.
+        _refreshActivePrefFromServer();
+        return;
+      }
+      // Watchlist / portfolio events: re-pull on anything else by default.
       loadPortfoliosFromStorage();
     } catch (_) {}
   };
@@ -4992,6 +5085,20 @@ function startLiveSyncStream() {
     }
   };
 }
+
+// iOS Safari aggressively pauses background tabs -- when the user comes
+// back to the tab the SSE stream may have been silently dropped (and is
+// reconnecting), AND we've missed all events while backgrounded. On
+// foreground we proactively re-sync: pull latest prefs + latest active
+// thread messages so the chat panel reflects what other devices wrote
+// while we were away.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!state.activeThreadId) return;
+  _refreshActivePrefFromServer();
+  _refreshActiveThreadMessages();
+  refreshAccountSummary();
+});
 
 /* ============================================================
    STARTUP

@@ -328,14 +328,20 @@ async def prefs_list(request: Request) -> Response:
 
 
 async def prefs_set(request: Request) -> Response:
-    """Upsert a single pref. Body: ``{key, value}``. Value is opaque
-    to the server -- the UI JSON-encodes anything structured."""
+    """Upsert a single pref. Body: ``{key, value, client_id?}``. Value
+    is opaque to the server -- the UI JSON-encodes anything structured.
+
+    Emits a `pref_changed` SSE event so other tabs / devices invalidate
+    their local pref cache and pick up the new value (critical for
+    cross-device chat thread sync via the activeThreadId pref).
+    """
     try:
         body = await request.json()
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     key = body.get("key")
     value = body.get("value")
+    client_id = body.get("client_id")
     if not isinstance(key, str) or not key:
         return JSONResponse({"error": "key required"}, status_code=400)
     if not isinstance(value, str):
@@ -344,12 +350,17 @@ async def prefs_set(request: Request) -> Response:
         _get_store().set_pref(key, value)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    await _publish("pref_changed", client_id=client_id, key=key, value=value)
     return JSONResponse({"ok": True, "key": key})
 
 
 async def prefs_delete(request: Request) -> Response:
     key = request.path_params["key"]
     _get_store().delete_pref(key)
+    # client_id query param is optional -- when present we suppress the
+    # originating tab's echo of its own delete.
+    client_id = request.query_params.get("client_id")
+    await _publish("pref_changed", client_id=client_id, key=key, value=None)
     return Response(status_code=204)
 
 
