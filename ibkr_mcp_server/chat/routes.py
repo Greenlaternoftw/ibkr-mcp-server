@@ -25,13 +25,18 @@ from pathlib import Path
 from typing import List, Optional
 
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from ..config import settings
 from ..tools import TOOLS, call_tool as mcp_call_tool
-from .agent import AnthropicAgent, ChatError
+from .agent import AnthropicAgent, ChatError, StreamEvent
 from .prompts import SYSTEM_PROMPT
 from .schemas import mcp_tools_to_anthropic
 
@@ -97,6 +102,60 @@ async def chat_health(request: Request) -> Response:
             "has_api_key": bool(settings.anthropic_api_key),
             "tool_count": len(TOOLS),
         }
+    )
+
+
+async def chat_message_stream(request: Request) -> Response:
+    """Stream one chat turn over SSE.
+
+    Same input shape as ``chat_message`` -- POST body is
+    ``{"messages": [...]}``. Response is ``text/event-stream``; each event
+    is ``data: <json>\\n\\n`` where the JSON has a ``type`` field
+    (``text`` / ``tool_call`` / ``tool_result`` / ``done`` / ``error``).
+
+    Client-side: consume via ``fetch`` + ``ReadableStream`` (browsers
+    don't let ``EventSource`` send POST bodies, so we don't use it).
+    See ``static/index.html`` for the consumer pattern.
+    """
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+
+    messages: List[dict] = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse(
+            {"error": "body must include a non-empty 'messages' list"},
+            status_code=400,
+        )
+
+    try:
+        agent = _get_agent()
+    except ChatError as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+
+    async def event_source():
+        # Outer try is the last line of defence -- if the agent crashes
+        # before yielding anything, the client still gets an error event
+        # instead of an opaque connection close.
+        try:
+            async for event in agent.run_stream(messages):
+                yield event.to_sse()
+        except Exception as e:
+            logger.exception("unexpected error in chat stream")
+            yield StreamEvent("error", {"message": f"internal: {e}"}).to_sse()
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            # No buffering -- proxies (nginx, Cloudflare) sometimes hold
+            # partial SSE responses for a few seconds otherwise.
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            # Most proxies set this; harmless if redundant.
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -166,6 +225,11 @@ def chat_routes() -> List:
         Route("/chat", chat_index, methods=["GET"]),
         Route("/chat/api/health", chat_health, methods=["GET"]),
         Route("/chat/api/message", chat_message, methods=["POST"]),
+        Route(
+            "/chat/api/message/stream",
+            chat_message_stream,
+            methods=["POST"],
+        ),
     ]
 
     if static_dir.exists():

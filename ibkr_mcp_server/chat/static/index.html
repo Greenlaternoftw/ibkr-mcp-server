@@ -376,6 +376,10 @@
   }
 
   // -------- sending --------
+  // Streams the response token-by-token via SSE. Each event line is
+  // "data: <json>\n\n" carrying a `type` and event-specific fields.
+  // Falls back to the non-streaming /chat/api/message endpoint if the
+  // stream connection fails before any token arrives.
   async function send(text) {
     const sendBtn = document.getElementById('send');
     const input = document.getElementById('input');
@@ -385,48 +389,114 @@
     appendMessage('user', text);
     persistThread();
 
-    const thinking = appendMessage('assistant', '…thinking', 'thinking');
+    // Placeholder bubble we'll mutate in place as text deltas arrive.
+    let assistantDiv = appendMessage('assistant', '…', 'assistant thinking');
+    let assistantText = '';
+    let gotAnyText = false;
+
+    function appendDelta(delta) {
+      assistantText += delta;
+      // Drop the "thinking" pulse the moment real content lands.
+      if (!gotAnyText) {
+        assistantDiv.classList.remove('thinking');
+        gotAnyText = true;
+      }
+      assistantDiv.innerHTML = renderMarkdown(assistantText);
+      const thread = document.getElementById('thread');
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    function startNewAssistantBubble() {
+      // After a tool_call interleaves, the next text delta should start
+      // a fresh assistant bubble, not append to the one we just rendered.
+      assistantDiv = appendMessage('assistant', '…', 'assistant thinking');
+      assistantText = '';
+      gotAnyText = false;
+    }
 
     try {
-      const r = await fetch('/chat/api/message', {
+      const r = await fetch('/chat/api/message/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ messages: conversation }),
       });
-      thinking.remove();
 
       if (!r.ok) {
-        const errBody = await r.json().catch(() => ({ error: 'unknown' }));
+        const errBody = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        assistantDiv.remove();
         appendMessage('assistant', '❌ ' + (errBody.error || ('HTTP ' + r.status)), 'error');
-        // Drop the user message back so it can be retried.
         conversation.pop();
         persistThread();
         return;
       }
 
-      const j = await r.json();
-      conversation = j.conversation;
-      persistThread();
+      // Read the SSE stream. Events are separated by "\n\n".
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      // Render only the new assistant turn (last message in convo).
-      const lastAssistant = conversation[conversation.length - 1];
-      if (lastAssistant && lastAssistant.role === 'assistant') {
-        for (const block of (lastAssistant.content || [])) {
-          if (block.type === 'text' && block.text) {
-            appendMessage('assistant', block.text);
-          } else if (block.type === 'tool_use') {
-            // shouldn't appear on a final turn but render defensively
-            appendMessage('tool', '🔧 ' + block.name, 'tool');
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process all complete events in the buffer; keep the trailing
+        // (possibly partial) chunk for the next read.
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+
+        for (const part of parts) {
+          if (!part.startsWith('data: ')) continue;
+          let event;
+          try {
+            event = JSON.parse(part.slice(6));
+          } catch (e) {
+            continue;  // malformed line; skip
+          }
+
+          switch (event.type) {
+            case 'text':
+              appendDelta(event.delta);
+              break;
+            case 'tool_call': {
+              // The "thinking" assistant bubble belongs to text we already
+              // streamed (or nothing). Either way, close it out and render
+              // a tool-call line, then prepare a fresh assistant bubble
+              // for any subsequent text.
+              if (!gotAnyText) assistantDiv.remove();
+              const args = JSON.stringify(event.input || {});
+              appendMessage('tool', '🔧 ' + event.name + ': ' + args, 'tool');
+              startNewAssistantBubble();
+              break;
+            }
+            case 'tool_result': {
+              const ok = event.ok ? '✓' : '✗';
+              const preview = (event.preview || '').slice(0, 200);
+              appendMessage('tool', ok + ' ' + preview, 'tool');
+              break;
+            }
+            case 'done':
+              conversation = event.conversation;
+              persistThread();
+              // Final bubble is the assistant's last text turn. If we
+              // already streamed text into the current bubble, keep it.
+              // Otherwise (e.g. last turn was tool_use with no text), drop
+              // the empty placeholder.
+              if (!gotAnyText) assistantDiv.remove();
+              break;
+            case 'error':
+              if (!gotAnyText) assistantDiv.remove();
+              appendMessage('assistant', '❌ ' + event.message, 'error');
+              // Server didn't update the conversation, so drop the user
+              // message we optimistically added so the user can retry.
+              conversation.pop();
+              persistThread();
+              break;
           }
         }
       }
-
-      // Also surface tool_use calls from intermediate iterations -- they
-      // get persisted into the conversation by the server.
-      // (We re-render to show the full new state cleanly.)
-      rerender();
     } catch (e) {
-      thinking.remove();
+      if (!gotAnyText) assistantDiv.remove();
       appendMessage('assistant', '❌ ' + e.message, 'error');
       conversation.pop();
       persistThread();

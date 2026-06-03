@@ -400,6 +400,199 @@ class TestPromptCaching:
         assert result.cache_read_input_tokens == 0
 
 
+# --- SSE streaming --------------------------------------------------------
+#
+# The agent's run_stream() method yields StreamEvent objects in order:
+#   text deltas during the model's response -> tool_call after each
+#   tool_use block -> tool_result after our dispatcher returns -> done
+#   on end_turn (or error on failure). The HTTP layer converts each
+#   event into a "data: <json>\n\n" SSE line.
+#
+# Tests below verify (a) the event-order contract holds in the happy
+# path, (b) tool_use stop triggers tool dispatch + tool_result events,
+# (c) the SSE wire format is correct.
+
+
+class _FakeStream:
+    """Minimal async-context-manager that mimics anthropic's stream API.
+
+    Real SDK exposes ``async for chunk in stream.text_stream`` and
+    ``await stream.get_final_message()``. We replicate both so the agent's
+    run_stream() can be exercised without a real Anthropic client.
+    """
+
+    def __init__(self, text_chunks: List[str], final_message: Any):
+        self._text_chunks = text_chunks
+        self._final = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    @property
+    def text_stream(self):
+        chunks = self._text_chunks
+
+        async def gen():
+            for c in chunks:
+                yield c
+
+        return gen()
+
+    async def get_final_message(self):
+        return self._final
+
+
+def _mk_final_message(content_blocks, stop_reason: str, in_tok=100, out_tok=50,
+                     cache_create=0, cache_read=0):
+    """Builds the object returned by get_final_message() on a fake stream."""
+    return SimpleNamespace(
+        content=content_blocks,
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(
+            input_tokens=in_tok, output_tokens=out_tok,
+            cache_creation_input_tokens=cache_create,
+            cache_read_input_tokens=cache_read,
+        ),
+    )
+
+
+class TestStreamEventWireFormat:
+    def test_to_sse_is_well_formed(self):
+        from ibkr_mcp_server.chat.agent import StreamEvent
+        ev = StreamEvent("text", {"delta": "hello"})
+        line = ev.to_sse()
+        assert line.startswith("data: ")
+        assert line.endswith("\n\n")
+        # The line between "data: " and "\n\n" must be valid JSON.
+        body = line[len("data: "): -2]
+        parsed = json.loads(body)
+        assert parsed == {"type": "text", "delta": "hello"}
+
+    def test_to_sse_handles_nested_payload(self):
+        from ibkr_mcp_server.chat.agent import StreamEvent
+        ev = StreamEvent("done", {"conversation": [{"role": "user", "content": "hi"}]})
+        line = ev.to_sse()
+        body = json.loads(line[len("data: "): -2])
+        assert body["type"] == "done"
+        assert body["conversation"][0]["role"] == "user"
+
+
+class TestStreamAgentLoop:
+    @pytest.mark.asyncio
+    async def test_end_turn_yields_text_then_done(self):
+        """Simplest path: model streams 'Hi there.' as 2 chunks, stops on
+        end_turn. We expect: text, text, done (in that order)."""
+        dispatcher = AsyncMock()
+        agent, sdk = _make_agent(dispatcher)
+        final = _mk_final_message(
+            [_mk_text_block("Hi there.")],
+            stop_reason="end_turn",
+            cache_read=4330,
+        )
+        sdk.messages.stream = MagicMock(
+            return_value=_FakeStream(["Hi ", "there."], final)
+        )
+
+        events = []
+        async for ev in agent.run_stream([{"role": "user", "content": "Hello"}]):
+            events.append(ev)
+
+        types = [e.type for e in events]
+        assert types == ["text", "text", "done"]
+        assert events[0].payload == {"delta": "Hi "}
+        assert events[1].payload == {"delta": "there."}
+
+        done = events[-1]
+        assert done.payload["usage"]["cache_read_input_tokens"] == 4330
+        assert done.payload["usage"]["iterations"] == 1
+        # Conversation grew by one assistant turn with the text block.
+        convo = done.payload["conversation"]
+        assert convo[-1]["role"] == "assistant"
+        assert convo[-1]["content"][0]["text"] == "Hi there."
+
+    @pytest.mark.asyncio
+    async def test_tool_use_then_end_turn_yields_full_sequence(self):
+        """Realistic two-iteration flow:
+          iter 1: model emits tool_use; stream completes; we fire
+                  tool_call event, dispatch, fire tool_result event.
+          iter 2: model emits final text; stream completes; done.
+        """
+        dispatcher = AsyncMock(return_value='{"connected": true}')
+        agent, sdk = _make_agent(dispatcher)
+
+        # Iteration 1: tool_use stop. No text streamed (tool calls
+        # generally don't have a preceding text block).
+        final1 = _mk_final_message(
+            [_mk_tool_use_block("tu_1", "get_connection_status", {})],
+            stop_reason="tool_use",
+        )
+        # Iteration 2: short text, end_turn.
+        final2 = _mk_final_message(
+            [_mk_text_block("Yes, connected.")],
+            stop_reason="end_turn",
+        )
+
+        # SDK's stream() is called twice -- once per iteration.
+        sdk.messages.stream = MagicMock(
+            side_effect=[
+                _FakeStream([], final1),
+                _FakeStream(["Yes, ", "connected."], final2),
+            ]
+        )
+
+        events = []
+        async for ev in agent.run_stream(
+            [{"role": "user", "content": "are you connected?"}]
+        ):
+            events.append(ev)
+
+        types = [e.type for e in events]
+        # Expected: tool_call (after iter 1), tool_result (after dispatch),
+        # text x2 (during iter 2), done.
+        assert types == ["tool_call", "tool_result", "text", "text", "done"]
+
+        # tool_call carries the name + parsed input
+        tc = next(e for e in events if e.type == "tool_call")
+        assert tc.payload["name"] == "get_connection_status"
+
+        # tool_result carries ok + truncated preview
+        tr = next(e for e in events if e.type == "tool_result")
+        assert tr.payload["ok"] is True
+        assert "connected" in tr.payload["preview"]
+
+        # Dispatcher was called exactly once
+        assert dispatcher.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_api_failure_emits_error_event(self):
+        """If the SDK raises (network error, rate limit, etc.), we
+        emit an error StreamEvent rather than letting the exception
+        propagate. The browser renders it as an inline error bubble."""
+        dispatcher = AsyncMock()
+        agent, sdk = _make_agent(dispatcher)
+
+        # Use a stream context manager that raises in __aenter__.
+        class _RaisingStream:
+            async def __aenter__(self):
+                raise RuntimeError("simulated 503")
+
+            async def __aexit__(self, *_):
+                return False
+
+        sdk.messages.stream = MagicMock(return_value=_RaisingStream())
+
+        events = []
+        async for ev in agent.run_stream([{"role": "user", "content": "go"}]):
+            events.append(ev)
+
+        assert len(events) == 1
+        assert events[0].type == "error"
+        assert "simulated 503" in events[0].payload["message"]
+
+
 # --- end-to-end confirmation-gate flow ------------------------------------
 
 
