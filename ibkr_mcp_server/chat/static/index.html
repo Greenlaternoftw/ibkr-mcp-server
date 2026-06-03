@@ -271,23 +271,77 @@
   }
   function clearToken() { localStorage.removeItem(STORAGE_KEY_TOKEN); }
 
-  // Bootstrap: grab from URL if present.
-  (function bootstrapToken() {
+  // Three auth paths, in priority order:
+  //   1. ?token=... in the URL (kept for backward compat / sharing links)
+  //   2. PIN prompt (if CHAT_PIN is configured server-side)
+  //   3. Raw token prompt (fallback when PIN isn't configured)
+  //
+  // The PIN flow exists because pasting a 64-char hex token into a
+  // browser URL or prompt is unreliable on iOS / various clipboards.
+  // A 4-digit PIN is hard to mangle, easy to type on a phone numeric
+  // keyboard, and the server-side rate-limiter keeps the short PIN
+  // brute-force-safe.
+  //
+  // bootstrapAuth is async because step 2 needs to hit the server to
+  // ask whether a PIN is configured. The page won't make any other
+  // API calls until this resolves (bootstrap() below awaits it).
+  async function bootstrapAuth() {
+    // 1. URL token wins -- save it and strip from the address bar.
     const url = new URL(window.location.href);
     const fromQuery = url.searchParams.get('token');
     if (fromQuery) {
       saveToken(fromQuery);
       url.searchParams.delete('token');
       window.history.replaceState({}, '', url.toString());
+      return;
     }
-    if (!getStoredToken()) {
-      const entered = window.prompt(
-        'Enter your MCP_AUTH_TOKEN to access this chat.\n' +
-        'Tip: append ?token=<your-token> to the URL to save it once.'
-      );
-      if (entered) saveToken(entered.trim());
+    // Already have a stored token from a previous session? Done.
+    if (getStoredToken()) return;
+
+    // 2. Ask the server whether PIN unlock is set up.
+    let pinConfigured = false;
+    try {
+      const r = await fetch('/chat/api/pin/status');
+      if (r.ok) {
+        const j = await r.json();
+        pinConfigured = !!j.configured;
+      }
+    } catch (e) {
+      // Status endpoint failed (network glitch?). Fall through to the
+      // raw token prompt; user can retry by refreshing.
+      console.warn('PIN status check failed:', e);
     }
-  })();
+
+    if (pinConfigured) {
+      const pin = window.prompt('Enter your 4-digit PIN:');
+      if (!pin) return;  // user cancelled; chat won't load, refresh to retry
+      try {
+        const r = await fetch('/chat/api/pin/unlock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: pin.trim() }),
+        });
+        if (r.ok) {
+          const j = await r.json();
+          if (j.token) saveToken(j.token);
+          return;
+        }
+        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        alert('PIN unlock failed: ' + (err.error || 'unknown'));
+      } catch (e) {
+        alert('PIN unlock failed: ' + e.message);
+      }
+      return;
+    }
+
+    // 3. No PIN -- fall back to full-token prompt.
+    const entered = window.prompt(
+      'Enter your MCP_AUTH_TOKEN to access this chat.\n' +
+      'Tip: append ?token=<your-token> to the URL to save it once, or\n' +
+      'set CHAT_PIN in .env on the server for short-PIN unlock.'
+    );
+    if (entered) saveToken(entered.trim());
+  }
 
   function authHeaders() {
     const t = getStoredToken();
@@ -790,6 +844,8 @@
   //   2. no localStorage but server has threads -> open the most recent
   //   3. otherwise empty state; first message will auto-create a thread
   (async function bootstrap() {
+    // Resolve auth BEFORE any other API call -- they all need the token.
+    await bootstrapAuth();
     refreshStatus();
     await refreshThreadList();
     const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_THREAD);

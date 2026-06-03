@@ -38,6 +38,7 @@ import asyncio
 
 from ..config import settings
 from ..tools import TOOLS, call_tool as mcp_call_tool
+from . import auth_pin
 from .agent import AnthropicAgent, ChatError, StreamEvent
 from .persistence import ChatStore
 from .prompts import SYSTEM_PROMPT
@@ -144,6 +145,82 @@ def _get_agent() -> AnthropicAgent:
 
 
 # --- handlers -------------------------------------------------------------
+
+
+async def pin_status(request: Request) -> Response:
+    """PUBLIC. Tells the UI whether a PIN is configured.
+
+    Returns ``{"configured": true/false}``. No auth required -- the
+    response leaks only whether the operator has set up PIN unlock,
+    which is something a determined network observer could infer anyway
+    (e.g., by attempting unlock and seeing 404 vs 401).
+    """
+    return JSONResponse({"configured": bool(settings.chat_pin)})
+
+
+async def pin_unlock(request: Request) -> Response:
+    """PUBLIC, rate-limited. Trades a correct PIN for the bearer token.
+
+    Body: ``{"pin": "1234"}``. On success returns
+    ``{"token": "<MCP_AUTH_TOKEN>"}`` and the page saves it to
+    localStorage. On failure, returns 401 with an error string and
+    records a failure in the in-memory rate limiter.
+
+    Status semantics:
+      * **200** ``{token}``                   correct PIN
+      * **400** ``{error}``                   bad request body
+      * **401** ``{error}``                   wrong PIN
+      * **404** ``{error: "not configured"}`` CHAT_PIN env var is unset
+      * **429** ``{error}``                   rate-limited or locked out
+    """
+    if not settings.chat_pin:
+        return JSONResponse(
+            {"error": "PIN not configured; set CHAT_PIN in .env"},
+            status_code=404,
+        )
+
+    # Pre-check the throttle before even reading the body. A flood of
+    # malformed requests should not get a free pass past the limiter.
+    pre_status = auth_pin.status()
+    if pre_status == "locked_out":
+        return JSONResponse(
+            {
+                "error": (
+                    "PIN unlock locked for the rest of the hour. "
+                    "Use your bearer token to log in if you need access now."
+                )
+            },
+            status_code=429,
+        )
+    if pre_status == "rate_limited":
+        return JSONResponse(
+            {"error": "too many recent attempts -- wait a minute"},
+            status_code=429,
+        )
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    pin = body.get("pin")
+    if not isinstance(pin, str) or not pin:
+        return JSONResponse({"error": "body must include 'pin' string"}, status_code=400)
+
+    # Constant-time compare -- the PIN is short enough that timing
+    # attacks are theoretically possible. ``secrets.compare_digest``
+    # avoids leaking how many leading chars matched.
+    import secrets as _secrets
+    if not _secrets.compare_digest(pin, settings.chat_pin):
+        new_status = auth_pin.record_failure()
+        if new_status == "locked_out":
+            auth_pin.maybe_alert_lockout()
+        return JSONResponse({"error": "incorrect PIN"}, status_code=401)
+
+    # Success -- clear the failure history so the next user doesn't
+    # inherit a near-miss attacker's counters.
+    auth_pin.record_success()
+    return JSONResponse({"token": settings.mcp_auth_token or ""})
 
 
 async def events_stream(request: Request) -> Response:
@@ -499,6 +576,11 @@ def chat_routes() -> List:
         ),
         # Long-lived SSE event stream for live multi-tab/-device sync.
         Route("/chat/api/events/stream", events_stream, methods=["GET"]),
+        # PIN unlock (public, rate-limited). Trades a short PIN for the
+        # bearer token, avoiding the need to paste the long token into
+        # browser URLs or prompts.
+        Route("/chat/api/pin/status", pin_status, methods=["GET"]),
+        Route("/chat/api/pin/unlock", pin_unlock, methods=["POST"]),
     ]
 
     if static_dir.exists():

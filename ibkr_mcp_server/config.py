@@ -85,6 +85,19 @@ class Settings(BaseSettings):
     # want to put it on a different volume or share with another
     # process.
     chat_db_path: str = "/home/trader/ibkr-mcp-server/chat.db"
+
+    # Optional short PIN for unlocking the chat UI on a new device
+    # without pasting the full 64-char MCP_AUTH_TOKEN. When set, the
+    # /chat page prompts for this PIN instead of the token; on success
+    # the server returns the bearer token and the page saves it to
+    # localStorage. Bearer token still works as a parallel auth path
+    # (Claude Desktop, curl, etc. unchanged).
+    #
+    # Plaintext storage is fine -- the PIN's security floor is the
+    # same as the bearer token, which already lives in this file.
+    # Brute-force resistance comes from the rate-limit + lockout
+    # logic, not from the storage format.
+    chat_pin: Optional[str] = None
     
     @field_validator('ibkr_managed_accounts')
     @classmethod

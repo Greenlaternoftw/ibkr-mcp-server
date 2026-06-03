@@ -39,11 +39,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     Public paths (always allowed, no auth needed):
 
-      * ``/healthz``             -- monitoring, watchdog probes
-      * ``/chat``                -- chat UI HTML shell (no secrets in
-                                   the page itself; the actual API
-                                   calls it makes ARE authenticated)
-      * ``/chat/static/*``       -- CSS, JS, icons, manifest
+      * ``/healthz``                  -- monitoring, watchdog probes
+      * ``/chat``                     -- chat UI HTML shell (no secrets in
+                                       the page itself; the actual API
+                                       calls it makes ARE authenticated)
+      * ``/chat/static/*``            -- CSS, JS, icons, manifest
+      * ``/chat/api/pin/status``      -- "is PIN configured?" (boolean only)
+      * ``/chat/api/pin/unlock``      -- the PIN-unlock endpoint itself
+                                       (it IS the auth flow; rate-limited
+                                       in-handler)
 
     Everything else (notably ``/mcp`` and ``/chat/api/*``) requires
     either a Bearer header OR ``?token=...`` query parameter when
@@ -65,7 +69,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     # Paths that bypass auth entirely. Match by prefix for the static
     # mount; exact match for the others.
-    _PUBLIC_EXACT = frozenset({"/healthz", "/chat"})
+    _PUBLIC_EXACT = frozenset({
+        "/healthz",
+        "/chat",
+        "/chat/api/pin/status",
+        "/chat/api/pin/unlock",
+    })
     _PUBLIC_PREFIXES = ("/chat/static/",)
 
     def __init__(self, app, expected_token: str | None):
