@@ -49,6 +49,16 @@ class AgentResult:
       this back as the new thread state).
     - ``input_tokens`` / ``output_tokens`` are accumulated across all
       iterations of this turn.
+    - ``cache_creation_input_tokens`` is the number of prompt tokens
+      WRITTEN to cache this turn (charged at ~1.25x the input price).
+      Non-zero only on the first request after a system-prompt /
+      tools-schema change (or after the 5-minute TTL expires).
+    - ``cache_read_input_tokens`` is the number of prompt tokens READ
+      from cache this turn (charged at ~0.1x the input price). For our
+      9.5K fixed prefix (8K tools + 1.5K system prompt), this should
+      sit at ~9500 on every request after the first -- if it doesn't,
+      a silent cache invalidator is at work (see chat/prompts.py for
+      the rules: keep the system prompt static, keep tool order stable).
     - ``iterations`` is how many Anthropic API calls were made (for
       debugging tool-loop behavior).
     """
@@ -57,6 +67,8 @@ class AgentResult:
     conversation: List[dict] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     iterations: int = 0
 
     def reply_text(self) -> str:
@@ -127,7 +139,25 @@ class AnthropicAgent:
                 response = await self._client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
-                    system=self.system_prompt,
+                    # Prompt caching: wrap the system prompt in a list so
+                    # we can attach `cache_control`. Render order is
+                    # tools -> system -> messages, so a cache marker on
+                    # the last system block caches BOTH tools and system
+                    # together (~9.5K tokens for us). On a cache hit those
+                    # tokens cost ~0.1x the normal input price; on a miss
+                    # ~1.25x. The break-even is 2 requests, so this pays
+                    # off on every conversation after the first turn.
+                    #
+                    # DO NOT mutate self.system_prompt or self.tools_schema
+                    # mid-process -- any change invalidates the cache for
+                    # the rest of the daemon's lifetime.
+                    system=[
+                        {
+                            "type": "text",
+                            "text": self.system_prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
                     tools=self.tools_schema,
                     messages=convo,
                 )
@@ -136,11 +166,20 @@ class AnthropicAgent:
                 raise ChatError(f"Anthropic API call failed: {e}") from e
 
             # Track token spend (best-effort -- some response shapes may
-            # not have usage on errors).
+            # not have usage on errors). Cache fields are non-zero only
+            # when prompt caching is engaged; getattr+default keeps the
+            # code resilient if Anthropic ever returns a usage object
+            # without those fields.
             usage = getattr(response, "usage", None)
             if usage is not None:
                 result.input_tokens += getattr(usage, "input_tokens", 0) or 0
                 result.output_tokens += getattr(usage, "output_tokens", 0) or 0
+                result.cache_creation_input_tokens += (
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                )
+                result.cache_read_input_tokens += (
+                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                )
 
             # Append the assistant turn to the conversation (Anthropic
             # requires content blocks, not a string, for multi-turn

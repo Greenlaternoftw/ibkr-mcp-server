@@ -116,12 +116,28 @@ def _mk_tool_use_block(tool_use_id: str, name: str, tool_input: dict):
     )
 
 
-def _mk_response(content_blocks, stop_reason: str, in_tok: int = 100, out_tok: int = 50):
-    """Build a mock anthropic messages.create() response."""
+def _mk_response(
+    content_blocks,
+    stop_reason: str,
+    in_tok: int = 100,
+    out_tok: int = 50,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+):
+    """Build a mock anthropic messages.create() response.
+
+    cache_creation/cache_read default to 0 so existing tests don't have
+    to care about caching; the caching-specific test below sets them.
+    """
     return SimpleNamespace(
         content=content_blocks,
         stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=in_tok, output_tokens=out_tok),
+        usage=SimpleNamespace(
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+        ),
     )
 
 
@@ -284,6 +300,104 @@ class TestAgentLoop:
         result = await agent.run([{"role": "user", "content": "go"}])
         assert result.input_tokens == 200
         assert result.output_tokens == 60
+
+
+# --- prompt caching -------------------------------------------------------
+#
+# The agent loop wraps system_prompt in a one-element list carrying
+# `cache_control: {"type": "ephemeral"}` so the ~9.5K-token tools+system
+# prefix is cached across turns. These tests verify:
+#   1. The marker is actually placed in the request (we inspect what got
+#      passed to client.messages.create).
+#   2. cache_creation_input_tokens / cache_read_input_tokens flow into
+#      AgentResult so the operator can observe cache effectiveness.
+# If either of these silently regress, token costs balloon ~5-10x.
+
+
+class TestPromptCaching:
+    @pytest.mark.asyncio
+    async def test_system_block_carries_cache_control(self):
+        """The request must include a system list with cache_control on
+        the last (and only) block. Render order is tools -> system ->
+        messages, so this marker caches BOTH tools and the system prompt.
+        """
+        dispatcher = AsyncMock()
+        agent, sdk = _make_agent(dispatcher)
+        sdk.messages.create = AsyncMock(
+            return_value=_mk_response([_mk_text_block("ok")], stop_reason="end_turn")
+        )
+
+        await agent.run([{"role": "user", "content": "hi"}])
+
+        # Inspect the kwargs passed to messages.create.
+        assert sdk.messages.create.await_count == 1
+        kwargs = sdk.messages.create.await_args.kwargs
+        system = kwargs.get("system")
+
+        # Must be a list, not a string -- string form can't carry cache_control.
+        assert isinstance(system, list), f"system must be a list for caching, got {type(system)}"
+        assert len(system) >= 1
+
+        # Marker on the last block caches everything up to it (tools + system).
+        last = system[-1]
+        assert last.get("type") == "text"
+        assert last.get("cache_control") == {"type": "ephemeral"}
+        # Sanity: the actual prompt text is preserved.
+        assert last.get("text") == "(test prompt)"
+
+    @pytest.mark.asyncio
+    async def test_cache_token_counts_accumulate(self):
+        """cache_creation and cache_read tokens roll up across iterations
+        into AgentResult. First iter writes the cache, second reads it --
+        AgentResult must reflect the sum, not just the last response."""
+        dispatcher = AsyncMock(return_value='{"ok": true}')
+        agent, sdk = _make_agent(dispatcher)
+        sdk.messages.create = AsyncMock(
+            side_effect=[
+                # Iteration 1: write the cache. cache_read=0 means miss.
+                _mk_response(
+                    [_mk_tool_use_block("tu1", "get_portfolio", {})],
+                    stop_reason="tool_use",
+                    in_tok=80, out_tok=40,
+                    cache_creation=9500, cache_read=0,
+                ),
+                # Iteration 2: cache hit. cache_creation=0, cache_read=9500.
+                _mk_response(
+                    [_mk_text_block("Done.")],
+                    stop_reason="end_turn",
+                    in_tok=120, out_tok=20,
+                    cache_creation=0, cache_read=9500,
+                ),
+            ]
+        )
+
+        result = await agent.run([{"role": "user", "content": "go"}])
+
+        assert result.cache_creation_input_tokens == 9500
+        assert result.cache_read_input_tokens == 9500
+        # Sanity: regular token counts still work alongside cache fields.
+        assert result.input_tokens == 200
+        assert result.output_tokens == 60
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_usage_fields_are_zero(self):
+        """If Anthropic ever returns a usage object WITHOUT the cache
+        fields (older SDK, error path, etc.), the agent must not crash --
+        cache counters stay at 0."""
+        dispatcher = AsyncMock()
+        agent, sdk = _make_agent(dispatcher)
+        # Build a response whose usage object lacks the cache_* attrs.
+        sdk.messages.create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[_mk_text_block("ok")],
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=50, output_tokens=10),
+            )
+        )
+
+        result = await agent.run([{"role": "user", "content": "hi"}])
+        assert result.cache_creation_input_tokens == 0
+        assert result.cache_read_input_tokens == 0
 
 
 # --- end-to-end confirmation-gate flow ------------------------------------
