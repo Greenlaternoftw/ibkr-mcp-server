@@ -2458,6 +2458,94 @@ function lockApp() {
   pinShowOverlay('Locked', 'Enter your PIN to unlock');
 }
 
+/**
+ * Re-derive the inline UI "🔧 tool call" / "✓ tool result" chips from
+ * an API-shaped conversation. Server persists turns as (role,
+ * content) where content is a string OR list of blocks; tool_use and
+ * tool_result blocks live inside assistant/user turns. The chat
+ * panel shows them as separate chips, so we walk the blocks and
+ * splice in UI-only entries (filtered out before the next API send).
+ */
+function _expandConversationToHistory(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    out.push({ role: m.role, content: m.content });
+    const blocks = Array.isArray(m.content) ? m.content : [];
+    for (const b of blocks) {
+      if (b.type === 'tool_use') {
+        out.push({
+          role: 'tool', _toolCall: true,
+          content: '🔧 ' + b.name + ': ' + JSON.stringify(b.input || {}),
+        });
+      } else if (b.type === 'tool_result') {
+        let preview = '';
+        if (typeof b.content === 'string') preview = b.content;
+        else if (Array.isArray(b.content)) {
+          preview = b.content
+            .filter(c => c.type === 'text').map(c => c.text).join('\n');
+        }
+        out.push({
+          role: 'tool', _toolResult: true,
+          ok: b.is_error !== true,
+          preview: preview.slice(0, 400),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Ensure a server-side thread exists and load its messages into
+ * chatHistory. Called on boot so the chat panel doesn't reset on
+ * every PIN unlock / page reload.
+ *
+ * Storage: state.activeThreadId is mirrored to the activeThreadId
+ * pref. If the cached id refers to a thread that was deleted (or the
+ * pref is empty / from a wiped DB), we create a fresh one.
+ */
+async function _ensureActiveThread() {
+  let tid = await storage.get('activeThreadId');
+  if (tid) {
+    try {
+      const j = await daemonGet('/chat/api/threads/' + encodeURIComponent(tid) + '/messages');
+      state.activeThreadId = tid;
+      chatHistory.length = 0;
+      const expanded = _expandConversationToHistory(j.messages || []);
+      for (const m of expanded) chatHistory.push(m);
+      return;
+    } catch (e) {
+      // 404 -- thread vanished; fall through to create a fresh one.
+      tid = null;
+    }
+  }
+  // Need a new thread.
+  try {
+    const thread = await daemonPost('/chat/api/threads', {
+      title: 'Command Center session',
+      client_id: DAEMON_CLIENT_ID,
+    });
+    state.activeThreadId = thread.id;
+    await storage.set('activeThreadId', thread.id);
+    chatHistory.length = 0;
+  } catch (e) {
+    console.error('Could not create chat thread:', e);
+    state.activeThreadId = null;
+  }
+}
+
+/**
+ * Restore the last-viewed pane (dashboard or chat) so the operator
+ * doesn't always land on the dashboard. Run after the rest of the
+ * boot is done so the chat panel has its history ready when shown.
+ */
+async function _restoreActiveView() {
+  const v = await storage.get('activeView');
+  if (v === 'chat' && !document.body.classList.contains('chat-view')) {
+    toggleView();
+  }
+}
+
 // Kicked off ONCE the user successfully unlocks (or the cached
 // token validated). Everything that needs the bearer token waits
 // for this -- keeps the empty-state UI from flickering during boot.
@@ -2468,7 +2556,9 @@ async function bootAppPostPin() {
     await refreshAccountSummary();
     startAccountSummaryPolling();
     startLiveSyncStream();
+    await _ensureActiveThread();
     renderChatMessages();
+    await _restoreActiveView();
   } catch (e) {
     console.error('post-PIN boot failed:', e);
   }
@@ -2626,6 +2716,7 @@ const state = {
   DISPLAY_MIN: 75,       // analyst accuracy % below which rows are hidden entirely
   BREAKEVEN_MIN: 0.50,   // breakeven + this $ amount = trailing stop floor
   BIAS_ADJUSTMENT_PCT: 0.20,
+  activeThreadId: null,  // server-side thread id; chat messages persist into it
 };
 
 // Persistent portfolio state (loaded from storage)
@@ -4504,6 +4595,10 @@ function toggleView() {
     btn.classList.remove('active');
     label.textContent = 'Chat View';
   }
+  // Persist so the next session lands where the operator left off.
+  // Fire-and-forget -- toggle should feel instant; SQLite write happens
+  // in the background.
+  try { storage.set('activeView', isChat ? 'chat' : 'dashboard'); } catch (_) {}
 }
 
 /* ============================================================
@@ -4576,10 +4671,22 @@ function renderChatMessages() {
   container.scrollTop = container.scrollHeight;
 }
 
-function clearChatHistory() {
-  if (chatHistory.length && !confirm('Clear the entire conversation?')) return;
+async function clearChatHistory() {
+  if (chatHistory.length && !confirm('Clear the entire conversation? Starts a fresh thread; old conversation remains in your thread history server-side.')) return;
   chatHistory.length = 0;
   renderChatMessages();
+  // Roll a new server-side thread so subsequent turns persist into a
+  // fresh transcript rather than appending to the cleared one.
+  try {
+    const thread = await daemonPost('/chat/api/threads', {
+      title: 'Command Center session',
+      client_id: DAEMON_CLIENT_ID,
+    });
+    state.activeThreadId = thread.id;
+    await storage.set('activeThreadId', thread.id);
+  } catch (e) {
+    console.error('Could not roll new thread:', e);
+  }
 }
 
 function handleImageAttach(event) {
@@ -4716,6 +4823,9 @@ async function sendChatMessage() {
       body: JSON.stringify({
         messages: apiMessages,
         client_id: DAEMON_CLIENT_ID,
+        // Persist this turn into the active server-side thread so the
+        // conversation survives reload / cross-device.
+        thread_id: state.activeThreadId || undefined,
       }),
     });
     if (!r.ok) {
@@ -4782,33 +4892,8 @@ async function sendChatMessage() {
             placeholder._loading = false;
             if (evt.conversation && Array.isArray(evt.conversation)) {
               chatHistory.length = 0;
-              for (const m of evt.conversation) {
-                chatHistory.push({ role: m.role, content: m.content });
-                // Inject UI decorations for any tool_use / tool_result
-                // blocks so the operator can see what happened.
-                const blocks = Array.isArray(m.content) ? m.content : [];
-                for (const b of blocks) {
-                  if (b.type === 'tool_use') {
-                    chatHistory.push({
-                      role: 'tool', _toolCall: true,
-                      content: '🔧 ' + b.name + ': ' + JSON.stringify(b.input || {}),
-                    });
-                  } else if (b.type === 'tool_result') {
-                    const isErr = b.is_error === true;
-                    let preview = '';
-                    if (typeof b.content === 'string') preview = b.content;
-                    else if (Array.isArray(b.content)) {
-                      preview = b.content
-                        .filter(c => c.type === 'text').map(c => c.text).join('\n');
-                    }
-                    chatHistory.push({
-                      role: 'tool', _toolResult: true,
-                      ok: !isErr,
-                      preview: preview.slice(0, 400),
-                    });
-                  }
-                }
-              }
+              const expanded = _expandConversationToHistory(evt.conversation);
+              for (const m of expanded) chatHistory.push(m);
             }
             renderChatMessages();
             break;
