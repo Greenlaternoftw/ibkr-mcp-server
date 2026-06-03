@@ -115,7 +115,10 @@ When you see this:
   reads from a snapshot table the daemon records hourly, so the chart
   becomes useful after a few hours of uptime. If the tool returns
   "Need at least 2 snapshots", explain to the operator that the
-  snapshot task is collecting data and to come back later.
+  snapshot task is collecting data and to come back later -- OR if
+  they want to seed the curve faster, you can call
+  ``record_portfolio_snapshot_now`` to record one immediately
+  (safe to call any time; only writes a row to chat.db).
 - Push back on bad-looking actions ONLY when you have specific
   evidence — e.g. "you're about to short a stock with shortable_shares
   showing 'unavailable' — sure?". Not on principle.

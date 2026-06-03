@@ -188,6 +188,39 @@ class TestEquityCurveTool:
         assert out["status"] == "ok"
 
     @pytest.mark.asyncio
+    async def test_snapshot_now_tool_creates_a_row(self, client, tmp_path, monkeypatch):
+        """The MCP tool ``record_portfolio_snapshot_now`` dispatches to
+        record_portfolio_snapshot and writes one row -- exposed so the
+        operator can seed the equity curve without waiting for the
+        hourly tick."""
+        from ibkr_mcp_server.tools import call_tool
+        # Patch the global ibkr_client (the dispatcher uses the module-level
+        # singleton, not our fixture's client).
+        from ibkr_mcp_server import tools as _tools_mod
+        monkeypatch.setattr(_tools_mod, "ibkr_client", client)
+
+        with patch.object(
+            client, "get_account_summary",
+            new=AsyncMock(return_value={
+                "account": "DU1",
+                "NetLiquidation": "100500.00",
+                "TotalCashValue": "30000.00",
+                "BuyingPower": "200000.00",
+            }),
+        ):
+            content = await call_tool("record_portfolio_snapshot_now", {})
+
+        # The dispatcher returns [TextContent] -- pull the JSON body.
+        import json as _json
+        result = _json.loads(content[0].text)
+        assert result["status"] == "ok"
+        assert result["net_liquidation"] == 100500.00
+
+        # And the row landed in chat.db.
+        store = ChatStore(tmp_path / "chat.db")
+        assert store.snapshot_count(account="DU1") == 1
+
+    @pytest.mark.asyncio
     async def test_respects_lookback_days_filter(self, client, tmp_path):
         """Old snapshots outside the lookback window should be excluded
         from the chart. Verified by inserting one OLD row directly (with

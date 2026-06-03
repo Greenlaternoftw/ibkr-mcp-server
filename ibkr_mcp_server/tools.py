@@ -302,6 +302,24 @@ TOOLS = [
         },
     ),
     Tool(
+        name="record_portfolio_snapshot_now",
+        description=(
+            "Force a portfolio equity snapshot RIGHT NOW. Normally the "
+            "daemon records one every hour via a background task; this "
+            "tool is for the operator to seed the equity-curve chart "
+            "with extra data points (e.g. after a manual restart, or "
+            "immediately after a deploy when the table is empty). "
+            "Read-only side-effect: just records a row in chat.db's "
+            "portfolio_snapshots table; doesn't touch the broker. Safe "
+            "to call any time."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="get_portfolio_equity_curve",
         description=(
             "Render the account's equity curve from accumulated daily/hourly "
@@ -732,6 +750,16 @@ async def call_tool(
                     mimeType="image/png",
                 ),
             ]
+
+        elif name == "record_portfolio_snapshot_now":
+            # No image content -- this is a write tool. The model
+            # gets back the snapshot fields so it can quote the
+            # numbers ("recorded $X at ...") to the operator.
+            result = await ibkr_client.record_portfolio_snapshot()
+            return [TextContent(
+                type="text",
+                text=json.dumps(result, indent=2, default=str),
+            )]
 
         elif name == "get_portfolio_equity_curve":
             result = await ibkr_client.get_portfolio_equity_curve(
