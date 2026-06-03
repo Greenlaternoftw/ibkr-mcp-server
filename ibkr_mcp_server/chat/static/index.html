@@ -4701,8 +4701,13 @@ async function sendChatMessage() {
     // Daemon-routed streaming. The server handles prompt caching, tool
     // execution (place_order, get_chart, etc.), the destructive-action
     // confirmation gate, and live multi-tab sync.
+    //
+    // Filter out the UI-only `role: 'tool'` decorations we splice in for
+    // the tool-call / tool-result chips -- Anthropic only accepts
+    // `user` / `assistant` at the top level (tool results travel as
+    // content blocks inside a user turn, which the server constructs).
     const apiMessages = chatHistory
-      .filter(m => !m._loading)
+      .filter(m => !m._loading && !m._toolCall && !m._toolResult)
       .map(m => ({ role: m.role, content: m.content }));
 
     const r = await fetch('/chat/api/message/stream', {
@@ -4768,17 +4773,41 @@ async function sendChatMessage() {
             renderChatMessages();
             break;
           case 'done':
-            // Final state from the server -- includes the full assistant
-            // turn the daemon persisted (carries tool_use blocks etc.).
-            // We trust assistantText already shows the right content;
-            // just clear the loading flag and move on.
+            // Final state from the server. evt.conversation is the
+            // authoritative message log -- it has the real `tool_use` /
+            // `tool_result` content blocks the next-turn API call needs.
+            // Replace our local chatHistory with it, then re-derive the
+            // inline UI decorations (🔧 tool-call lines, ✓/✗ result
+            // lines) so the chat panel stays visually unchanged.
             placeholder._loading = false;
-            if (!gotAnyText && evt.conversation) {
-              // Edge case: assistant ended on tool_use without text.
-              const last = evt.conversation[evt.conversation.length - 1];
-              if (last && last.role === 'assistant') {
-                placeholder.content = (last.content || [])
-                  .filter(b => b.type === 'text').map(b => b.text).join('\n');
+            if (evt.conversation && Array.isArray(evt.conversation)) {
+              chatHistory.length = 0;
+              for (const m of evt.conversation) {
+                chatHistory.push({ role: m.role, content: m.content });
+                // Inject UI decorations for any tool_use / tool_result
+                // blocks so the operator can see what happened.
+                const blocks = Array.isArray(m.content) ? m.content : [];
+                for (const b of blocks) {
+                  if (b.type === 'tool_use') {
+                    chatHistory.push({
+                      role: 'tool', _toolCall: true,
+                      content: '🔧 ' + b.name + ': ' + JSON.stringify(b.input || {}),
+                    });
+                  } else if (b.type === 'tool_result') {
+                    const isErr = b.is_error === true;
+                    let preview = '';
+                    if (typeof b.content === 'string') preview = b.content;
+                    else if (Array.isArray(b.content)) {
+                      preview = b.content
+                        .filter(c => c.type === 'text').map(c => c.text).join('\n');
+                    }
+                    chatHistory.push({
+                      role: 'tool', _toolResult: true,
+                      ok: !isErr,
+                      preview: preview.slice(0, 400),
+                    });
+                  }
+                }
               }
             }
             renderChatMessages();
