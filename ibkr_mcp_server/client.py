@@ -837,6 +837,157 @@ class IBKRClient:
             "image_png_b64": base64.b64encode(png).decode("ascii"),
         }
 
+    async def get_swing_visualization(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 180,
+        theme: str = "dark",
+    ) -> Dict:
+        """Render a candlestick chart with the swing strategy's state overlaid.
+
+        On top of the standard OHLC + moving-averages chart, draws:
+          * cost basis (horizontal line, accent color)
+          * floor price = cost_basis - floor_offset (horizontal line, red --
+            this is where the hard STP fires)
+          * current trail-stop estimate = last_close - ATR*trail_multiplier
+            (horizontal line, dashed -- moves with price)
+          * dip-buy target (only when state == FLAT, since that's when we're
+            waiting on a dip to re-enter)
+          * last-fill marker (scatter dot at the last buy or sell)
+
+        If the swing strategy isn't registered for ``symbol``, returns
+        an error dict; the dispatcher surfaces this as plain text so
+        the model can explain to the operator that there's no active
+        strategy to visualize.
+        """
+        from . import charts as _charts
+        import base64
+
+        # Need the swing record. Use the same lazy loader the rest of the
+        # daemon uses so we don't touch state files on cold start.
+        swing_states = self._swing_state_dict()
+        state = swing_states.get(symbol)
+        if state is None:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": f"No active swing strategy for {symbol}. "
+                           "Use start_swing_strategy first, or use get_chart "
+                           "for a generic price chart.",
+            }
+
+        bars = await self.get_historical_bars(symbol, lookback_days=lookback_days)
+        if bars is None or len(bars) == 0:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "message": "No historical bars returned",
+            }
+
+        # Build the overlay list. Colors picked from the chart theme
+        # palette so they read against both light and dark backgrounds.
+        overlays: list[dict] = []
+
+        # Cost basis -- always present.
+        overlays.append({
+            "type": "hline",
+            "y": state.cost_basis,
+            "label": f"cost ${state.cost_basis:.2f}",
+            "color": "#38bdf8",   # accent blue
+        })
+
+        # Floor (hard stop). Only meaningful when state is HOLDING --
+        # otherwise the STP isn't live -- but we draw it either way so
+        # the operator sees the protective level the strategy WOULD use.
+        floor = state.cost_basis - state.config.floor_offset
+        overlays.append({
+            "type": "hline",
+            "y": floor,
+            "label": f"floor ${floor:.2f}",
+            "color": "#f87171",   # down/danger red
+        })
+
+        # Trail stop estimate. Needs ATR -- compute from the bars we
+        # just fetched (matches the strategy's own per-tick computation
+        # at compute_trail_amount in swing.py).
+        try:
+            from .swing import compute_trail_amount
+            trail_amount = compute_trail_amount(
+                bars, state.config.trail_atr_multiplier
+            )
+            last_close = float(bars["close"].iloc[-1])
+            trail_stop = last_close - trail_amount
+            overlays.append({
+                "type": "hline",
+                "y": trail_stop,
+                "label": f"trail ~${trail_stop:.2f} (ATR×{state.config.trail_atr_multiplier})",
+                "color": "#fbbf24",   # warning amber
+            })
+        except Exception as e:
+            # ATR can fail if bars are too short / pandas_ta hiccup --
+            # don't let it block the rest of the chart.
+            self.logger.warning(f"get_swing_visualization ATR calc failed: {e}")
+            trail_stop = None
+
+        # Dip-buy target (only when waiting to re-enter).
+        from .swing import SwingState, compute_dip_price
+        dip_target = None
+        if state.state == SwingState.FLAT and state.last_fill_price:
+            try:
+                dip_target = compute_dip_price(state.last_fill_price, state.config)
+                overlays.append({
+                    "type": "hline",
+                    "y": dip_target,
+                    "label": f"dip target ${dip_target:.2f}",
+                    "color": "#10b981",   # up/buy green
+                })
+            except Exception as e:
+                self.logger.warning(f"get_swing_visualization dip calc failed: {e}")
+
+        # Last-fill marker (so the operator can see where we last
+        # bought or sold relative to the chart).
+        if state.last_fill_time and state.last_fill_price is not None:
+            overlays.append({
+                "type": "marker",
+                "x": state.last_fill_time[:10],   # YYYY-MM-DD
+                "y": state.last_fill_price,
+                "label": f"last {state.last_fill_action} ${state.last_fill_price:.2f}",
+                "color": "#10b981" if state.last_fill_action == "BUY" else "#f87171",
+            })
+
+        png = await asyncio.to_thread(
+            _charts.render_ohlc_chart,
+            bars,
+            symbol=symbol,
+            sma_periods=(20, 50),
+            overlays=overlays,
+            theme=theme,
+        )
+
+        last = float(bars["close"].iloc[-1])
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "swing_state": state.state.value,
+            "quantity": state.quantity,
+            "cost_basis": state.cost_basis,
+            "floor_price": round(floor, 2),
+            "trail_stop_estimate": round(trail_stop, 2) if trail_stop else None,
+            "dip_target": round(dip_target, 2) if dip_target else None,
+            "last_close": round(last, 2),
+            "pct_vs_cost": round((last - state.cost_basis) / state.cost_basis * 100, 2),
+            "lookback_days": lookback_days,
+            "bars_returned": int(len(bars)),
+            "summary": (
+                f"{symbol} swing: {state.quantity} shares @ ${state.cost_basis:.2f} "
+                f"cost, now ${last:.2f} "
+                f"({(last - state.cost_basis) / state.cost_basis * 100:+.1f}%). "
+                f"State: {state.state.value}."
+            ),
+            "image_png_b64": base64.b64encode(png).decode("ascii"),
+        }
+
     async def check_regime(self, symbol: str, **overrides) -> Dict:
         """Evaluate the Layer 2 regime filter against `symbol`'s recent bars.
 

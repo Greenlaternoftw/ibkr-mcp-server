@@ -302,6 +302,40 @@ TOOLS = [
         },
     ),
     Tool(
+        name="get_swing_visualization",
+        description=(
+            "Render the swing strategy's state on top of a candlestick chart. "
+            "Shows price history with the operator's cost basis, the hard "
+            "floor (STP fires here), the current trail-stop estimate (moves "
+            "with price), the dip-buy target if waiting on a re-entry, and "
+            "a marker at the last fill. Use this when the user asks about "
+            "'my AAPL swing', 'how's my F position', or wants to see how "
+            "their strategy is performing visually. Requires an active swing "
+            "strategy for the symbol -- if there isn't one, the result "
+            "will say so and you should suggest get_chart for a generic view."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Symbol with an active swing strategy."},
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "Calendar days of history. Default 180.",
+                    "default": 180,
+                    "minimum": 5,
+                    "maximum": 730,
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["dark", "light"],
+                    "default": "dark",
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="get_chart",
         description=(
             "Fetch historical price bars for a symbol and render a candlestick "
@@ -309,7 +343,9 @@ TOOLS = [
             "inline in the chat UI) and a short numeric summary. Use this "
             "whenever the user asks 'show me X', 'chart X', or wants to see "
             "what a stock has been doing visually. Defaults to ~180 calendar "
-            "days of daily bars with SMA20 + SMA50 overlays."
+            "days of daily bars with SMA20 + SMA50 overlays. For a chart with "
+            "the user's strategy overlaid (cost basis, trail stop, etc.), "
+            "use get_swing_visualization instead when a swing strategy is active."
         ),
         inputSchema={
             "type": "object",
@@ -582,6 +618,34 @@ async def call_tool(
             )
             if result.get("status") != "ok":
                 # Error path -- return text only so the model can surface it.
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                )]
+            png_b64 = result.pop("image_png_b64")
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, default=str),
+                ),
+                ImageContent(
+                    type="image",
+                    data=png_b64,
+                    mimeType="image/png",
+                ),
+            ]
+
+        elif name == "get_swing_visualization":
+            # Same text+image shape as get_chart but with strategy overlays
+            # baked into the PNG (cost basis, floor, trail stop, dip target,
+            # last fill). Falls back to text-only on missing strategy / no
+            # bars; the model can then point the user at get_chart.
+            result = await ibkr_client.get_swing_visualization(
+                arguments["symbol"],
+                lookback_days=arguments.get("lookback_days", 180),
+                theme=arguments.get("theme", "dark"),
+            )
+            if result.get("status") != "ok":
                 return [TextContent(
                     type="text",
                     text=json.dumps(result, indent=2, default=str),

@@ -99,6 +99,16 @@ When you see this:
   (trend direction, where price is relative to MAs, recent volatility),
   but don't restate the obvious price + percent change -- the chart
   shows that.
+- When the operator asks about THEIR position in something they're
+  actively running a swing strategy on -- "how's my AAPL swing", "show
+  me my F position", "where's my trail stop" -- prefer
+  ``get_swing_visualization`` over ``get_chart``. It draws the same
+  candlestick chart but overlays the cost basis, hard floor, current
+  trail-stop estimate, dip-buy target (when waiting), and a marker at
+  the last fill. The accompanying numbers (pct vs cost, trail stop
+  price, etc.) are also in the text result. If the operator asks for a
+  symbol with no active strategy, the tool will say so and you should
+  fall back to ``get_chart``.
 - Push back on bad-looking actions ONLY when you have specific
   evidence — e.g. "you're about to short a stock with shortable_shares
   showing 'unavailable' — sure?". Not on principle.
