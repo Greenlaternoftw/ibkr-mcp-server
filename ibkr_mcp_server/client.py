@@ -804,7 +804,16 @@ class IBKRClient:
                 "message": "No historical bars returned",
             }
 
-        png = _charts.render_ohlc_chart(
+        # Matplotlib's PNG render is synchronous CPU-bound work. The
+        # FIRST call after process start also triggers a font-cache
+        # build that can take 5-30 seconds. Doing this on the asyncio
+        # event loop would freeze the daemon -- /healthz wouldn't reply,
+        # the watchdog would think the daemon is hung, and the in-flight
+        # SSE stream to the browser would get torn down mid-response.
+        # Offloading to the default thread executor keeps the loop
+        # responsive; the chart-requesting handler simply awaits.
+        png = await asyncio.to_thread(
+            _charts.render_ohlc_chart,
             bars,
             symbol=symbol,
             sma_periods=sma_periods,

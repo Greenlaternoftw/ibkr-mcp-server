@@ -155,6 +155,27 @@ async def run_daemon_http():
             f"resumed strategies: reversal={resumed['reversal']} swing={resumed['swing']}"
         )
 
+        # Pre-warm matplotlib if charts are wired in. The first call
+        # to pyplot triggers a font-cache build that can take 5-30
+        # seconds, and we want to pay that cost ONCE at boot rather
+        # than blocking the first user's chart request (which would
+        # also trip the watchdog). Failure here is non-fatal -- if
+        # matplotlib isn't installed, charts will fail at call time
+        # with a clear ImportError, which is the right surface for
+        # that bug.
+        try:
+            import matplotlib  # noqa: F401
+            matplotlib.use("Agg", force=True)
+            import matplotlib.pyplot as plt  # noqa: F401
+            # A no-op figure forces the font cache to build.
+            fig = plt.figure()
+            plt.close(fig)
+            logger.info("matplotlib pre-warmed (charts ready)")
+        except ImportError:
+            logger.info("matplotlib not installed; chart tools will error on call")
+        except Exception as e:
+            logger.warning(f"matplotlib pre-warm failed: {e}")
+
         await run_http_server(
             host=settings.mcp_bind_host,
             port=settings.mcp_bind_port,
