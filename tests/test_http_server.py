@@ -93,6 +93,43 @@ class TestBearerAuth:
         r = client.get("/tools", headers={"authorization": "Bearer secret"})
         assert r.status_code == 200
 
+    # --- query-param fallback (for browser-navigation case) ---------------
+    #
+    # The /chat UI is loaded by typing a URL into the browser. Browsers do
+    # NOT attach Authorization headers to navigation GETs (only to
+    # fetch()). Without a fallback, the very first /chat request 401s
+    # and the page never loads. The middleware accepts ?token=... as a
+    # backup so the page can boot, save the token to localStorage, and
+    # use the Authorization header for every subsequent API call.
+
+    def test_query_param_token_accepted_when_header_absent(self):
+        client = TestClient(_build_app(token="secret"))
+        r = client.get("/tools?token=secret")
+        assert r.status_code == 200
+
+    def test_query_param_token_rejected_when_wrong(self):
+        client = TestClient(_build_app(token="secret"))
+        r = client.get("/tools?token=nope")
+        assert r.status_code == 401
+        assert "invalid token" in r.json()["error"]
+
+    def test_header_takes_precedence_over_query_param(self):
+        """If both are present and the header is valid, the request goes
+        through even if the query is bogus -- header is preferred."""
+        client = TestClient(_build_app(token="secret"))
+        r = client.get(
+            "/tools?token=garbage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert r.status_code == 200
+
+    def test_query_param_does_not_bypass_token_check(self):
+        """Sanity: query param must still match. Empty query + no header
+        is still 401."""
+        client = TestClient(_build_app(token="secret"))
+        r = client.get("/tools?token=")
+        assert r.status_code == 401
+
 
 # --- startup-binding validation --------------------------------------------
 

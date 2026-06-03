@@ -40,6 +40,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     - `/healthz` is always allowed (monitoring, watchdog probes).
     - When `expected_token` is None, every other route is also allowed
       (localhost-only dev mode).
+    - Falls back to `?token=<...>` query parameter when the
+      Authorization header is absent. This is necessary for the browser
+      chat UI at /chat: browsers cannot attach an Authorization header
+      to a navigation GET, only to fetch() calls. The chat HTML strips
+      the token from the URL and saves it to localStorage on first
+      load, so the query parameter is only ever needed for the very
+      first page request. All subsequent /chat/api/* calls go through
+      the Authorization header path.
     """
 
     def __init__(self, app, expected_token: str | None):
@@ -52,13 +60,22 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not self.expected_token:
             return await call_next(request)
 
+        # Preferred path: Authorization header.
+        token: str | None = None
         header = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-        if not header.startswith("Bearer "):
+        if header.startswith("Bearer "):
+            token = header[7:].strip()
+
+        # Browser-navigation fallback: ?token=... in the URL.
+        # See class docstring for why this is required.
+        if not token:
+            token = request.query_params.get("token")
+
+        if not token:
             return JSONResponse(
                 {"error": "missing or malformed Authorization header"},
                 status_code=401,
             )
-        token = header[7:].strip()
         if token != self.expected_token:
             return JSONResponse({"error": "invalid token"}, status_code=401)
         return await call_next(request)
