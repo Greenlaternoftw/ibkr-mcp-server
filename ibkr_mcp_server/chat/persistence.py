@@ -183,6 +183,54 @@ class ChatStore:
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_account_ts "
                 "ON portfolio_snapshots(account, timestamp)"
             )
+            # Command-Center: user-defined watchlist "portfolios" (multiple
+            # named groups of tickers). Independent of IBKR positions --
+            # these are for tracking + research, NOT for orders.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watchlists (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    created_at  TEXT NOT NULL,
+                    sort_order  INTEGER DEFAULT 0
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watchlist_stocks (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id  INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+                    symbol        TEXT NOT NULL,
+                    rating        TEXT,
+                    current_price REAL,
+                    target_price  REAL,
+                    range_low     REAL,
+                    range_high    REAL,
+                    notes         TEXT,
+                    added_at      TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL,
+                    UNIQUE(watchlist_id, symbol)
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wstocks_watchlist "
+                "ON watchlist_stocks(watchlist_id)"
+            )
+            # Generic key-value preferences -- UI state that used to
+            # live in browser localStorage. Moving it server-side means
+            # one device's settings (active watchlist tab, gate
+            # threshold, view mode, etc.) sync to every other device.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_prefs (
+                    key         TEXT PRIMARY KEY,
+                    value       TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                )
+                """
+            )
             c.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -351,6 +399,179 @@ class ChatStore:
         with self._conn() as c:
             rows = c.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    # --- watchlists (Command-Center portfolio tabs) -------------------
+
+    def list_watchlists(self) -> List[dict]:
+        """All watchlists with their stock counts. Sort_order then name."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT w.id, w.name, w.created_at, w.sort_order,
+                  (SELECT COUNT(*) FROM watchlist_stocks s WHERE s.watchlist_id = w.id) AS stock_count
+                FROM watchlists w
+                ORDER BY w.sort_order, w.name
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_watchlist(self, name: str) -> dict:
+        """Create a new (empty) watchlist. Raises sqlite3.IntegrityError
+        if the name is already taken."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO watchlists(name, created_at, sort_order) "
+                "VALUES (?, ?, COALESCE((SELECT MAX(sort_order) FROM watchlists), 0) + 1)",
+                (name, _utc_now_iso()),
+            )
+            new_id = cur.lastrowid
+            row = c.execute(
+                "SELECT id, name, created_at, sort_order FROM watchlists WHERE id = ?",
+                (new_id,),
+            ).fetchone()
+        d = dict(row)
+        d["stock_count"] = 0
+        return d
+
+    def delete_watchlist(self, watchlist_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+            return cur.rowcount > 0
+
+    def get_watchlist_stocks(self, watchlist_id: int) -> List[dict]:
+        """All stocks in one watchlist, in insertion order."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, symbol, rating, current_price, target_price,
+                       range_low, range_high, notes, added_at, updated_at
+                FROM watchlist_stocks WHERE watchlist_id = ?
+                ORDER BY id ASC
+                """,
+                (watchlist_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_watchlist_stock(self, watchlist_id: int, symbol: str) -> dict:
+        """Insert a placeholder row for a symbol (metrics filled later
+        via upsert_watchlist_stock). Raises IntegrityError on duplicate."""
+        now = _utc_now_iso()
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO watchlist_stocks(watchlist_id, symbol, added_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (watchlist_id, symbol.upper(), now, now),
+            )
+            row = c.execute(
+                "SELECT id, symbol, rating, current_price, target_price, "
+                "range_low, range_high, notes, added_at, updated_at "
+                "FROM watchlist_stocks WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+        return dict(row)
+
+    def upsert_watchlist_stock(
+        self,
+        watchlist_id: int,
+        symbol: str,
+        *,
+        rating: Optional[str] = None,
+        current_price: Optional[float] = None,
+        target_price: Optional[float] = None,
+        range_low: Optional[float] = None,
+        range_high: Optional[float] = None,
+        notes: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Update an existing watchlist row's metrics (rating, prices, etc).
+        Only non-None fields are written -- partial updates are common
+        when only the price refresh fires. Returns the updated row, or
+        None if the (watchlist_id, symbol) pair doesn't exist."""
+        sets, params = [], []
+        if rating is not None:
+            sets.append("rating = ?"); params.append(rating)
+        if current_price is not None:
+            sets.append("current_price = ?"); params.append(float(current_price))
+        if target_price is not None:
+            sets.append("target_price = ?"); params.append(float(target_price))
+        if range_low is not None:
+            sets.append("range_low = ?"); params.append(float(range_low))
+        if range_high is not None:
+            sets.append("range_high = ?"); params.append(float(range_high))
+        if notes is not None:
+            sets.append("notes = ?"); params.append(notes)
+        if not sets:
+            # Nothing to update, just bump timestamp.
+            sets.append("updated_at = ?"); params.append(_utc_now_iso())
+        else:
+            sets.append("updated_at = ?"); params.append(_utc_now_iso())
+        params.extend([watchlist_id, symbol.upper()])
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE watchlist_stocks SET " + ", ".join(sets) +
+                " WHERE watchlist_id = ? AND symbol = ?",
+                params,
+            )
+            if cur.rowcount == 0:
+                return None
+            row = c.execute(
+                "SELECT id, symbol, rating, current_price, target_price, "
+                "range_low, range_high, notes, added_at, updated_at "
+                "FROM watchlist_stocks WHERE watchlist_id = ? AND symbol = ?",
+                (watchlist_id, symbol.upper()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def remove_watchlist_stock(self, watchlist_id: int, symbol: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM watchlist_stocks "
+                "WHERE watchlist_id = ? AND symbol = ?",
+                (watchlist_id, symbol.upper()),
+            )
+            return cur.rowcount > 0
+
+    # --- generic user preferences (UI state) ---------------------------
+
+    def get_pref(self, key: str) -> Optional[str]:
+        """Returns the raw string value, or None if unset.
+
+        The UI is responsible for JSON-encoding/decoding any structured
+        values it stores. Keeping the column TEXT means the persistence
+        layer doesn't have to grow alongside whatever UI state shows up.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM user_prefs WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_pref(self, key: str, value: str) -> None:
+        """Upsert a single preference. Limit key/value size to keep one
+        misbehaving caller from filling the DB."""
+        if len(key) > 256:
+            raise ValueError("pref key too long (max 256)")
+        if len(value) > 65536:
+            raise ValueError("pref value too long (max 64KB)")
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO user_prefs(key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                (key, value, _utc_now_iso()),
+            )
+
+    def delete_pref(self, key: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM user_prefs WHERE key = ?", (key,))
+            return cur.rowcount > 0
+
+    def list_prefs(self) -> dict:
+        """All prefs as a {key: value} dict. Used for bulk-load on
+        page boot to avoid a round-trip per pref."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT key, value FROM user_prefs"
+            ).fetchall()
+        return {r["key"]: r["value"] for r in rows}
 
     def snapshot_count(self, account: Optional[str] = None) -> int:
         """For health / debug. Total snapshots, optionally per-account."""

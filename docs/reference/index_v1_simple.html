@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="IBKR">
+  <title>IBKR Chat</title>
+
+  <!-- PWA manifest -- enables full "Add to Home Screen" install on iOS
+       and Android with our own app icon, name, and theme color. -->
+  <link rel="manifest" href="/chat/static/manifest.json">
+  <!-- iOS Safari ignores the manifest's icon list when adding to the
+       home screen; it specifically looks for these <link> tags. -->
+  <link rel="apple-touch-icon" href="/chat/static/icon.svg">
+  <link rel="icon" type="image/svg+xml" href="/chat/static/icon.svg">
+  <style>
+    /* Phone-first dark UI. No framework, no build step. */
+    :root {
+      --bg: #0f172a;
+      --bg-elevated: #1e293b;
+      --bg-input: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --text-dim: #94a3b8;
+      --accent: #38bdf8;
+      --user-bg: #1e3a8a;
+      --user-text: #dbeafe;
+      --assistant-bg: #1e293b;
+      --assistant-text: #e2e8f0;
+      --tool-bg: #134e4a;
+      --tool-text: #a7f3d0;
+      --error-bg: #7f1d1d;
+      --error-text: #fecaca;
+      --code-bg: #0b1120;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f8fafc;
+        --bg-elevated: #ffffff;
+        --bg-input: #ffffff;
+        --border: #cbd5e1;
+        --text: #0f172a;
+        --text-dim: #475569;
+        --accent: #0284c7;
+        --user-bg: #dbeafe;
+        --user-text: #1e3a8a;
+        --assistant-bg: #ffffff;
+        --assistant-text: #0f172a;
+        --tool-bg: #d1fae5;
+        --tool-text: #064e3b;
+        --error-bg: #fee2e2;
+        --error-text: #7f1d1d;
+        --code-bg: #f1f5f9;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; height: 100%;
+      background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      font-size: 16px;
+      overscroll-behavior-y: none;
+    }
+    body {
+      display: flex; flex-direction: column;
+      height: 100vh; height: 100dvh;
+    }
+    header {
+      flex: 0 0 auto;
+      padding: env(safe-area-inset-top, 12px) 16px 12px;
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px;
+    }
+    header h1 {
+      margin: 0; font-size: 16px; font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .status {
+      font-size: 11px; color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .status.ok { color: #10b981; }
+    .status.err { color: #f87171; }
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+    .header-actions button,
+    .header-actions select {
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+      max-width: 140px;
+    }
+    .header-actions button:active { background: var(--bg); }
+    .header-actions select {
+      /* native select styling is ugly; keep it minimal */
+      -webkit-appearance: none;
+      appearance: none;
+      padding-right: 24px;
+      background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+                        linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+      background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+      background-size: 4px 4px;
+      background-repeat: no-repeat;
+    }
+
+    #thread {
+      flex: 1 1 auto; overflow-y: auto;
+      padding: 12px;
+      display: flex; flex-direction: column; gap: 12px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .msg {
+      max-width: 88%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      line-height: 1.45;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .msg.user {
+      background: var(--user-bg);
+      color: var(--user-text);
+      align-self: flex-end;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.assistant {
+      background: var(--assistant-bg);
+      color: var(--assistant-text);
+      align-self: flex-start;
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+    .msg.tool {
+      background: var(--tool-bg);
+      color: var(--tool-text);
+      align-self: flex-start;
+      max-width: 95%;
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      font-size: 12px;
+      border-radius: 8px;
+    }
+    .msg.error {
+      background: var(--error-bg);
+      color: var(--error-text);
+      align-self: stretch;
+      max-width: 100%;
+    }
+    .msg.thinking {
+      align-self: flex-start;
+      color: var(--text-dim);
+      font-style: italic;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.5; }
+      50% { opacity: 1; }
+    }
+    .msg pre, .msg code {
+      background: var(--code-bg);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+      font-size: 13px;
+    }
+    .msg pre {
+      padding: 8px 10px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .meta {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    form {
+      flex: 0 0 auto;
+      display: flex; gap: 8px;
+      padding: 10px 12px env(safe-area-inset-bottom, 14px);
+      background: var(--bg-elevated);
+      border-top: 1px solid var(--border);
+    }
+    textarea {
+      flex: 1;
+      resize: none;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg-input);
+      color: var(--text);
+      font-size: 16px;  /* >= 16px stops iOS auto-zoom on focus */
+      font-family: inherit;
+      padding: 10px 12px;
+      max-height: 120px;
+      min-height: 40px;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    button[type="submit"] {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 0 18px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      min-width: 64px;
+    }
+    button[type="submit"]:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>IBKR Chat</h1>
+      <div id="status" class="status">connecting...</div>
+    </div>
+    <div class="header-actions">
+      <select id="thread-picker" title="Switch conversation"></select>
+      <button id="new-thread" type="button" title="Start a new conversation">+</button>
+      <button id="delete-thread" type="button" title="Delete current conversation">🗑</button>
+      <button id="change-pin" type="button" title="Change PIN">🔑</button>
+    </div>
+  </header>
+
+  <main id="thread" aria-live="polite"></main>
+
+  <form id="form" autocomplete="off">
+    <textarea id="input" placeholder="Ask anything..." rows="1" required></textarea>
+    <button type="submit" id="send">Send</button>
+  </form>
+
+  <script>
+  // -------- bearer token bootstrap --------
+  // The chat page is fetched with a bearer header (the user's browser
+  // doesn't have one natively). To make this work without an OAuth flow,
+  // we accept the token either:
+  //   (a) embedded in the URL as ?token=<...> on first load -- saved to
+  //       localStorage on success and stripped from the URL,
+  //   (b) entered in a prompt if not present.
+  // Future improvement: a real login form. Phase 1 is operator-only.
+  const STORAGE_KEY_TOKEN = 'ibkr-chat-token';
+
+  // Per-tab identity. Used to skip self-echoes from the server's pub/sub
+  // bus and from BroadcastChannel (otherwise the tab that just sent a
+  // message would react to its own notification and double-render).
+  // Regenerated on every page load -- no need to persist.
+  const CLIENT_ID = (window.crypto?.randomUUID && crypto.randomUUID()) ||
+                    ('cid-' + Math.random().toString(36).slice(2, 12));
+
+  function getStoredToken() {
+    return localStorage.getItem(STORAGE_KEY_TOKEN) || '';
+  }
+  function saveToken(t) {
+    if (t) localStorage.setItem(STORAGE_KEY_TOKEN, t);
+  }
+  function clearToken() { localStorage.removeItem(STORAGE_KEY_TOKEN); }
+
+  // Three auth paths, in priority order:
+  //   1. ?token=... in the URL (kept for backward compat / sharing links)
+  //   2. PIN prompt (if CHAT_PIN is configured server-side)
+  //   3. Raw token prompt (fallback when PIN isn't configured)
+  //
+  // The PIN flow exists because pasting a 64-char hex token into a
+  // browser URL or prompt is unreliable on iOS / various clipboards.
+  // A 4-digit PIN is hard to mangle, easy to type on a phone numeric
+  // keyboard, and the server-side rate-limiter keeps the short PIN
+  // brute-force-safe.
+  //
+  // bootstrapAuth is async because step 2 needs to hit the server to
+  // ask whether a PIN is configured. The page won't make any other
+  // API calls until this resolves (bootstrap() below awaits it).
+  async function bootstrapAuth() {
+    // 1. URL token wins -- save it and strip from the address bar.
+    const url = new URL(window.location.href);
+    const fromQuery = url.searchParams.get('token');
+    if (fromQuery) {
+      saveToken(fromQuery);
+      url.searchParams.delete('token');
+      window.history.replaceState({}, '', url.toString());
+      return;
+    }
+    // Already have a stored token from a previous session? Done.
+    if (getStoredToken()) return;
+
+    // 2. Ask the server whether PIN unlock is set up.
+    let pinConfigured = false;
+    try {
+      const r = await fetch('/chat/api/pin/status');
+      if (r.ok) {
+        const j = await r.json();
+        pinConfigured = !!j.configured;
+      }
+    } catch (e) {
+      // Status endpoint failed (network glitch?). Fall through to the
+      // raw token prompt; user can retry by refreshing.
+      console.warn('PIN status check failed:', e);
+    }
+
+    if (pinConfigured) {
+      const pin = window.prompt('Enter your 4-digit PIN:');
+      if (!pin) return;  // user cancelled; chat won't load, refresh to retry
+      try {
+        const r = await fetch('/chat/api/pin/unlock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: pin.trim() }),
+        });
+        if (r.ok) {
+          const j = await r.json();
+          if (j.token) saveToken(j.token);
+          return;
+        }
+        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        alert('PIN unlock failed: ' + (err.error || 'unknown'));
+      } catch (e) {
+        alert('PIN unlock failed: ' + e.message);
+      }
+      return;
+    }
+
+    // 3. No PIN -- fall back to full-token prompt.
+    const entered = window.prompt(
+      'Enter your MCP_AUTH_TOKEN to access this chat.\n' +
+      'Tip: append ?token=<your-token> to the URL to save it once, or\n' +
+      'set CHAT_PIN in .env on the server for short-PIN unlock.'
+    );
+    if (entered) saveToken(entered.trim());
+  }
+
+  function authHeaders() {
+    const t = getStoredToken();
+    return t ? { 'Authorization': 'Bearer ' + t } : {};
+  }
+
+  // -------- thread state --------
+  // Conversation now lives server-side (SQLite). The browser still
+  // keeps the active thread's messages in-memory so render is instant
+  // and intra-turn deltas update without round-tripping; persistence
+  // happens on each completed turn via thread_id passed to the server.
+  //
+  // STORAGE_KEY_THREAD (localStorage) holds ONLY the active thread ID,
+  // not the messages. Refreshing the page re-fetches messages from the
+  // server, which means you can switch devices and keep the same chat.
+  const STORAGE_KEY_ACTIVE_THREAD = 'ibkr-chat-active-thread';
+
+  let conversation = [];        // in-memory messages for the active thread
+  let currentThreadId = null;   // server-side thread ID
+  let threadsCache = [];        // most-recent-first list for the picker
+
+  function setActiveThread(threadId) {
+    currentThreadId = threadId;
+    if (threadId) localStorage.setItem(STORAGE_KEY_ACTIVE_THREAD, threadId);
+    else localStorage.removeItem(STORAGE_KEY_ACTIVE_THREAD);
+  }
+
+  // Fetch the thread list and re-populate the picker. Keep selection
+  // pointed at the current thread when possible.
+  async function refreshThreadList() {
+    try {
+      const r = await fetch('/chat/api/threads', { headers: authHeaders() });
+      if (!r.ok) return;
+      const j = await r.json();
+      threadsCache = j.threads || [];
+    } catch (e) {
+      // Don't break the UI if the listing call fails -- the chat itself
+      // is more important than the picker.
+      console.warn('failed to list threads:', e);
+      return;
+    }
+
+    const picker = document.getElementById('thread-picker');
+    picker.innerHTML = '';
+    if (threadsCache.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '(no chats)';
+      picker.appendChild(opt);
+      return;
+    }
+    for (const t of threadsCache) {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      const date = t.updated_at ? ' · ' + t.updated_at.slice(5, 10) : '';
+      opt.textContent = t.title + date;
+      if (t.id === currentThreadId) opt.selected = true;
+      picker.appendChild(opt);
+    }
+  }
+
+  async function loadThread(threadId) {
+    try {
+      const r = await fetch('/chat/api/threads/' + encodeURIComponent(threadId), {
+        headers: authHeaders(),
+      });
+      if (!r.ok) {
+        if (r.status === 404) {
+          // Thread was deleted elsewhere -- fall back to no-thread state.
+          setActiveThread(null);
+          conversation = [];
+          rerender();
+          await refreshThreadList();
+          return;
+        }
+        appendMessage('assistant', '❌ Failed to load thread', 'error');
+        return;
+      }
+      const j = await r.json();
+      conversation = j.messages || [];
+      setActiveThread(threadId);
+      rerender();
+    } catch (e) {
+      appendMessage('assistant', '❌ ' + e.message, 'error');
+    }
+  }
+
+  async function createNewThread() {
+    try {
+      const r = await fetch('/chat/api/threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ title: 'New chat', client_id: CLIENT_ID }),
+      });
+      if (!r.ok) {
+        appendMessage('assistant', '❌ Could not create new thread', 'error');
+        return null;
+      }
+      const t = await r.json();
+      setActiveThread(t.id);
+      conversation = [];
+      rerender();
+      await refreshThreadList();
+      return t.id;
+    } catch (e) {
+      appendMessage('assistant', '❌ ' + e.message, 'error');
+      return null;
+    }
+  }
+
+  async function deleteCurrentThread() {
+    if (!currentThreadId) return;
+    if (!confirm('Delete this conversation? This cannot be undone.')) return;
+    try {
+      await fetch('/chat/api/threads/' + encodeURIComponent(currentThreadId) +
+                  '?client_id=' + encodeURIComponent(CLIENT_ID), {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+    } catch (e) {
+      console.warn('delete failed:', e);
+    }
+    setActiveThread(null);
+    conversation = [];
+    rerender();
+    await refreshThreadList();
+    // If other threads exist, switch to the most recent. Otherwise leave
+    // the user on an empty state -- their next message will auto-create.
+    if (threadsCache.length > 0) {
+      await loadThread(threadsCache[0].id);
+    }
+  }
+
+  // -------- rendering --------
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[c]);
+  }
+
+  // Very small markdown subset -- enough for the kinds of replies the
+  // agent produces. We do NOT pull in a full markdown lib for Phase 1.
+  function renderMarkdown(text) {
+    let html = escapeHtml(text);
+    // Code blocks ```...```
+    html = html.replace(/```([\s\S]*?)```/g, (_m, code) =>
+      '<pre>' + code.replace(/^\n/, '') + '</pre>');
+    // Inline code `...`
+    html = html.replace(/`([^`\n]+?)`/g, '<code>$1</code>');
+    // Bold **...**
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    return html;
+  }
+
+  function appendMessage(role, text, klass) {
+    const thread = document.getElementById('thread');
+    const div = document.createElement('div');
+    div.className = 'msg ' + (klass || role);
+    div.innerHTML = renderMarkdown(text);
+    thread.appendChild(div);
+    thread.scrollTop = thread.scrollHeight;
+    return div;
+  }
+
+  // Render an entire conversation from storage on page load.
+  function rerender() {
+    const thread = document.getElementById('thread');
+    thread.innerHTML = '';
+    for (const msg of conversation) {
+      if (msg.role === 'user') {
+        // Content may be string OR array of blocks (after tool_result turn).
+        if (typeof msg.content === 'string') {
+          appendMessage('user', msg.content);
+        }
+        // tool_result content is hidden in the UI (it's the model's input,
+        // not something the user wrote). The associated tool_use will
+        // already have rendered as the "calling tool..." line above.
+      } else if (msg.role === 'assistant') {
+        for (const block of (msg.content || [])) {
+          if (block.type === 'text' && block.text) {
+            appendMessage('assistant', block.text);
+          } else if (block.type === 'tool_use') {
+            const args = JSON.stringify(block.input || {}, null, 0);
+            appendMessage('tool', '🔧 ' + block.name + ': ' + args, 'tool');
+          }
+        }
+      }
+    }
+  }
+
+  // -------- status indicator --------
+  async function refreshStatus() {
+    const status = document.getElementById('status');
+    try {
+      const r = await fetch('/chat/api/health', { headers: authHeaders() });
+      if (r.status === 401) {
+        status.textContent = 'auth failed';
+        status.className = 'status err';
+        return;
+      }
+      const j = await r.json();
+      if (!j.chat_enabled) {
+        status.textContent = 'chat disabled';
+        status.className = 'status err';
+      } else if (!j.has_api_key) {
+        status.textContent = 'no api key';
+        status.className = 'status err';
+      } else {
+        status.textContent = j.model + ' • ' + j.tool_count + ' tools';
+        status.className = 'status ok';
+      }
+    } catch (e) {
+      status.textContent = 'offline';
+      status.className = 'status err';
+    }
+  }
+
+  // -------- sending --------
+  // Streams the response token-by-token via SSE. Each event line is
+  // "data: <json>\n\n" carrying a `type` and event-specific fields.
+  // Falls back to the non-streaming /chat/api/message endpoint if the
+  // stream connection fails before any token arrives.
+  async function send(text) {
+    const sendBtn = document.getElementById('send');
+    const input = document.getElementById('input');
+    sendBtn.disabled = true; input.disabled = true;
+    // Mute live-sync refreshes while we're streaming -- our own
+    // thread_updated push (sent at end-of-turn) would otherwise trigger
+    // an unnecessary re-fetch. Other tabs still receive and react to it.
+    isStreamingTurn = true;
+
+    // Auto-create a thread on the first message. We don't create empty
+    // threads upfront -- that would clutter the list.
+    if (!currentThreadId) {
+      const id = await createNewThread();
+      if (!id) {
+        sendBtn.disabled = false; input.disabled = false;
+        return;
+      }
+    }
+
+    conversation.push({ role: 'user', content: text });
+    appendMessage('user', text);
+
+    // Placeholder bubble we'll mutate in place as text deltas arrive.
+    let assistantDiv = appendMessage('assistant', '…', 'assistant thinking');
+    let assistantText = '';
+    let gotAnyText = false;
+
+    function appendDelta(delta) {
+      assistantText += delta;
+      // Drop the "thinking" pulse the moment real content lands.
+      if (!gotAnyText) {
+        assistantDiv.classList.remove('thinking');
+        gotAnyText = true;
+      }
+      assistantDiv.innerHTML = renderMarkdown(assistantText);
+      const thread = document.getElementById('thread');
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    function startNewAssistantBubble() {
+      // After a tool_call interleaves, the next text delta should start
+      // a fresh assistant bubble, not append to the one we just rendered.
+      assistantDiv = appendMessage('assistant', '…', 'assistant thinking');
+      assistantText = '';
+      gotAnyText = false;
+    }
+
+    try {
+      const r = await fetch('/chat/api/message/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          messages: conversation,
+          thread_id: currentThreadId,
+          client_id: CLIENT_ID,
+        }),
+      });
+
+      if (!r.ok) {
+        const errBody = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        assistantDiv.remove();
+        appendMessage('assistant', '❌ ' + (errBody.error || ('HTTP ' + r.status)), 'error');
+        conversation.pop();
+        return;
+      }
+
+      // Read the SSE stream. Events are separated by "\n\n".
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process all complete events in the buffer; keep the trailing
+        // (possibly partial) chunk for the next read.
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+
+        for (const part of parts) {
+          if (!part.startsWith('data: ')) continue;
+          let event;
+          try {
+            event = JSON.parse(part.slice(6));
+          } catch (e) {
+            continue;  // malformed line; skip
+          }
+
+          switch (event.type) {
+            case 'text':
+              appendDelta(event.delta);
+              break;
+            case 'tool_call': {
+              // The "thinking" assistant bubble belongs to text we already
+              // streamed (or nothing). Either way, close it out and render
+              // a tool-call line, then prepare a fresh assistant bubble
+              // for any subsequent text.
+              if (!gotAnyText) assistantDiv.remove();
+              const args = JSON.stringify(event.input || {});
+              appendMessage('tool', '🔧 ' + event.name + ': ' + args, 'tool');
+              startNewAssistantBubble();
+              break;
+            }
+            case 'tool_result': {
+              const ok = event.ok ? '✓' : '✗';
+              const preview = (event.preview || '').slice(0, 200);
+              appendMessage('tool', ok + ' ' + preview, 'tool');
+              // If the tool returned an image (e.g. get_chart), render
+              // it inline below the tool_result line.
+              if (event.image_b64) {
+                const thread = document.getElementById('thread');
+                const wrap = document.createElement('div');
+                wrap.className = 'msg assistant';
+                wrap.style.padding = '6px';
+                wrap.style.maxWidth = '95%';
+                const img = document.createElement('img');
+                img.src = 'data:' + (event.image_mime || 'image/png') +
+                          ';base64,' + event.image_b64;
+                img.alt = 'chart';
+                img.style.display = 'block';
+                img.style.width = '100%';
+                img.style.height = 'auto';
+                img.style.borderRadius = '6px';
+                wrap.appendChild(img);
+                thread.appendChild(wrap);
+                thread.scrollTop = thread.scrollHeight;
+              }
+              break;
+            }
+            case 'done':
+              conversation = event.conversation;
+              // Persistence is server-side now; nothing to do here.
+              // Final bubble is the assistant's last text turn. If we
+              // already streamed text into the current bubble, keep it.
+              // Otherwise (e.g. last turn was tool_use with no text), drop
+              // the empty placeholder.
+              if (!gotAnyText) assistantDiv.remove();
+              break;
+            case 'error':
+              if (!gotAnyText) assistantDiv.remove();
+              appendMessage('assistant', '❌ ' + event.message, 'error');
+              // Server didn't update the conversation, so drop the user
+              // message we optimistically added so the user can retry.
+              conversation.pop();
+              // Persistence is server-side now; nothing to do here.
+              break;
+          }
+        }
+      }
+    } catch (e) {
+      if (!gotAnyText) assistantDiv.remove();
+      appendMessage('assistant', '❌ ' + e.message, 'error');
+      conversation.pop();
+    } finally {
+      sendBtn.disabled = false; input.disabled = false;
+      isStreamingTurn = false;
+      input.focus();
+    }
+  }
+
+  // -------- wiring --------
+  document.getElementById('form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = document.getElementById('input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    input.style.height = '';
+    send(text);
+  });
+
+  // Auto-grow textarea
+  const ta = document.getElementById('input');
+  ta.addEventListener('input', () => {
+    ta.style.height = '';
+    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+  });
+
+  // Enter to send, Shift+Enter for newline.
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      document.getElementById('form').dispatchEvent(new Event('submit'));
+    }
+  });
+
+  document.getElementById('new-thread').addEventListener('click', async () => {
+    await createNewThread();
+  });
+
+  document.getElementById('delete-thread').addEventListener('click', async () => {
+    await deleteCurrentThread();
+  });
+
+  // PIN rotation. Three prompts: current PIN -> new PIN -> confirm new PIN.
+  // Send to /chat/api/pin/change with the bearer token from localStorage;
+  // the middleware enforces auth so a stranger can't change the PIN even
+  // if they reach this page.
+  document.getElementById('change-pin').addEventListener('click', async () => {
+    if (!getStoredToken()) {
+      alert('You need to be signed in (with the bearer token) to change the PIN.');
+      return;
+    }
+    const oldPin = window.prompt('Current PIN:');
+    if (!oldPin) return;
+    const newPin = window.prompt('New PIN (4+ characters):');
+    if (!newPin) return;
+    const confirmPin = window.prompt('Confirm new PIN:');
+    if (newPin !== confirmPin) {
+      alert("PINs don't match -- not changed.");
+      return;
+    }
+    if (newPin.trim().length < 4) {
+      alert('PIN must be at least 4 characters.');
+      return;
+    }
+    try {
+      const r = await fetch('/chat/api/pin/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          old_pin: oldPin.trim(),
+          new_pin: newPin.trim(),
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) {
+        alert('PIN updated. Next sign-in on any device will need the new PIN.');
+      } else {
+        alert('Could not change PIN: ' + (j.error || ('HTTP ' + r.status)));
+      }
+    } catch (e) {
+      alert('Could not change PIN: ' + e.message);
+    }
+  });
+
+  document.getElementById('thread-picker').addEventListener('change', async (e) => {
+    const id = e.target.value;
+    if (id && id !== currentThreadId) await loadThread(id);
+  });
+
+  // -------- live sync (SSE + BroadcastChannel) --------
+  //
+  // Two channels feeding the same handler:
+  //   * EventSource on /chat/api/events/stream gets pushes from the
+  //     daemon any time a thread is created/renamed/deleted/updated by
+  //     ANY connected client (other tabs, other devices, anything).
+  //   * BroadcastChannel relays events between same-origin tabs on this
+  //     device at microsecond latency, so two tabs on the same laptop
+  //     stay in sync slightly faster than via the server roundtrip.
+  //
+  // De-dupe: every event carries `originating_client_id`. We ignore
+  // events from CLIENT_ID so the tab that just sent a message doesn't
+  // re-render against its own echo.
+  //
+  // The active stream is muted while the user is mid-turn (sending),
+  // since the streaming response is already updating the view live --
+  // a thread_updated push for our own message would re-fetch and clobber
+  // the in-progress render.
+  let isStreamingTurn = false;
+  let eventSource = null;
+  const channel = ('BroadcastChannel' in window)
+      ? new BroadcastChannel('ibkr-chat-sync') : null;
+
+  function handleSyncEvent(event) {
+    if (!event || event.originating_client_id === CLIENT_ID) return;
+
+    // Always keep the thread list fresh -- the sender just renamed a
+    // thread, deleted one, created one, or bumped its updated_at.
+    refreshThreadList();
+
+    if (event.type === 'thread_deleted' && event.thread_id === currentThreadId) {
+      // The thread we're looking at was deleted in another tab. Reset
+      // and pick something else if available.
+      setActiveThread(null);
+      conversation = [];
+      rerender();
+      // refreshThreadList already fired; wait a tick then pick the
+      // most recent remaining thread if any.
+      setTimeout(async () => {
+        if (threadsCache.length > 0 && !currentThreadId) {
+          await loadThread(threadsCache[0].id);
+        }
+      }, 50);
+      return;
+    }
+
+    if (event.type === 'thread_updated' &&
+        event.thread_id === currentThreadId &&
+        !isStreamingTurn) {
+      // Someone added a message to the thread we're viewing. Re-fetch.
+      loadThread(currentThreadId);
+    }
+  }
+
+  function startLiveSync() {
+    // EventSource can't send Authorization headers, but our auth
+    // middleware accepts ?token=... as a fallback (same trick the
+    // /chat page navigation uses).
+    const token = getStoredToken();
+    if (!token) return;
+
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource(
+      '/chat/api/events/stream?token=' + encodeURIComponent(token)
+    );
+    eventSource.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        handleSyncEvent(event);
+        // Forward to other same-origin tabs (BroadcastChannel sends
+        // synchronously within this device; ~1ms latency).
+        if (channel) channel.postMessage(event);
+      } catch (err) {
+        console.warn('sync event parse failed:', err);
+      }
+    };
+    eventSource.onerror = (e) => {
+      // EventSource auto-reconnects on transient errors; we only get
+      // here for genuine failures. Reset and try again in a moment.
+      console.warn('event stream error -- will reconnect');
+      // Browser handles reconnect automatically when readyState ==
+      // CONNECTING. If it goes to CLOSED, we re-open manually.
+      if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+        setTimeout(startLiveSync, 5000);
+      }
+    };
+  }
+
+  if (channel) {
+    channel.onmessage = (e) => handleSyncEvent(e.data);
+  }
+
+  // --- bootstrap ---
+  // Resolve the active thread on first load:
+  //   1. localStorage has an ID -> load that thread from the server
+  //      (and fall back to the most-recent thread if it 404s)
+  //   2. no localStorage but server has threads -> open the most recent
+  //   3. otherwise empty state; first message will auto-create a thread
+  (async function bootstrap() {
+    // Resolve auth BEFORE any other API call -- they all need the token.
+    await bootstrapAuth();
+    refreshStatus();
+    await refreshThreadList();
+    const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_THREAD);
+    if (saved && threadsCache.find(t => t.id === saved)) {
+      await loadThread(saved);
+    } else if (threadsCache.length > 0) {
+      await loadThread(threadsCache[0].id);
+    } else {
+      // No threads yet -- leave currentThreadId null. send() will create
+      // one when the user types their first message.
+      rerender();
+    }
+    // Open the live-sync stream once we have a token. Pushed events
+    // start flowing immediately; we'll already be on the right thread
+    // for the first updates.
+    startLiveSync();
+  })();
+  </script>
+</body>
+</html>

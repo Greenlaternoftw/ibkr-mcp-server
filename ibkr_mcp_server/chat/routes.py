@@ -321,6 +321,344 @@ async def pin_change(request: Request) -> Response:
     return JSONResponse({"ok": True, "message": "PIN updated"})
 
 
+async def prefs_list(request: Request) -> Response:
+    """Bulk read all user prefs. UI calls this once on page boot to
+    avoid a round-trip per individual key."""
+    return JSONResponse({"prefs": _get_store().list_prefs()})
+
+
+async def prefs_set(request: Request) -> Response:
+    """Upsert a single pref. Body: ``{key, value}``. Value is opaque
+    to the server -- the UI JSON-encodes anything structured."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    key = body.get("key")
+    value = body.get("value")
+    if not isinstance(key, str) or not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if not isinstance(value, str):
+        return JSONResponse({"error": "value must be a string"}, status_code=400)
+    try:
+        _get_store().set_pref(key, value)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({"ok": True, "key": key})
+
+
+async def prefs_delete(request: Request) -> Response:
+    key = request.path_params["key"]
+    _get_store().delete_pref(key)
+    return Response(status_code=204)
+
+
+async def account_summary(request: Request) -> Response:
+    """Compact account-summary JSON for the Command Center strip.
+
+    Wraps IBKRClient.get_account_summary into the small set of fields
+    the UI displays: NetLiq, Buying Power, Excess Liquidity, Maint
+    Margin, Realized P/L, Unrealized P/L. The strip polls this every
+    10-15 seconds; we don't bother with caching beyond that.
+    """
+    from ..client import ibkr_client
+    try:
+        raw = await ibkr_client.get_account_summary()
+    except Exception as e:
+        logger.exception("account summary fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    def _num(key):
+        v = raw.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return JSONResponse({
+        "account": raw.get("account"),
+        "net_liquidation": _num("NetLiquidation"),
+        "buying_power": _num("BuyingPower"),
+        "excess_liquidity": _num("ExcessLiquidity"),
+        "maint_margin": _num("MaintMarginReq"),
+        "realized_pnl": _num("RealizedPnL"),
+        "unrealized_pnl": _num("UnrealizedPnL"),
+        "total_cash": _num("TotalCashValue"),
+    })
+
+
+# --- watchlists / portfolios --------------------------------------------
+
+
+async def watchlists_list(request: Request) -> Response:
+    return JSONResponse({"watchlists": _get_store().list_watchlists()})
+
+
+async def watchlists_create(request: Request) -> Response:
+    try:
+        body = await request.json() if await request.body() else {}
+    except json.JSONDecodeError:
+        body = {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    if len(name) > 64:
+        return JSONResponse({"error": "name too long (max 64)"}, status_code=400)
+    import sqlite3
+    try:
+        wl = _get_store().create_watchlist(name)
+    except sqlite3.IntegrityError:
+        return JSONResponse({"error": "watchlist with that name already exists"}, status_code=409)
+    return JSONResponse(wl, status_code=201)
+
+
+async def watchlists_delete(request: Request) -> Response:
+    wid = int(request.path_params["wid"])
+    if not _get_store().delete_watchlist(wid):
+        return JSONResponse({"error": "watchlist not found"}, status_code=404)
+    return Response(status_code=204)
+
+
+async def watchlist_stocks_list(request: Request) -> Response:
+    wid = int(request.path_params["wid"])
+    return JSONResponse({"stocks": _get_store().get_watchlist_stocks(wid)})
+
+
+async def watchlist_stocks_add(request: Request) -> Response:
+    wid = int(request.path_params["wid"])
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    sym = (body.get("symbol") or "").strip().upper()
+    if not sym or len(sym) > 8:
+        return JSONResponse({"error": "symbol required (max 8 chars)"}, status_code=400)
+    import sqlite3
+    try:
+        row = _get_store().add_watchlist_stock(wid, sym)
+    except sqlite3.IntegrityError:
+        return JSONResponse({"error": f"{sym} already in this watchlist"}, status_code=409)
+    return JSONResponse(row, status_code=201)
+
+
+async def watchlist_stocks_update(request: Request) -> Response:
+    """Upsert metrics for a stock already in the watchlist. Used by the
+    UI to write back research/price-refresh data so it survives reload."""
+    wid = int(request.path_params["wid"])
+    sym = request.path_params["symbol"].upper()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    row = _get_store().upsert_watchlist_stock(
+        wid, sym,
+        rating=body.get("rating"),
+        current_price=body.get("current_price"),
+        target_price=body.get("target_price"),
+        range_low=body.get("range_low"),
+        range_high=body.get("range_high"),
+        notes=body.get("notes"),
+    )
+    if row is None:
+        return JSONResponse({"error": "stock not in watchlist"}, status_code=404)
+    return JSONResponse(row)
+
+
+async def watchlist_stocks_remove(request: Request) -> Response:
+    wid = int(request.path_params["wid"])
+    sym = request.path_params["symbol"].upper()
+    if not _get_store().remove_watchlist_stock(wid, sym):
+        return JSONResponse({"error": "stock not in watchlist"}, status_code=404)
+    return Response(status_code=204)
+
+
+# --- live market quote -------------------------------------------------
+
+
+async def research_symbol(request: Request) -> Response:
+    """Structured analyst-and-think-tank research on one symbol.
+
+    The Command Center UI used to call Anthropic API directly for this
+    with a giant inline prompt + web_search tool. We do it server-side
+    now so:
+      * the API key never leaves the VPS,
+      * the prompt cache works across requests (same prompt prefix
+        every time),
+      * we can serve the JSON-only response shape the UI expects
+        without exposing it to model refusals or wrapper preamble.
+
+    Returns the parsed JSON object verbatim if the model produced one,
+    or a structured error.
+    """
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    if not sym or len(sym) > 8:
+        return JSONResponse({"error": "invalid symbol"}, status_code=400)
+
+    if not settings.anthropic_api_key:
+        return JSONResponse(
+            {"error": "ANTHROPIC_API_KEY not set; configure .env and restart"},
+            status_code=503,
+        )
+
+    import anthropic
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+    prompt = f"""For the ticker {sym}, return ONLY a JSON object (no markdown, no preamble) with this exact shape:
+
+{{
+  "symbol": "{sym}",
+  "currentPrice": <number>,
+  "consensusTarget": <number, 12-month consensus price target>,
+  "analysts": [
+    {{ "name": "<analyst full name>", "firm": "<firm>", "rating": "BUY|HOLD|SELL|OUTPERFORM|UNDERPERFORM", "priceTarget": <number>, "accuracy": <integer 0-100, the analyst's published success rate>, "dateUpdated": "YYYY-MM-DD" }}
+  ],
+  "thinkTanks": [
+    {{ "name": "<institution>", "view": "<one-sentence positioning>", "stance": "POSITIVE|NEGATIVE|NEUTRAL", "accuracy": <integer 0-100 estimate>, "asOf": "YYYY-MM-DD" }}
+  ],
+  "impliedMoves": {{
+    "available": <true if options-implied move data was found, false otherwise>,
+    "30d": <decimal, e.g. 0.045 for 4.5%; one-standard-deviation expected move from ATM options>,
+    "60d": <decimal>,
+    "90d": <decimal>,
+    "source": "<short note on where the data came from>"
+  }},
+  "news": [
+    {{ "headline": "<short headline>", "impact": "POSITIVE|NEGATIVE|NEUTRAL", "magnitude": <1-5>, "rationale": "<one sentence>" }}
+  ]
+}}
+
+Requirements:
+- Use web search to gather data. Use accurate, current information.
+- Include the top 6-8 analysts ranked by accuracy (success rate) descending.
+- Include 2-4 think-tank / institutional views.
+- For impliedMoves: search Barchart, OptionStrat, Market Chameleon, IBKR, or similar for ATM straddle / IV-derived expected moves at the ~30/60/90 day horizons. If not found, set "available": false and use 0 for values.
+- Include 3-5 recent news items that could move the price in the next 90 days.
+- If you cannot find a specific analyst's accuracy, estimate based on firm tier (Tier-1 firms 70-78%, top boutiques 75-85%) and mark in the name as "(est.)".
+- Numbers only, no strings with $ signs.
+- Return ONLY the JSON object."""
+
+    try:
+        msg = await client.messages.create(
+            model=settings.anthropic_model,
+            max_tokens=4000,
+            # Cache the (large, static) prompt prefix -- same shape on
+            # every research request, so subsequent calls hit cache.
+            system=[{
+                "type": "text",
+                "text": "You are a financial-data research assistant. Return ONLY valid JSON matching the shape requested. No markdown, no preamble.",
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": prompt}],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        )
+    except Exception as e:
+        logger.exception(f"research call to Anthropic failed for {sym}")
+        return JSONResponse({"error": f"upstream Anthropic call failed: {e}"}, status_code=502)
+
+    # Extract text from response blocks (ignoring tool_use blocks).
+    text_parts = []
+    for block in msg.content:
+        if getattr(block, "type", None) == "text":
+            text_parts.append(getattr(block, "text", "") or "")
+    text = "\n".join(text_parts).strip()
+    if not text:
+        return JSONResponse(
+            {"error": "Anthropic returned no text blocks (probably mid-tool-loop)",
+             "raw_blocks": [getattr(b, "type", "?") for b in msg.content]},
+            status_code=502,
+        )
+
+    # Strip markdown fences if any, then find the JSON object.
+    text = text.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return JSONResponse(
+            {"error": "no JSON object in model response",
+             "preview": text[:300]},
+            status_code=502,
+        )
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            {"error": f"JSON parse failed: {e}", "preview": text[:300]},
+            status_code=502,
+        )
+
+    return JSONResponse({
+        "status": "ok",
+        "symbol": sym,
+        "data": parsed,
+        "usage": {
+            "input_tokens": getattr(msg.usage, "input_tokens", 0),
+            "output_tokens": getattr(msg.usage, "output_tokens", 0),
+            "cache_read_input_tokens": getattr(msg.usage, "cache_read_input_tokens", 0) or 0,
+        },
+    })
+
+
+async def market_quote(request: Request) -> Response:
+    """Single-symbol quote (last/bid/ask) for the price ticker.
+
+    Calls IBKRClient.get_market_data if available, falls back to
+    placeholder if not connected or rate-limited. UI is expected to
+    handle missing-data gracefully (shows '—').
+    """
+    sym = (request.query_params.get("symbol") or "").strip().upper()
+    if not sym:
+        return JSONResponse({"error": "symbol query param required"}, status_code=400)
+
+    from ..client import ibkr_client
+    if not ibkr_client.is_connected():
+        return JSONResponse(
+            {"symbol": sym, "error": "IBKR not connected", "last": None,
+             "bid": None, "ask": None},
+            status_code=503,
+        )
+
+    # IBKRClient has get_shortable_shares + get_margin_requirements that
+    # internally fetch ticker data. We don't have a clean "just give me
+    # the last price" method yet, so we use a minimal helper: subscribe
+    # briefly via reqMktData. Keep this cheap.
+    try:
+        from ib_async import Stock as _Stock
+        contract = _Stock(sym, "SMART", "USD")
+        await ibkr_client._bounded(
+            ibkr_client.ib.qualifyContractsAsync(contract),
+            timeout=ibkr_client.QUALIFY_TIMEOUT,
+            op=f"qualify_quote:{sym}",
+        )
+        if not contract.conId:
+            return JSONResponse(
+                {"symbol": sym, "error": "could not qualify contract"},
+                status_code=404,
+            )
+        ticker = ibkr_client.ib.reqMktData(contract, "", False, False)
+        # Brief poll for a snapshot. Cancel cleanly afterwards so we
+        # don't leak subscriptions.
+        for _ in range(20):  # ~2 seconds max
+            await asyncio.sleep(0.1)
+            if ticker.last or ticker.close or (ticker.bid and ticker.ask):
+                break
+        last = ticker.last if ticker.last and ticker.last > 0 else None
+        close = ticker.close if ticker.close and ticker.close > 0 else None
+        bid = ticker.bid if ticker.bid and ticker.bid > 0 else None
+        ask = ticker.ask if ticker.ask and ticker.ask > 0 else None
+        ibkr_client.ib.cancelMktData(contract)
+        return JSONResponse({
+            "symbol": sym,
+            "last": last or close,
+            "bid": bid,
+            "ask": ask,
+            "close": close,
+        })
+    except Exception as e:
+        logger.exception(f"market quote failed for {sym}")
+        return JSONResponse({"symbol": sym, "error": str(e)}, status_code=500)
+
+
 async def events_stream(request: Request) -> Response:
     """Long-lived SSE stream of thread mutation events.
 
@@ -683,6 +1021,28 @@ def chat_routes() -> List:
         # Takes old + new PIN; on success the new PIN is persisted to
         # SQLite and takes effect immediately.
         Route("/chat/api/pin/change", pin_change, methods=["POST"]),
+        # Command Center -- account summary strip
+        Route("/chat/api/account/summary", account_summary, methods=["GET"]),
+        # Command Center -- watchlists / portfolios CRUD
+        Route("/chat/api/watchlists", watchlists_list, methods=["GET"]),
+        Route("/chat/api/watchlists", watchlists_create, methods=["POST"]),
+        Route("/chat/api/watchlists/{wid}", watchlists_delete, methods=["DELETE"]),
+        Route("/chat/api/watchlists/{wid}/stocks", watchlist_stocks_list, methods=["GET"]),
+        Route("/chat/api/watchlists/{wid}/stocks", watchlist_stocks_add, methods=["POST"]),
+        Route("/chat/api/watchlists/{wid}/stocks/{symbol}",
+              watchlist_stocks_update, methods=["PATCH"]),
+        Route("/chat/api/watchlists/{wid}/stocks/{symbol}",
+              watchlist_stocks_remove, methods=["DELETE"]),
+        # Command Center -- single-symbol live quote for price ticker
+        Route("/chat/api/market/quote", market_quote, methods=["GET"]),
+        # Command Center -- structured analyst research (proxies Anthropic
+        # with web_search; prompt prefix cached for cost reduction).
+        Route("/chat/api/research/{symbol}", research_symbol, methods=["GET"]),
+        # Server-side user prefs (UI state) -- replaces browser localStorage
+        # so settings sync across devices.
+        Route("/chat/api/prefs", prefs_list, methods=["GET"]),
+        Route("/chat/api/prefs", prefs_set, methods=["POST"]),
+        Route("/chat/api/prefs/{key}", prefs_delete, methods=["DELETE"]),
     ]
 
     if static_dir.exists():
