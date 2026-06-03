@@ -30,12 +30,20 @@ set -uo pipefail
 LOG=${IBKR_WATCHDOG_LOG:-/home/trader/ibkr-watchdog.log}
 ENV_FILE=${IBKR_WATCHDOG_ENV_FILE:-/home/trader/ibkr-mcp-server/.env}
 GATEWAY_COMPOSE=${IBKR_WATCHDOG_GATEWAY_COMPOSE:-/home/trader/ibkr-stack/docker-compose.yml}
-HEALTHZ_URL=${IBKR_WATCHDOG_HEALTHZ_URL:-http://127.0.0.1:8765/healthz}
 GATEWAY_PORT=${IBKR_WATCHDOG_GATEWAY_PORT:-4002}
 GATEWAY_RESTART_WAIT=${IBKR_WATCHDOG_GATEWAY_WAIT:-90}
 DAEMON_RESTART_WAIT=${IBKR_WATCHDOG_DAEMON_WAIT:-5}
 LOCK_FILE=/tmp/ibkr-watchdog.lock
 STATE_FILE=${IBKR_WATCHDOG_STATE_FILE:-/tmp/ibkr-watchdog.last-state}
+
+# HEALTHZ_URL: if not pinned explicitly, derive from MCP_BIND_HOST /
+# MCP_BIND_PORT in .env so we always probe the same address the daemon
+# listens on. Hardcoding 127.0.0.1 used to silently break the moment
+# anyone bound the daemon to a non-localhost interface (e.g. Tailscale)
+# -- watchdog would 'connection refused' every 5 min and helpfully
+# restart the perfectly-healthy daemon. We resolve the env vars below,
+# AFTER read_env is defined, in the "--- read env ---" block.
+HEALTHZ_URL=${IBKR_WATCHDOG_HEALTHZ_URL:-}
 
 # --- single-run guard -----------------------------------------------------
 exec 9>"$LOCK_FILE"
@@ -63,8 +71,18 @@ if [ -r "$ENV_FILE" ]; then
     NOTIFY_ENABLED_VAL=$(read_env NOTIFY_ENABLED)
     NTFY_URL_VAL=$(read_env NTFY_URL)
     NTFY_TOPIC_VAL=$(read_env NTFY_TOPIC)
+    BIND_HOST=$(read_env MCP_BIND_HOST)
+    BIND_PORT=$(read_env MCP_BIND_PORT)
 fi
 NTFY_URL_VAL=${NTFY_URL_VAL:-https://ntfy.sh}
+
+# Resolve HEALTHZ_URL from daemon config if the cron didn't pin it. This
+# is the cornerstone fix for the "watchdog kills healthy daemon" bug --
+# the watchdog now follows the daemon's actual bind address instead of
+# guessing 127.0.0.1.
+if [ -z "$HEALTHZ_URL" ]; then
+    HEALTHZ_URL="http://${BIND_HOST:-127.0.0.1}:${BIND_PORT:-8765}/healthz"
+fi
 
 # --- ntfy helper (failure-silent) -----------------------------------------
 # Args: title, message, priority (1-5), tags (comma list)
