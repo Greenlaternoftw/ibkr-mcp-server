@@ -66,6 +66,18 @@ class PivotAnalysis:
     blocked_by_catalyst: bool = False
     days_to_next_catalyst: Optional[int] = None
 
+    # Volume confirmation (Phase C). All None when the bars DataFrame
+    # doesn't carry a 'volume' column -- in that case the volume gate
+    # is skipped and the loop falls back to price-only logic.
+    recent_volume_avg: Optional[float] = None    # trailing 3 bars
+    lookback_volume_avg: Optional[float] = None  # full window
+    volume_ratio: Optional[float] = None         # recent / lookback
+    volume_ok: Optional[bool] = None             # ratio >= min_volume_ratio
+
+    # Broader-market regime (Phase E). None when the caller didn't
+    # supply a regime result; True/False otherwise.
+    market_regime_enabled: Optional[bool] = None
+
     recommendation: str = ""         # BUY / WAIT / HOLD / SELL / EXIT-CATALYST
     notes: List[str] = field(default_factory=list)
 
@@ -138,6 +150,50 @@ def _compute_effective_low(bars, pivot_low: float, trend: Dict[str, Any]) -> tup
     return pivot_low, "window low (flat trend)"
 
 
+def _compute_volume_stats(bars, min_volume_ratio: float) -> Dict[str, Any]:
+    """Volume confirmation (Phase C).
+
+    A pivot bounce on tiny volume is mostly noise -- institutions
+    aren't buying, so the bounce often fails. Compute the ratio of
+    recent (last 3 bars) average volume to full-window average and
+    flag the entry as 'volume_ok' only if that ratio meets the
+    threshold (default 0.8 -- recent volume must be at least 80%
+    of typical to be tradeable).
+
+    If the bars DataFrame doesn't carry a ``volume`` column (e.g.
+    synthetic test fixtures), every field comes back None and the
+    caller skips the gate.
+
+    Returns dict shaped:
+      {recent_volume_avg, lookback_volume_avg, volume_ratio, volume_ok}
+    """
+    if "volume" not in getattr(bars, "columns", []):
+        return {
+            "recent_volume_avg": None,
+            "lookback_volume_avg": None,
+            "volume_ratio": None,
+            "volume_ok": None,
+        }
+    try:
+        vols = bars["volume"].astype(float)
+    except Exception:
+        return {
+            "recent_volume_avg": None,
+            "lookback_volume_avg": None,
+            "volume_ratio": None,
+            "volume_ok": None,
+        }
+    full_avg = float(vols.mean())
+    recent_avg = float(vols.tail(3).mean()) if len(vols) >= 3 else float(vols.mean())
+    ratio = recent_avg / full_avg if full_avg > 0 else 0.0
+    return {
+        "recent_volume_avg": round(recent_avg, 2),
+        "lookback_volume_avg": round(full_avg, 2),
+        "volume_ratio": round(ratio, 3),
+        "volume_ok": bool(ratio >= min_volume_ratio),
+    }
+
+
 def analyze_pivot_loop(
     bars,
     catalysts: Optional[List[Dict[str, Any]]] = None,
@@ -145,6 +201,8 @@ def analyze_pivot_loop(
     entry_buffer_pct: float = 0.005,
     stop_buffer_pct: float = 0.03,
     catalyst_horizon_days: int = 2,
+    min_volume_ratio: float = 0.8,
+    market_regime_enabled: Optional[bool] = None,
 ) -> PivotAnalysis:
     """Compute the pivot-loop analysis from a bars DataFrame + catalyst list.
 
@@ -233,6 +291,9 @@ def analyze_pivot_loop(
             f"⚠️ {c['type']} on {c['date']} ({c['days_away']}d away) — "
             "exit before this"
         )
+    # Volume + market-regime gates (Phases C + E).
+    vol_stats = _compute_volume_stats(bars, min_volume_ratio)
+
     # Trend annotation -- always surface so the operator sees what
     # adjustment the algo made.
     if trend["direction"] != "flat":
@@ -242,12 +303,28 @@ def analyze_pivot_loop(
             f"({trend['pct_change']:+.2f}% over window) — "
             f"floor reference: {effective_low_source}"
         )
+    if vol_stats["volume_ok"] is False:
+        notes.append(
+            f"⚠️ volume ratio {vol_stats['volume_ratio']:.2f} below "
+            f"{min_volume_ratio:.2f} -- recent bars are low-conviction"
+        )
+    if market_regime_enabled is False:
+        notes.append(
+            "⚠️ broader market regime is risk-off (SPY trend/ADX gate failed) "
+            "-- individual mean-reversion setups have lower hit-rate here"
+        )
 
-    # Recommendation logic, ordered by precedence. Trend awareness:
-    # in a confirmed downtrend, refuse new entries even at the entry
-    # level -- the floor itself is in motion. In a strong uptrend
-    # already past target, recommendation flips to "TRENDING — entry
-    # missed" so the operator doesn't chase.
+    # Recommendation logic, ordered by precedence. Each gate represents
+    # a different reason to refuse entry, evaluated in order of severity:
+    #
+    #   1. Catalyst inside horizon  -> EXIT regardless of position state
+    #   2. Strong/moderate downtrend -> don't catch falling knives
+    #   3. Market regime risk-off    -> don't fight the tape (Phase E)
+    #   4. Low volume                -> low-conviction setup (Phase C)
+    #   5. Price above buffer        -> not at entry yet
+    #
+    # Then once all four 'no-trade' filters clear, normal price-vs-level
+    # logic (BUY / WAIT / HOLD / SELL / TRENDING) takes over.
     if blocked_by_catalyst:
         recommendation = f"EXIT — catalyst within {catalyst_horizon_days}d"
     elif trend["direction"] == "down" and trend["strength"] in ("moderate", "strong"):
@@ -257,6 +334,21 @@ def analyze_pivot_loop(
         recommendation = (
             f"WAIT — {trend['strength']} downtrend; effective floor not "
             "yet stabilized. Re-check after a green close."
+        )
+    elif market_regime_enabled is False:
+        # CAPM math: 60-80% of individual-stock variance is market beta.
+        # A buy signal during a risk-off SPY regime is structurally
+        # weaker -- skip the trade rather than fight the tape.
+        recommendation = (
+            "WAIT — broader market regime risk-off; don't fight the "
+            "tape on a mean-reversion entry"
+        )
+    elif vol_stats["volume_ok"] is False:
+        # Low volume = institutions aren't participating. Pivot
+        # bounces on light volume often fail.
+        recommendation = (
+            f"WAIT — low volume ({vol_stats['volume_ratio']:.2f}× avg); "
+            "pivot lacks conviction"
         )
     elif current_price <= suggested_entry:
         recommendation = "BUY — at or below suggested entry"
@@ -295,6 +387,11 @@ def analyze_pivot_loop(
         catalysts=upcoming,
         blocked_by_catalyst=blocked_by_catalyst,
         days_to_next_catalyst=days_to_next,
+        recent_volume_avg=vol_stats["recent_volume_avg"],
+        lookback_volume_avg=vol_stats["lookback_volume_avg"],
+        volume_ratio=vol_stats["volume_ratio"],
+        volume_ok=vol_stats["volume_ok"],
+        market_regime_enabled=market_regime_enabled,
         recommendation=recommendation,
         notes=notes,
     )

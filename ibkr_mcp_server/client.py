@@ -2620,10 +2620,14 @@ class IBKRClient:
         catalysts = cat_mod.get_upcoming_catalysts(
             symbol, horizon_days=max(loop["lookback_days"], 30)
         )
+        # Phase E: broader-market regime gate (SPY trend/ADX). Cached
+        # 1h so we don't refetch SPY's 250d bars on every 60s tick.
+        market_regime_enabled = await engine_mod.get_market_regime_enabled(self)
         try:
             analysis = pivot_mod.analyze_pivot_loop(
                 bars, catalysts,
                 catalyst_horizon_days=loop["catalyst_horizon_days"],
+                market_regime_enabled=market_regime_enabled,
             )
         except ValueError as e:
             self.logger.warning(f"pivot-loop {symbol}: analysis failed: {e}")

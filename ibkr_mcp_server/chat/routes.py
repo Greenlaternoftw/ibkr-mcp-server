@@ -572,8 +572,17 @@ async def pivot_analysis(request: Request) -> Response:
         sym, horizon_days=max(lookback, 30)
     )
 
+    # Phase E -- broader market regime (SPY/VIX gate). Cached 1h. None
+    # if the fetch fails -- in that case the gate is skipped, matching
+    # the engine's behavior.
+    from .. import pivot_loop as engine_mod
+    market_regime_enabled = await engine_mod.get_market_regime_enabled(ibkr_client)
+
     try:
-        analysis = pivot_mod.analyze_pivot_loop(bars, catalysts)
+        analysis = pivot_mod.analyze_pivot_loop(
+            bars, catalysts,
+            market_regime_enabled=market_regime_enabled,
+        )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

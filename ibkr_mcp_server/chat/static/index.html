@@ -2347,6 +2347,16 @@
               <span class="qx-c-val" id="loopAvgRise">—</span>
             </div>
 
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Volume confirmation</span>
+              <span class="qx-c-val" id="loopVolume">—</span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">SPY market regime</span>
+              <span class="qx-c-val" id="loopRegime">—</span>
+            </div>
+
             <div class="qx-construct-row" style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--hairline-2);">
               <span class="qx-c-key">Suggested entry</span>
               <span class="qx-c-val" id="loopEntry">—</span>
@@ -5160,6 +5170,40 @@ function _renderPivotResult(d) {
   }
   setText('loopAvgRange', _fmtMoneyShort(d.avg_daily_range));
   setText('loopAvgRise', _fmtMoneyShort(d.avg_close_to_low));
+
+  // Volume confirmation row (Phase C). Three states:
+  //   - null/null  → no volume in bars (gate skipped)
+  //   - true       → recent volume above threshold (green)
+  //   - false      → below threshold (red, "low conviction")
+  const volEl = document.getElementById('loopVolume');
+  if (volEl) {
+    if (d.volume_ok === null || d.volume_ok === undefined) {
+      volEl.textContent = '—';
+      volEl.style.color = 'var(--muted)';
+    } else if (d.volume_ok) {
+      volEl.textContent = `✓ ${d.volume_ratio.toFixed(2)}× avg (recent ${Math.round(d.recent_volume_avg / 1000)}k)`;
+      volEl.style.color = 'var(--go)';
+    } else {
+      volEl.textContent = `⚠ ${d.volume_ratio.toFixed(2)}× avg (low conviction)`;
+      volEl.style.color = 'var(--stop)';
+    }
+  }
+
+  // Market regime row (Phase E). Three states: null = unknown,
+  // true = risk-on (green), false = risk-off (red).
+  const regEl = document.getElementById('loopRegime');
+  if (regEl) {
+    if (d.market_regime_enabled === null || d.market_regime_enabled === undefined) {
+      regEl.textContent = '— (regime fetch unavailable)';
+      regEl.style.color = 'var(--muted)';
+    } else if (d.market_regime_enabled) {
+      regEl.textContent = '✓ risk-on (SPY trend + ADX gates passing)';
+      regEl.style.color = 'var(--go)';
+    } else {
+      regEl.textContent = '⚠ risk-off (SPY trend or ADX failing)';
+      regEl.style.color = 'var(--stop)';
+    }
+  }
   setText('loopEntry', _fmtMoneyShort(d.suggested_entry));
   setText('loopTarget', _fmtMoneyShort(d.suggested_target));
   setText('loopStop', _fmtMoneyShort(d.suggested_stop));

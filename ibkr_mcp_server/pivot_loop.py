@@ -80,6 +80,53 @@ def current_tick_interval(now_utc: Optional[dt.datetime] = None) -> int:
 
 
 # ---------------------------------------------------------------------
+# Broader-market regime (cached for 1 hour)
+# ---------------------------------------------------------------------
+#
+# Phase E filter: refuse pivot entries when SPY is in a "risk-off"
+# regime (SMA-50 trending down + ADX high, per the existing
+# regime.py rules). Per-tick we don't want a fresh 250-day SPY fetch
+# (rate limits + bandwidth), so cache for 1 hour. Regime doesn't
+# flip minute-to-minute.
+
+_REGIME_CACHE: Dict[str, Any] = {"fetched_at": None, "enabled": None}
+_REGIME_CACHE_TTL_SECONDS = 3600
+_REGIME_INDEX_SYMBOL = "SPY"
+
+
+async def get_market_regime_enabled(client) -> Optional[bool]:
+    """Return True/False for SPY's regime; None if the fetch failed.
+
+    Cached for 1h so a tick storm doesn't hammer IBKR's historical
+    data endpoint.  Caller is `client` (an IBKRClient instance --
+    typed as Any to avoid the circular import).
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    last = _REGIME_CACHE["fetched_at"]
+    if last and (now - last).total_seconds() < _REGIME_CACHE_TTL_SECONDS:
+        return _REGIME_CACHE["enabled"]
+    try:
+        bars = await client.get_historical_bars(
+            _REGIME_INDEX_SYMBOL, lookback_days=250
+        )
+        from .regime import check_regime_from_bars
+        result = check_regime_from_bars(_REGIME_INDEX_SYMBOL, bars)
+        enabled = bool(result.get("enabled"))
+    except Exception as e:
+        logger.warning(f"pivot-loop regime fetch failed: {e}")
+        enabled = None
+    _REGIME_CACHE["fetched_at"] = now
+    _REGIME_CACHE["enabled"] = enabled
+    return enabled
+
+
+def clear_regime_cache() -> None:
+    """Wipe the cache. Used by tests + a future force-refresh button."""
+    _REGIME_CACHE["fetched_at"] = None
+    _REGIME_CACHE["enabled"] = None
+
+
+# ---------------------------------------------------------------------
 # Decision policy (pure -- no I/O)
 # ---------------------------------------------------------------------
 

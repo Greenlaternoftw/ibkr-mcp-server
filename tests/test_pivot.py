@@ -246,6 +246,121 @@ class TestTrendAdjustment:
         assert a.recommendation.startswith("EXIT")
 
 
+class TestVolumeGate:
+    """Phase C -- low-volume pivots are skipped as low-conviction."""
+
+    def _bars_with_volume(self, vol_rows):
+        """vol_rows: list of (volume,). Returns a clean flat-trend bars
+        DataFrame so we isolate the volume gate."""
+        rows = [(102, 100, 101, v) for v in vol_rows]
+        return pd.DataFrame(rows, columns=["high", "low", "close", "volume"])
+
+    def test_volume_ratio_computed(self):
+        # Last 3 of 5: 100,100,100  → recent avg = 100
+        # All 5:       50,50,100,100,100 → full avg = 80
+        # Ratio = 1.25
+        bars = self._bars_with_volume([50, 50, 100, 100, 100])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.recent_volume_avg == pytest.approx(100.0)
+        assert a.lookback_volume_avg == pytest.approx(80.0)
+        assert a.volume_ratio == pytest.approx(1.25)
+        assert a.volume_ok is True
+
+    def test_low_volume_blocks_buy_recommendation(self):
+        # Last 3 of 5: 30,30,30 → recent avg = 30
+        # All 5:       100,100,30,30,30 → full avg = 58
+        # Ratio = 0.517 < 0.8 → low volume
+        bars = self._bars_with_volume([100, 100, 30, 30, 30])
+        a = pivot.analyze_pivot_loop(bars, entry_buffer_pct=0.005)
+        assert a.volume_ok is False
+        # Even though price is at entry (flat bars, current = pivot_low+1),
+        # the recommendation should be WAIT (low volume)
+        assert a.recommendation.startswith("WAIT"), f"got: {a.recommendation}"
+        assert "volume" in a.recommendation.lower()
+
+    def test_custom_min_volume_ratio(self):
+        # Ratio 0.9 -- ok at default 0.8, NOT ok at custom 1.0 threshold
+        bars = self._bars_with_volume([100, 100, 90, 90, 90])
+        a_default = pivot.analyze_pivot_loop(bars)
+        assert a_default.volume_ok is True
+        a_strict = pivot.analyze_pivot_loop(bars, min_volume_ratio=1.0)
+        assert a_strict.volume_ok is False
+
+    def test_no_volume_column_disables_gate(self):
+        # Bars without volume column → volume_* all None, gate skipped
+        bars = pd.DataFrame([(102, 100, 101)] * 5,
+                            columns=["high", "low", "close"])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.volume_ok is None
+        assert a.volume_ratio is None
+        # Recommendation must NOT be the low-volume WAIT
+        assert "volume" not in a.recommendation.lower()
+
+    def test_volume_annotation_in_notes_when_blocked(self):
+        bars = self._bars_with_volume([100, 100, 30, 30, 30])
+        a = pivot.analyze_pivot_loop(bars)
+        assert any("volume ratio" in n.lower() for n in a.notes)
+
+
+class TestRegimeGate:
+    """Phase E -- broader market regime risk-off prevents new entries."""
+
+    def _flat_bars_at_entry(self):
+        # Flat trend, price at pivot low → would normally BUY
+        return pd.DataFrame(
+            [(102, 100, 100)] * 4,
+            columns=["high", "low", "close"],
+        )
+
+    def test_regime_enabled_does_not_block(self):
+        bars = self._flat_bars_at_entry()
+        a = pivot.analyze_pivot_loop(bars, market_regime_enabled=True)
+        assert a.market_regime_enabled is True
+        assert a.recommendation.startswith("BUY")
+
+    def test_regime_disabled_blocks_buy(self):
+        bars = self._flat_bars_at_entry()
+        a = pivot.analyze_pivot_loop(bars, market_regime_enabled=False)
+        assert a.market_regime_enabled is False
+        assert a.recommendation.startswith("WAIT"), f"got: {a.recommendation}"
+        assert "market regime" in a.recommendation.lower()
+
+    def test_regime_none_does_not_block(self):
+        # When regime info isn't supplied, we don't apply the gate
+        bars = self._flat_bars_at_entry()
+        a = pivot.analyze_pivot_loop(bars, market_regime_enabled=None)
+        assert a.market_regime_enabled is None
+        assert a.recommendation.startswith("BUY"), f"got: {a.recommendation}"
+
+    def test_regime_disabled_note_in_notes(self):
+        bars = self._flat_bars_at_entry()
+        a = pivot.analyze_pivot_loop(bars, market_regime_enabled=False)
+        assert any("market regime" in n.lower() for n in a.notes)
+
+
+class TestCombinedGates:
+    """Both gates together -- the realistic Phase C+E scenario."""
+
+    def test_low_volume_AND_regime_off_still_just_one_wait(self):
+        # When both filters fire, the LATER one (volume, by precedence)
+        # is what gets reported -- because regime is checked first.
+        bars = pd.DataFrame(
+            [(102, 100, 100, 30)] * 5,
+            columns=["high", "low", "close", "volume"],
+        )
+        # Make volume tank for the last 3
+        bars.loc[2:, "volume"] = 10
+        a = pivot.analyze_pivot_loop(bars, market_regime_enabled=False)
+        # Regime check comes first in the precedence -- that's what
+        # the operator should see
+        assert a.recommendation.startswith("WAIT")
+        assert "market regime" in a.recommendation.lower()
+        # But BOTH notes are present so the operator has full context
+        notes_text = " ".join(a.notes).lower()
+        assert "market regime" in notes_text
+        assert "volume" in notes_text
+
+
 class TestEdgeCases:
     def test_empty_bars_raises(self):
         with pytest.raises(ValueError, match="at least 2 bars"):
