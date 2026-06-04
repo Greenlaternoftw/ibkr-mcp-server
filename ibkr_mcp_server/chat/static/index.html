@@ -2080,12 +2080,9 @@
       </div>
       <div class="ticket" style="padding:16px;">
         <div class="quick-actions">
-          <button class="quick-btn tp" onclick="fillQuickAction('sellAllTP')">↑ Take Profits</button>
-          <button class="quick-btn" onclick="fillQuickAction('positions')">Get positions</button>
-          <button class="quick-btn" onclick="fillQuickAction('sync')">Sync portfolio</button>
-          <button class="quick-btn" onclick="fillQuickAction('cancel')">Cancel all orders</button>
-          <button class="quick-btn" onclick="fillQuickAction('orders')">Open orders</button>
-          <button class="quick-btn" onclick="fillQuickAction('quote')">Get quote</button>
+          <button class="quick-btn tp" onclick="dispatchQuickAction('sellAllTP')">↑ Take Profits</button>
+          <button class="quick-btn" onclick="dispatchQuickAction('cancel')">Cancel all orders</button>
+          <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">＋ Buy with Stop Loss</button>
         </div>
         <textarea id="chatExecBox" class="chat-exec-box"
           placeholder='e.g.  Place a BUY 100 NVDA at LMT 178.50 with attached STP at 175.00. Or:  What is the current bid/ask for SPY?  Or:  Cancel order 12345.'
@@ -3489,6 +3486,7 @@ document.addEventListener('keydown', e => {
     if (document.getElementById('qbOverlay')?.classList.contains('show')) closeQuickBuy();
     if (document.getElementById('settingsOverlay')?.classList.contains('show')) closeSettings();
     if (document.getElementById('addPortfolioOverlay')?.classList.contains('show')) closeAddPortfolio();
+    if (document.getElementById('buyStopOverlay')?.classList.contains('show')) closeBuyStop();
   }
 });
 
@@ -4601,6 +4599,138 @@ function fillQuickAction(action) {
   document.getElementById('chatExecBox').focus();
 }
 
+/* ============================================================
+   BUY + STOP LOSS QUICK ACTION
+   Symbol + dollar amount + stop % → composes a BUY LMT IOC parent
+   with an attached STP child at entry × (1 − stop%) → dispatches
+   via chat. Daemon's confirmation gate runs server-side before
+   the destructive call.
+============================================================ */
+function openBuyStop() {
+  // Pre-fill the symbol from whatever's currently in the order-ticket
+  // box if anything; otherwise empty.
+  const symFromTicket = document.getElementById('orderSymbol')?.value || '';
+  document.getElementById('bsSymbol').value = symFromTicket.toUpperCase();
+  document.getElementById('bsDollar').value = '';
+  document.getElementById('bsStopPct').value = '8';
+  document.getElementById('bsError').textContent = '';
+  document.getElementById('buyStopOverlay').classList.add('show');
+  requestAnimationFrame(() => document.getElementById('bsSymbol').focus());
+}
+
+function closeBuyStop() {
+  document.getElementById('buyStopOverlay').classList.remove('show');
+}
+
+function executeBuyStop() {
+  const sym = (document.getElementById('bsSymbol').value || '').trim().toUpperCase();
+  const dollar = parseFloat(document.getElementById('bsDollar').value);
+  const stopPct = parseFloat(document.getElementById('bsStopPct').value);
+  const err = document.getElementById('bsError');
+  if (!sym || sym.length < 1 || sym.length > 6) {
+    err.textContent = 'Enter a valid symbol (1-6 chars).';
+    return;
+  }
+  if (isNaN(dollar) || dollar < 100) {
+    err.textContent = 'Dollar amount must be ≥ $100.';
+    return;
+  }
+  if (isNaN(stopPct) || stopPct < 0.5 || stopPct > 50) {
+    err.textContent = 'Stop loss % must be between 0.5 and 50.';
+    return;
+  }
+
+  // Compose a complete BUY-with-attached-STP order command. Claude
+  // calls place_oca_group (or place_order with attached child) on the
+  // daemon side; the confirmation gate intercepts before transmit.
+  const stopMult = (1 - stopPct / 100).toFixed(4);
+  const portfolioName = portfolios.active || 'active account';
+  const command =
+`Claude, execute a PROTECTED BUY via the ibkr MCP — enter ${sym} with a hard stop loss attached:
+
+Position
+  symbol:           ${sym}
+  side:             BUY
+  target notional:  $${dollar.toLocaleString()}
+  source:           Dashboard "Buy with Stop Loss" · ${portfolioName} tab
+  stop loss:        ${stopPct}% below fill price (HARD STOP, not trailing)
+
+Order strategy
+  Parent: LMT IOC at ask + 0.30% (min $0.10 buffer), routed through
+  IBKR Adaptive Algorithm with priority=Urgent. Sizing:
+  floor(target_notional / live_ask). Integer shares.
+
+  Attached child: STP at <fill_price × ${stopMult}>, GTC, OCA-linked
+  to the parent fill. Triggers a market sell if price crosses below.
+
+IBKR primitives — parent BUY
+  order_type:       LMT
+  algo:             Adaptive
+  algo_params:      { adaptivePriority: "Urgent" }
+  lmt_price:        <live_ask> + max(0.30% × ask, $0.10)
+  quantity:         floor($${dollar.toLocaleString()} / lmt_price)
+  tif:              IOC
+  routing:          SMART
+  outside_rth:      false
+
+IBKR primitives — attached STP child
+  order_type:       STP
+  stop_price:       <fill_price> × ${stopMult}
+  tif:              GTC
+  parent_id:        <buy order id>
+  oca_group:        ${sym}_BS_${Date.now()}
+  quantity:         same as parent fill
+
+Execution steps
+  1) get_market_data(${sym}) → fetch live bid, ask, last
+  2) Calculate buy limit: ask + max(0.30% × ask, $0.10)
+  3) Calculate shares: floor($${dollar.toLocaleString()} / limit)
+  4) Place parent LMT IOC with Adaptive(Urgent)
+  5) If parent CANCELLED (no fill): retry once at ask + 0.50%, then escalate to MKT
+  6) On parent FILL: immediately place attached STP child at fill_price × ${stopMult}
+  7) Confirm: parent fill price, shares, attached STP placed + active
+  8) Add ${sym} to the Portfolio tab (auto-sync should pick it up within 30s)
+
+Risk envelope
+  Max risk: $${(dollar * stopPct / 100).toFixed(2)} (${stopPct}% of capital deployed).
+  Max slippage on entry: 0.75% from reference.
+  Stop is HARD (STP, not TRAIL) -- will not adjust upward on profit.
+  If you want trailing, ask separately or run start_swing_strategy after fill.`;
+
+  closeBuyStop();
+  const hint = document.getElementById('chatExecHint');
+  if (hint) {
+    hint.innerHTML = `<span style="color:var(--go); font-weight:600;">→ Dispatching BUY+STOP ${sym} ($${dollar.toLocaleString()}, stop ${stopPct}%) to Claude…</span> confirm in the chat panel.`;
+    setTimeout(() => { hint.textContent = ''; }, 8000);
+  }
+  dispatchToChat(command);
+}
+
+// One-tap "execute via chat" variant for the trimmed dashboard
+// quick-actions row. Take Profits & Cancel All Orders dispatch
+// straight through the chat agent -- daemon's destructive-action
+// gate still pauses for confirmation before any irreversible op.
+function dispatchQuickAction(action) {
+  // 'cancel' needs a symbol; default to the order-ticket symbol box.
+  const sym = document.getElementById('orderSymbol')?.value
+            || document.getElementById('symbolInput')?.value
+            || '<SYMBOL>';
+  const templates = {
+    sellAllTP: buildTakeProfitsCommand(),
+    cancel: sym && sym !== '<SYMBOL>'
+      ? `Claude, cancel ALL open orders for ${sym}. Confirm cancellation status for each.`
+      : 'Claude, cancel ALL open orders across all symbols. Confirm cancellation status for each.',
+  };
+  const text = templates[action];
+  if (!text) return;
+  const hint = document.getElementById('chatExecHint');
+  if (hint) {
+    hint.innerHTML = `<span style="color:var(--accent); font-weight:600;">→ Dispatched ${action === 'sellAllTP' ? 'TAKE PROFITS' : 'CANCEL ALL'} to Claude…</span> confirm in the chat panel.`;
+    setTimeout(() => { hint.textContent = ''; }, 6000);
+  }
+  dispatchToChat(text);
+}
+
 // "Execute via Chat" box — dispatch the textarea content through the
 // chat agent. (Was previously copy-to-clipboard + paste; now one click.)
 function copyChatExec() {
@@ -5440,6 +5570,47 @@ pinLoadConfig();
 </div>
 
 <!-- ============ SETTINGS MODAL ============ -->
+<!-- ============ BUY WITH STOP LOSS OVERLAY ============ -->
+<div class="qx-overlay" id="buyStopOverlay" onclick="if(event.target===this) closeBuyStop()">
+  <div class="qx-modal" style="border-top-color: var(--go); max-width: 460px;" role="dialog" aria-labelledby="bsTitle">
+    <div class="qx-header">
+      <div>
+        <div class="qx-eyebrow" style="color: var(--go);">BUY + STOP LOSS</div>
+        <h2 class="qx-title" id="bsTitle">New protected entry</h2>
+      </div>
+      <button class="qx-close" onclick="closeBuyStop()" aria-label="Close">✕</button>
+    </div>
+    <div class="qx-body">
+      <div class="qx-row">
+        <label class="qx-label" for="bsSymbol">Symbol</label>
+        <input type="text" id="bsSymbol" class="qx-qty-input" placeholder="AAPL"
+               autocomplete="off" autocapitalize="characters" maxlength="6"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('bsDollar').focus();}" />
+      </div>
+      <div class="qx-row">
+        <label class="qx-label" for="bsDollar">Dollar amount to deploy</label>
+        <input type="number" id="bsDollar" class="qx-qty-input" placeholder="1000" step="100" min="0"
+               inputmode="decimal"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('bsStopPct').focus();}" />
+      </div>
+      <div class="qx-row">
+        <label class="qx-label" for="bsStopPct">Stop loss (% below entry)</label>
+        <input type="number" id="bsStopPct" class="qx-qty-input" placeholder="8" step="0.5" min="0.5" max="50"
+               value="8" inputmode="decimal"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();executeBuyStop();}" />
+        <div style="margin-top:6px; font-size:11px; color: var(--text-2); line-height:1.5;">
+          Hard stop only -- order placed as an attached STP child, no trailing. Common values: 5% for tight risk, 8% standard, 12% wide swing.
+        </div>
+        <div id="bsError" style="margin-top:10px; font-size:12px; color: var(--stop); min-height:14px;"></div>
+      </div>
+    </div>
+    <div class="qx-footer">
+      <button class="qx-cancel" onclick="closeBuyStop()">Cancel</button>
+      <button class="qx-execute" onclick="executeBuyStop()" style="background:var(--go);">Execute via Chat →</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============ ADD-PORTFOLIO OVERLAY (replaces native prompt) ============ -->
 <div class="qx-overlay" id="addPortfolioOverlay" onclick="if(event.target===this) closeAddPortfolio()">
   <div class="qx-modal" style="border-top-color: var(--accent-deep); max-width: 420px;" role="dialog" aria-labelledby="addPortfolioTitle">
