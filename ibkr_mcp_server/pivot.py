@@ -87,6 +87,12 @@ class PivotAnalysis:
     vol_ratio: Optional[float] = None             # recent / lookback
     vol_ok: Optional[bool] = None                 # ratio <= max_vol_ratio
 
+    # News sentiment (Phase F). Computed by news_sentiment.py from the
+    # last 7 days of headlines via Claude web-search, cached 6h.
+    news_score: Optional[int] = None              # weighted sum of items
+    news_sentiment_ok: Optional[bool] = None      # score > block_threshold
+    news_top_negative: Optional[str] = None       # most-impactful negative headline
+
     recommendation: str = ""         # BUY / WAIT / HOLD / SELL / EXIT-CATALYST
     notes: List[str] = field(default_factory=list)
 
@@ -265,6 +271,7 @@ def analyze_pivot_loop(
     min_volume_ratio: float = 0.8,
     max_vol_ratio: float = 1.5,
     market_regime_enabled: Optional[bool] = None,
+    news_sentiment: Optional[Dict[str, Any]] = None,
 ) -> PivotAnalysis:
     """Compute the pivot-loop analysis from a bars DataFrame + catalyst list.
 
@@ -385,6 +392,19 @@ def analyze_pivot_loop(
             "⚠️ broader market regime is risk-off (SPY trend/ADX gate failed) "
             "-- individual mean-reversion setups have lower hit-rate here"
         )
+    # Phase F news sentiment (caller-provided; None means feature disabled).
+    news_score = None
+    news_sentiment_ok = None
+    news_top_negative = None
+    if news_sentiment is not None:
+        news_score = news_sentiment.get("score")
+        news_sentiment_ok = news_sentiment.get("sentiment_ok")
+        news_top_negative = news_sentiment.get("top_negative")
+        if news_sentiment_ok is False:
+            notes.append(
+                f"⚠️ news sentiment negative (score {news_score}); "
+                f"top negative: \"{news_top_negative}\""
+            )
 
     # Recommendation logic, ordered by precedence. Each gate represents
     # a different reason to refuse entry, evaluated in order of severity:
@@ -421,6 +441,12 @@ def analyze_pivot_loop(
             f"WAIT — realized vol expanding "
             f"({rvol_stats['vol_ratio']:.2f}× baseline); event likely "
             "being priced in even without a named catalyst"
+        )
+    elif news_sentiment_ok is False:
+        # Phase F -- recent news sentiment net-negative
+        recommendation = (
+            f"WAIT — news sentiment negative (score {news_score}); "
+            "wait for the news flow to neutralize"
         )
     elif vol_stats["volume_ok"] is False:
         # Low volume = institutions aren't participating. Pivot
@@ -475,6 +501,9 @@ def analyze_pivot_loop(
         lookback_vol_pct=rvol_stats["lookback_vol_pct"],
         vol_ratio=rvol_stats["vol_ratio"],
         vol_ok=rvol_stats["vol_ok"],
+        news_score=news_score,
+        news_sentiment_ok=news_sentiment_ok,
+        news_top_negative=news_top_negative,
         recommendation=recommendation,
         notes=notes,
     )

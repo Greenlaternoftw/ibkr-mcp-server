@@ -578,10 +578,19 @@ async def pivot_analysis(request: Request) -> Response:
     from .. import pivot_loop as engine_mod
     market_regime_enabled = await engine_mod.get_market_regime_enabled(ibkr_client)
 
+    # Phase F -- news sentiment. Cached 6h per symbol. Cheap on cache
+    # hit; expensive (Anthropic web-search) on miss.
+    from .. import news_sentiment as news_mod
+    try:
+        news = await news_mod.get_news_sentiment(sym)
+    except Exception:
+        news = None
+
     try:
         analysis = pivot_mod.analyze_pivot_loop(
             bars, catalysts,
             market_regime_enabled=market_regime_enabled,
+            news_sentiment=news,
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

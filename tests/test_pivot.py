@@ -396,6 +396,67 @@ class TestVolExpansionGate:
         assert any("realized vol" in n.lower() for n in a.notes)
 
 
+class TestNewsSentimentGate:
+    """Phase F -- net-negative news blocks new entries."""
+
+    def _flat_at_entry(self):
+        return pd.DataFrame(
+            [(102, 100, 100)] * 4,
+            columns=["high", "low", "close"],
+        )
+
+    def test_no_news_input_disables_gate(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(bars, news_sentiment=None)
+        assert a.news_sentiment_ok is None
+        assert a.recommendation.startswith("BUY")
+
+    def test_positive_sentiment_passes(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(
+            bars, news_sentiment={"score": 5, "sentiment_ok": True,
+                                  "top_negative": None, "n_items": 3},
+        )
+        assert a.news_sentiment_ok is True
+        assert a.news_score == 5
+        assert a.recommendation.startswith("BUY")
+
+    def test_negative_sentiment_blocks(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(
+            bars,
+            news_sentiment={"score": -7, "sentiment_ok": False,
+                            "top_negative": "downgrade by tier-1 firm",
+                            "n_items": 4},
+        )
+        assert a.news_sentiment_ok is False
+        assert a.news_score == -7
+        assert a.news_top_negative == "downgrade by tier-1 firm"
+        assert a.recommendation.startswith("WAIT"), f"got: {a.recommendation}"
+        assert "news" in a.recommendation.lower()
+
+    def test_negative_news_note_in_notes(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(
+            bars,
+            news_sentiment={"score": -7, "sentiment_ok": False,
+                            "top_negative": "guidance cut",
+                            "n_items": 3},
+        )
+        assert any("news sentiment" in n.lower() for n in a.notes)
+
+    def test_regime_takes_precedence_over_news(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(
+            bars,
+            market_regime_enabled=False,
+            news_sentiment={"score": -10, "sentiment_ok": False,
+                            "top_negative": "bad", "n_items": 2},
+        )
+        # Regime fires first
+        assert "market regime" in a.recommendation.lower()
+
+
 class TestCombinedGates:
     """Both gates together -- the realistic Phase C+E scenario."""
 

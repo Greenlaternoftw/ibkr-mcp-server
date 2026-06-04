@@ -2697,11 +2697,19 @@ class IBKRClient:
         # Phase E: broader-market regime gate (SPY trend/ADX). Cached
         # 1h so we don't refetch SPY's 250d bars on every 60s tick.
         market_regime_enabled = await engine_mod.get_market_regime_enabled(self)
+        # Phase F: news sentiment. Cached 6h per symbol; cheap on cache hit.
+        try:
+            from . import news_sentiment as news_mod
+            news = await news_mod.get_news_sentiment(symbol)
+        except Exception as e:
+            self.logger.debug(f"pivot-loop {symbol}: news fetch failed: {e}")
+            news = None
         try:
             analysis = pivot_mod.analyze_pivot_loop(
                 bars, catalysts,
                 catalyst_horizon_days=loop["catalyst_horizon_days"],
                 market_regime_enabled=market_regime_enabled,
+                news_sentiment=news,
             )
         except ValueError as e:
             self.logger.warning(f"pivot-loop {symbol}: analysis failed: {e}")

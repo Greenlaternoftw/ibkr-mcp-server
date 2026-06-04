@@ -38,6 +38,8 @@ def make_analysis(
     market_regime_enabled=None,
     vol_ok=None,
     vol_ratio=None,
+    news_sentiment_ok=None,
+    news_score=None,
 ):
     """Build a PivotAnalysis-shaped object (SimpleNamespace duck-types fine
     -- decide_next_action only reads attributes)."""
@@ -56,6 +58,8 @@ def make_analysis(
         market_regime_enabled=market_regime_enabled,
         vol_ok=vol_ok,
         vol_ratio=vol_ratio,
+        news_sentiment_ok=news_sentiment_ok,
+        news_score=news_score,
     )
 
 
@@ -311,6 +315,37 @@ class TestEngineHonorsRegimeAndVolume:
                                           last_3_cycles_losses=0)
         assert d.action == "no_op"
         assert "regime" in d.reason.lower()
+
+    def test_negative_news_blocks_entry(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            news_sentiment_ok=False, news_score=-7,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "news" in d.reason.lower()
+
+    def test_neutral_news_does_not_block(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            news_sentiment_ok=True, news_score=2,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
+
+    def test_news_unknown_does_not_block(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            news_sentiment_ok=None,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
 
     def test_downtrend_blocks_before_regime_check(self):
         # Downtrend guard fires before regime gate

@@ -228,6 +228,16 @@ def decide_next_action(
                 reason=f"realized vol expanding (ratio {vr:.2f}× baseline)" if vr is not None
                        else "realized vol expanding above threshold",
             )
+        # News sentiment gate (Phase F). None means feature disabled
+        # or fetch failed; skip. False means recent headlines are
+        # net-negative; refuse entry.
+        if getattr(analysis, "news_sentiment_ok", None) is False:
+            score = getattr(analysis, "news_score", None)
+            return Decision(
+                action="no_op",
+                reason=f"news sentiment negative (score {score})" if score is not None
+                       else "news sentiment negative",
+            )
         # Volume confirmation gate (Phase C). None means bars don't carry
         # volume (test fixtures or odd ib_async build); skip. False means
         # recent volume is below the threshold -- low-conviction pivot.

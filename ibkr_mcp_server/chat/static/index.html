@@ -2362,6 +2362,11 @@
               <span class="qx-c-val" id="loopRegime">—</span>
             </div>
 
+            <div class="qx-construct-row">
+              <span class="qx-c-key">News sentiment (24h)</span>
+              <span class="qx-c-val" id="loopNews">—</span>
+            </div>
+
             <div class="qx-construct-row" style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--hairline-2);">
               <span class="qx-c-key">Suggested entry</span>
               <span class="qx-c-val" id="loopEntry">—</span>
@@ -5223,6 +5228,23 @@ function _renderPivotResult(d) {
     } else {
       regEl.textContent = '⚠ risk-off (SPY trend or ADX failing)';
       regEl.style.color = 'var(--stop)';
+    }
+  }
+
+  // News sentiment row (Phase F). null = feature off or fetch failed,
+  // true = neutral-or-positive (green), false = net-negative (red).
+  const newsEl = document.getElementById('loopNews');
+  if (newsEl) {
+    if (d.news_sentiment_ok === null || d.news_sentiment_ok === undefined) {
+      newsEl.textContent = '— (news fetch unavailable)';
+      newsEl.style.color = 'var(--muted)';
+    } else if (d.news_sentiment_ok) {
+      newsEl.textContent = `✓ score ${d.news_score > 0 ? '+' : ''}${d.news_score} from ${d.n_items ?? '?'} items`;
+      newsEl.style.color = 'var(--go)';
+    } else {
+      const top = d.news_top_negative ? ` — top: "${String(d.news_top_negative).slice(0, 60)}…"` : '';
+      newsEl.textContent = `⚠ score ${d.news_score} (net-negative)${top}`;
+      newsEl.style.color = 'var(--stop)';
     }
   }
   setText('loopEntry', _fmtMoneyShort(d.suggested_entry));
