@@ -893,6 +893,39 @@
   }
 
   /* ===== Order Ticket ===== */
+  .ticket-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: -1px;   /* overlap the .ticket top border so active tab "joins" the pane */
+    position: relative;
+    z-index: 1;
+  }
+  .ticket-tab {
+    background: var(--bg);
+    border: 1px solid var(--hairline);
+    border-bottom: none;
+    color: var(--text-2);
+    padding: 8px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ticket-tab:hover { color: var(--accent); }
+  .ticket-tab.active {
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 600;
+    border-color: var(--hairline);
+  }
+  /* Pivot-loop lookback chips: when one is .active, give it accent treatment */
+  .quick-btn.loop-lb.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
   .ticket {
     background: var(--surface);
     border: 1px solid var(--hairline);
@@ -2131,7 +2164,15 @@
         <span class="label" id="ticketGate" style="color:var(--muted);">awaiting symbol</span>
       </div>
 
-      <div class="ticket">
+      <!-- Tab row: Manual Builder | Pivot Loop -->
+      <div class="ticket-tabs">
+        <button class="ticket-tab active" id="ticketTabManual"
+                onclick="setTicketTab('manual')">Manual Builder</button>
+        <button class="ticket-tab" id="ticketTabLoop"
+                onclick="setTicketTab('loop')">Pivot Loop</button>
+      </div>
+
+      <div class="ticket" id="ticketPaneManual">
         <div class="field">
           <label>Symbol</label>
           <input id="orderSymbol" type="text" readonly placeholder="—" />
@@ -2198,6 +2239,114 @@
           Override only if you have independent conviction.
           <div style="margin-top:8px;">
             <button class="copy-btn" onclick="overrideGate()">I understand — let me override</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ PIVOT LOOP TAB (hidden by default) ============ -->
+      <div class="ticket" id="ticketPaneLoop" style="display:none;">
+        <div class="field">
+          <label for="loopSymbol">Symbol</label>
+          <input id="loopSymbol" type="text" placeholder="AAPL" maxlength="6"
+                 autocapitalize="characters" autocomplete="off"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();runPivotAnalysis();}" />
+        </div>
+
+        <div class="field">
+          <label>Lookback (days)</label>
+          <div class="quick-actions quick-actions--fit" id="loopLookbackRow"
+               style="margin-top:4px; margin-bottom:6px;">
+            <button class="quick-btn loop-lb active" data-lb="7"
+                    onclick="setLookback(7)">7d</button>
+            <button class="quick-btn loop-lb" data-lb="14"
+                    onclick="setLookback(14)">14d</button>
+            <button class="quick-btn loop-lb" data-lb="21"
+                    onclick="setLookback(21)">21d</button>
+            <button class="quick-btn loop-lb" data-lb="30"
+                    onclick="setLookback(30)">30d</button>
+            <button class="quick-btn loop-lb" data-lb="60"
+                    onclick="setLookback(60)">60d</button>
+          </div>
+          <input id="loopCustomLb" type="number" min="3" max="180" step="1"
+                 placeholder="custom (3-180)" style="margin-top:4px;"
+                 oninput="onCustomLookbackChange()" />
+        </div>
+
+        <button class="submit-btn" style="width:100%; padding:11px;"
+                onclick="runPivotAnalysis()" id="loopAnalyzeBtn">
+          Analyze Pivot Loop
+        </button>
+        <div id="loopHint" class="label"
+             style="margin-top:8px; color:var(--text-2); text-transform:none; letter-spacing:0; min-height:14px;"></div>
+
+        <!-- Result panel: populated by JS -->
+        <div id="loopResult" style="display:none; margin-top:14px;">
+          <div class="qx-construct" style="border-left-color: var(--accent);">
+            <div class="qx-label" style="margin-bottom:8px;">
+              <span id="loopResultSymbol">—</span>
+              · <span id="loopResultLookback">—</span> day window
+              · <span id="loopResultBars">—</span> bars
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Recommendation</span>
+              <span class="qx-c-val" id="loopRec" style="font-weight:700;">—</span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Pivot low → current → pivot high</span>
+              <span class="qx-c-val">
+                <span id="loopPivotLow">—</span>
+                · <strong id="loopCurrent">—</strong>
+                · <span id="loopPivotHigh">—</span>
+              </span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Distance from low</span>
+              <span class="qx-c-val" id="loopDistLow">—</span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Avg daily range</span>
+              <span class="qx-c-val" id="loopAvgRange">—</span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Avg rise from low</span>
+              <span class="qx-c-val" id="loopAvgRise">—</span>
+            </div>
+
+            <div class="qx-construct-row" style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--hairline-2);">
+              <span class="qx-c-key">Suggested entry</span>
+              <span class="qx-c-val" id="loopEntry">—</span>
+            </div>
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Suggested target</span>
+              <span class="qx-c-val" id="loopTarget">—</span>
+            </div>
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Suggested stop</span>
+              <span class="qx-c-val" id="loopStop">—</span>
+            </div>
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Risk : reward</span>
+              <span class="qx-c-val" id="loopRR">—</span>
+            </div>
+
+            <div class="qx-construct-row" style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--hairline-2);">
+              <span class="qx-c-key">Next catalyst</span>
+              <span class="qx-c-val" id="loopCatalyst">—</span>
+            </div>
+            <div id="loopCatalystList" style="margin-top:6px; font-size:11px; color:var(--text-2); line-height:1.6;"></div>
+            <div id="loopNotes" style="margin-top:6px; font-size:12px; color:var(--warn); line-height:1.6;"></div>
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:12px;">
+            <button class="portfolio-btn" style="flex:1; padding:10px;"
+                    onclick="dispatchLoopWatchToChat()" id="loopDispatchBtn">
+              Send watch instructions to chat
+            </button>
           </div>
         </div>
       </div>
@@ -4835,6 +4984,202 @@ function executeCmd() {
   const t = document.getElementById('cmdText').textContent;
   if (!t || !t.trim()) return;
   dispatchToChat(t);
+}
+
+/* ============================================================
+   ORDER TICKET TABS (Manual Builder / Pivot Loop)
+============================================================ */
+
+function setTicketTab(which) {
+  const tabM = document.getElementById('ticketTabManual');
+  const tabL = document.getElementById('ticketTabLoop');
+  const paneM = document.getElementById('ticketPaneManual');
+  const paneL = document.getElementById('ticketPaneLoop');
+  if (!tabM || !tabL || !paneM || !paneL) return;
+  if (which === 'loop') {
+    tabM.classList.remove('active');
+    tabL.classList.add('active');
+    paneM.style.display = 'none';
+    paneL.style.display = '';
+    // Pre-fill loop symbol from order-ticket symbol or the research input.
+    const sym = document.getElementById('orderSymbol')?.value
+              || document.getElementById('symbolInput')?.value || '';
+    if (sym && !document.getElementById('loopSymbol').value) {
+      document.getElementById('loopSymbol').value = sym.toUpperCase();
+    }
+    setTimeout(() => document.getElementById('loopSymbol').focus(), 60);
+  } else {
+    tabL.classList.remove('active');
+    tabM.classList.add('active');
+    paneL.style.display = 'none';
+    paneM.style.display = '';
+  }
+}
+
+/* ============================================================
+   PIVOT LOOP -- analysis tab on Order Ticket
+   Selectable lookback (7/14/21/30/60 + custom), single-shot
+   "Analyze" button hits /chat/api/pivot/{symbol}?lookback=N and
+   renders the result panel. Optionally dispatches a watch-setup
+   prompt to the chat agent.
+============================================================ */
+
+let _loopLookback = 7;   // mirrors the active chip / custom-input choice
+
+function setLookback(days) {
+  _loopLookback = days;
+  // Clear the custom input + chip-highlight the chosen preset.
+  const custom = document.getElementById('loopCustomLb');
+  if (custom) custom.value = '';
+  document.querySelectorAll('.loop-lb').forEach(b => {
+    b.classList.toggle('active', Number(b.dataset.lb) === days);
+  });
+}
+
+function onCustomLookbackChange() {
+  const v = parseInt(document.getElementById('loopCustomLb').value, 10);
+  if (Number.isFinite(v) && v >= 3 && v <= 180) {
+    _loopLookback = v;
+    // Custom input wins -- de-highlight all preset chips.
+    document.querySelectorAll('.loop-lb').forEach(b => b.classList.remove('active'));
+  }
+}
+
+function _loopHint(msg, color) {
+  const el = document.getElementById('loopHint');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.style.color = color || 'var(--text-2)';
+}
+
+function _fmtMoneyShort(v) {
+  if (v == null || isNaN(v)) return '—';
+  return '$' + Number(v).toFixed(2);
+}
+
+function _fmtPctShort(v) {
+  if (v == null || isNaN(v)) return '—';
+  const s = Number(v) >= 0 ? '+' : '';
+  return s + Number(v).toFixed(2) + '%';
+}
+
+async function runPivotAnalysis() {
+  const sym = (document.getElementById('loopSymbol').value || '').trim().toUpperCase();
+  if (!sym || sym.length < 1 || sym.length > 6) {
+    _loopHint('Enter a valid symbol (1-6 chars).', 'var(--stop)');
+    return;
+  }
+  const btn = document.getElementById('loopAnalyzeBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Analyzing…'; }
+  _loopHint(`Pulling ${_loopLookback}d of bars + catalysts for ${sym}…`, 'var(--accent)');
+
+  let data;
+  try {
+    data = await daemonGet(
+      `/chat/api/pivot/${encodeURIComponent(sym)}?lookback=${_loopLookback}`
+    );
+  } catch (e) {
+    _loopHint('✗ ' + e.message, 'var(--stop)');
+    if (btn) { btn.disabled = false; btn.textContent = 'Analyze Pivot Loop'; }
+    return;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Analyze Pivot Loop'; }
+  }
+
+  _loopHint(`✓ analyzed ${data.bars_used} bars at ${new Date().toLocaleTimeString()}`,
+            'var(--go)');
+  _renderPivotResult(data);
+}
+
+function _renderPivotResult(d) {
+  const setText = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = v;
+  };
+  document.getElementById('loopResult').style.display = '';
+  setText('loopResultSymbol', d.symbol);
+  setText('loopResultLookback', d.lookback_days);
+  setText('loopResultBars', d.bars_used);
+
+  setText('loopPivotLow', _fmtMoneyShort(d.pivot_low));
+  setText('loopCurrent', _fmtMoneyShort(d.current_price));
+  setText('loopPivotHigh', _fmtMoneyShort(d.pivot_high));
+  setText('loopDistLow', _fmtPctShort(d.distance_from_low_pct));
+  setText('loopAvgRange', _fmtMoneyShort(d.avg_daily_range));
+  setText('loopAvgRise', _fmtMoneyShort(d.avg_close_to_low));
+  setText('loopEntry', _fmtMoneyShort(d.suggested_entry));
+  setText('loopTarget', _fmtMoneyShort(d.suggested_target));
+  setText('loopStop', _fmtMoneyShort(d.suggested_stop));
+  setText('loopRR', d.risk_reward_ratio ? `1 : ${d.risk_reward_ratio}` : '—');
+
+  // Catalyst summary
+  if (d.days_to_next_catalyst != null) {
+    setText('loopCatalyst',
+      `${d.days_to_next_catalyst}d away (${d.catalysts[0]?.type || '—'})`);
+  } else {
+    setText('loopCatalyst', 'none in window');
+  }
+  const list = document.getElementById('loopCatalystList');
+  list.innerHTML = (d.catalysts || []).map(c =>
+    `<div>• <strong>${c.type}</strong> on ${c.date} (${c.days_away}d) — ${c.description || ''}</div>`
+  ).join('');
+
+  // Color-code recommendation by leading verb
+  const recEl = document.getElementById('loopRec');
+  recEl.textContent = d.recommendation || '—';
+  const rec = (d.recommendation || '').toUpperCase();
+  if (rec.startsWith('BUY')) recEl.style.color = 'var(--go)';
+  else if (rec.startsWith('SELL') || rec.startsWith('EXIT')) recEl.style.color = 'var(--stop)';
+  else if (rec.startsWith('WAIT')) recEl.style.color = 'var(--warn)';
+  else recEl.style.color = 'var(--text)';
+
+  // Notes (catalyst warnings, etc.)
+  const notes = document.getElementById('loopNotes');
+  notes.innerHTML = (d.notes || []).map(n => `<div>${n}</div>`).join('');
+}
+
+// Dispatch a "watch this symbol, alert me when X" prompt through the
+// chat agent. Uses the current analysis result + the OPERATOR
+// PRE-AUTHORIZED contract so Claude doesn't ask for confirmation.
+function dispatchLoopWatchToChat() {
+  const sym = document.getElementById('loopResultSymbol').textContent;
+  const entry = document.getElementById('loopEntry').textContent;
+  const target = document.getElementById('loopTarget').textContent;
+  const stop = document.getElementById('loopStop').textContent;
+  const cat = document.getElementById('loopCatalyst').textContent;
+  const rec = document.getElementById('loopRec').textContent;
+  if (!sym || sym === '—') return;
+
+  const prompt =
+`Claude, set up a pivot-loop watch on ${sym}:
+
+*** OPERATOR PRE-AUTHORIZED *** (dashboard "Pivot Loop" tab)
+
+Watch parameters (from dashboard analysis):
+  - Lookback window:  ${_loopLookback}d
+  - Suggested entry:  ${entry}
+  - Suggested target: ${target}
+  - Suggested stop:   ${stop}
+  - Next catalyst:    ${cat}
+  - Current rec:      ${rec}
+
+What I need from you:
+  1. Note the levels above; I'll monitor the dashboard for the
+     entry trigger.
+  2. When I tell you to "execute the ${sym} loop entry", place a
+     BUY LMT IOC at the entry price + small buffer, with an
+     attached SELL LMT GTC at the target price (OCA-linked to the
+     entry fill) AND a SELL STP at the stop price (also OCA-linked).
+     Use place_oca_group with confirm=true.
+  3. If the next catalyst is within 2 trading days at execution time,
+     refuse the trade and tell me why -- the loop thesis breaks
+     through earnings/ex-div windows.
+  4. After the entry fills, ntfy me with the fill price and the
+     two attached children so I can verify.
+
+Acknowledge the watch is set and summarize the trigger conditions in
+one line. Don't place any orders yet.`;
+  dispatchToChat(prompt);
 }
 
 /* ============================================================

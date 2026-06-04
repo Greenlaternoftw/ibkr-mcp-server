@@ -33,6 +33,9 @@ dependencies = [
     "pandas>=2.0.0,<3.0.0",
     "pandas_ta==0.4.71b0",
     "numpy>=2.2.6",
+    # Catalyst calendar (earnings, ex-dividend) for the Pivot Loop
+    # analysis. Free, no API key, scraped from Yahoo Finance.
+    "yfinance>=0.2.40",
 ]
 
 [project.optional-dependencies]

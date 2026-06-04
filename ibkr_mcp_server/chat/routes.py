@@ -364,6 +364,65 @@ async def prefs_delete(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def pivot_analysis(request: Request) -> Response:
+    """Pivot-loop analysis for the Command Center "Loop" tab.
+
+    GET /chat/api/pivot/{symbol}?lookback=N
+
+    lookback (default 7) is the number of daily bars to use for pivot
+    low / pivot high / average rise computation. The catalyst feed is
+    queried for events in the next max(lookback, 30) days so the
+    operator can see an event coming even with a short lookback.
+    """
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    if not sym or len(sym) > 8:
+        return JSONResponse({"error": "invalid symbol"}, status_code=400)
+
+    try:
+        lookback = int(request.query_params.get("lookback", "7"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "lookback must be an integer"}, status_code=400)
+    if not (3 <= lookback <= 180):
+        return JSONResponse(
+            {"error": "lookback must be 3-180 days"}, status_code=400
+        )
+
+    from ..client import ibkr_client
+    from .. import pivot as pivot_mod
+    from .. import catalysts as cat_mod
+
+    # Pull a few extra days of buffer (weekends/holidays trim the result).
+    try:
+        bars = await ibkr_client.get_historical_bars(
+            sym, lookback_days=lookback + 5
+        )
+    except Exception as e:
+        logger.exception(f"pivot: historical bars failed for {sym}")
+        return JSONResponse(
+            {"error": f"historical bars failed: {e}"}, status_code=502
+        )
+
+    # Trim to the requested lookback window.
+    if len(bars) > lookback:
+        bars = bars.tail(lookback).reset_index(drop=True)
+
+    # Best-effort catalyst fetch -- yfinance can fail silently; the
+    # pivot analysis still works without it (no catalyst block).
+    catalysts = cat_mod.get_upcoming_catalysts(
+        sym, horizon_days=max(lookback, 30)
+    )
+
+    try:
+        analysis = pivot_mod.analyze_pivot_loop(bars, catalysts)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    out = pivot_mod.to_json_dict(analysis)
+    out["symbol"] = sym
+    out["lookback_days"] = lookback
+    return JSONResponse(out)
+
+
 async def positions(request: Request) -> Response:
     """Current IBKR positions for the active account, shaped for the
     Command Center "Portfolio" tab auto-sync. The client polls this
@@ -1095,6 +1154,7 @@ def chat_routes() -> List:
         # Command Center -- account summary strip
         Route("/chat/api/account/summary", account_summary, methods=["GET"]),
         Route("/chat/api/positions", positions, methods=["GET"]),
+        Route("/chat/api/pivot/{symbol}", pivot_analysis, methods=["GET"]),
         # Command Center -- watchlists / portfolios CRUD
         Route("/chat/api/watchlists", watchlists_list, methods=["GET"]),
         Route("/chat/api/watchlists", watchlists_create, methods=["POST"]),
