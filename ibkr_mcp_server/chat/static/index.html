@@ -2081,9 +2081,9 @@
       <div class="ticket" style="padding:16px;">
         <div class="quick-actions">
           <!-- Ordered by lifecycle: open position → manage profits → exit/cancel -->
-          <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">＋ Buy with Trailing Stop</button>
-          <button class="quick-btn tp" onclick="dispatchQuickAction('sellAllTP')">↑ Take Profits</button>
-          <button class="quick-btn" onclick="dispatchQuickAction('cancel')">Cancel all orders</button>
+          <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">Buy w/ Trailing</button>
+          <button class="quick-btn tp" onclick="dispatchQuickAction('sellAllTP')">Take Profits</button>
+          <button class="quick-btn" onclick="dispatchQuickAction('cancel')">Cancel All</button>
         </div>
         <textarea id="chatExecBox" class="chat-exec-box"
           placeholder='e.g.  Place a BUY 100 NVDA at LMT 178.50 with attached STP at 175.00. Or:  What is the current bid/ask for SPY?  Or:  Cancel order 12345.'
