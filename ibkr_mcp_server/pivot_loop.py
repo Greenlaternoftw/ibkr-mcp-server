@@ -210,6 +210,24 @@ def decide_next_action(
                 action="no_op",
                 reason=f"trend is {analysis.trend_strength} down ({analysis.trend_pct_change}%)",
             )
+        # Broader-market regime gate (Phase E). None means we couldn't
+        # fetch SPY -- skip the gate rather than block trading entirely.
+        # Explicit False means SPY is risk-off; don't fight the tape.
+        if getattr(analysis, "market_regime_enabled", None) is False:
+            return Decision(
+                action="no_op",
+                reason="SPY market regime is risk-off (trend/ADX gate failed)",
+            )
+        # Volume confirmation gate (Phase C). None means bars don't carry
+        # volume (test fixtures or odd ib_async build); skip. False means
+        # recent volume is below the threshold -- low-conviction pivot.
+        if getattr(analysis, "volume_ok", None) is False:
+            vr = getattr(analysis, "volume_ratio", None)
+            return Decision(
+                action="no_op",
+                reason=f"volume confirmation failed (ratio {vr:.2f}× avg)" if vr is not None
+                       else "volume confirmation failed",
+            )
         # Price must be at or near the suggested entry.
         if analysis.current_price > analysis.suggested_entry * 1.005:
             return Decision(

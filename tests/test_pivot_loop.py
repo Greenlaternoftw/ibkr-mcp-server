@@ -30,6 +30,12 @@ def make_analysis(
     trend_pct_change=0.0,
     blocked_by_catalyst=False,
     days_to_next_catalyst=None,
+    # Phase C+E gate fields. Default = unknown (None) so existing
+    # tests that don't care about volume/regime get the no-gate
+    # behavior they expect.
+    volume_ok=None,
+    volume_ratio=None,
+    market_regime_enabled=None,
 ):
     """Build a PivotAnalysis-shaped object (SimpleNamespace duck-types fine
     -- decide_next_action only reads attributes)."""
@@ -43,6 +49,9 @@ def make_analysis(
         trend_pct_change=trend_pct_change,
         blocked_by_catalyst=blocked_by_catalyst,
         days_to_next_catalyst=days_to_next_catalyst,
+        volume_ok=volume_ok,
+        volume_ratio=volume_ratio,
+        market_regime_enabled=market_regime_enabled,
     )
 
 
@@ -183,6 +192,101 @@ class TestWaiting:
         assert d.action == "place_entry"
         assert d.extra["target_price"] == 103.5
         assert d.extra["stop_price"] == 97.5
+
+
+# ---------- Phase C+E engine gates ----------------------------------
+#
+# The pivot.py analysis layer already gates the RECOMMENDATION text on
+# volume + regime; these tests pin down that decide_next_action ALSO
+# honors them when picking the engine's action. Without these, the
+# dashboard would say "WAIT - risk-off" but the engine would still
+# auto-enter on the next tick.
+
+class TestEngineHonorsRegimeAndVolume:
+    def test_regime_risk_off_blocks_entry(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            market_regime_enabled=False,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "regime" in d.reason.lower()
+
+    def test_regime_risk_on_allows_entry(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            market_regime_enabled=True,
+            volume_ok=True,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
+
+    def test_regime_unknown_does_not_block(self):
+        # None → fetch failed; skip the gate (don't lock the operator
+        # out of trading just because SPY data was momentarily unfetchable)
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            market_regime_enabled=None,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
+
+    def test_low_volume_blocks_entry(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            volume_ok=False, volume_ratio=0.55,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "volume" in d.reason.lower()
+        assert "0.55" in d.reason
+
+    def test_volume_unknown_does_not_block(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            volume_ok=None,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
+
+    def test_catalyst_block_takes_precedence_over_regime(self):
+        # Catalyst > regime > volume in the precedence ordering
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            blocked_by_catalyst=True, days_to_next_catalyst=1,
+            market_regime_enabled=False,
+            volume_ok=False, volume_ratio=0.5,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "catalyst" in d.reason.lower()
+
+    def test_downtrend_blocks_before_regime_check(self):
+        # Downtrend guard fires before regime gate
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            trend_direction="down", trend_strength="strong",
+            trend_pct_change=-7.5,
+            market_regime_enabled=False,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        # Operator sees the trend reason (precedence) not the regime
+        assert "down" in d.reason.lower()
 
 
 # ---------- entry_pending → place_oca / revert ----------------------
