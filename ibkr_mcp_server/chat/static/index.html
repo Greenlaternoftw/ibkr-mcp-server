@@ -555,6 +555,26 @@
     border-color: rgba(231, 76, 60, 0.3);
     color: var(--stop);
   }
+  /* Synthetic fill / system messages -- visually distinct so the
+     operator can scan them past the conversation. Compact, gray,
+     monospace, centered. Tinted green on BUY, red on SELL. */
+  .chat-message.fill {
+    background: rgba(148, 163, 184, 0.10);
+    color: var(--text-2);
+    border: 1px dashed var(--hairline-2);
+    border-radius: 6px;
+    padding: 6px 10px;
+    align-self: center;
+    max-width: 92%;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    box-shadow: none;
+    line-height: 1.4;
+    text-align: center;
+  }
+  .chat-message.fill.buy  { color: var(--go);   border-color: rgba(21, 128, 61, 0.35); }
+  .chat-message.fill.sell { color: var(--stop); border-color: rgba(231, 76, 60, 0.35); }
   .chat-message img.attachment {
     display: block;
     max-width: 100%;
@@ -5639,6 +5659,16 @@ function renderChatMessages() {
       }).join('');
     }
     if (m._loading) body = '<em>thinking…</em>';
+    // Synthetic fill messages (pushed by _on_fill_for_chat in client.py)
+    // get distinct styling so they don't read like operator text. The
+    // marker prefix is consistent: "🟢 FILL ·" for buys, "🔴 FILL ·"
+    // for sells, both followed by structured fields.
+    const rawText = typeof m.content === 'string' ? m.content : '';
+    if (m.role === 'user' && rawText.startsWith('🟢 FILL')) {
+      cls = 'fill buy';
+    } else if (m.role === 'user' && rawText.startsWith('🔴 FILL')) {
+      cls = 'fill sell';
+    }
     return `<div class="chat-message ${cls}">${body}</div>`;
   }).join('');
   container.scrollTop = container.scrollHeight;
