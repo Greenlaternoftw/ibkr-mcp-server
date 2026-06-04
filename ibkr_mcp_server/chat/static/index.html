@@ -3938,6 +3938,8 @@ function summarizeStockData(r) {
   const biasFactor = 1 - state.BIAS_ADJUSTMENT_PCT;
   const adj30 = has30 ? im['30d'] * biasFactor : null;
 
+  const proj30Low  = adj30 != null ? r.currentPrice * (1 - adj30) : null;
+  const proj30High = adj30 != null ? r.currentPrice * (1 + adj30) : null;
   return {
     symbol: r.symbol,
     rating: rating,
@@ -3946,8 +3948,14 @@ function summarizeStockData(r) {
     potentialMovePct: r.currentPrice
       ? ((targetPrice - r.currentPrice) / r.currentPrice) * 100
       : 0,
-    projection30dLow:  adj30 != null ? r.currentPrice * (1 - adj30) : null,
-    projection30dHigh: adj30 != null ? r.currentPrice * (1 + adj30) : null,
+    // The 30D column reads s.range = [low, high]. _persistStockMetrics
+    // writes range_low/range_high from summary.range. The summary used
+    // to expose this as projection30dLow/High (different names), so
+    // persistence quietly stored nulls and the 30D column always blanked.
+    // Map once here so all three names point at the same numbers.
+    range: (proj30Low != null && proj30High != null) ? [proj30Low, proj30High] : null,
+    projection30dLow:  proj30Low,
+    projection30dHigh: proj30High,
     projection30dAdjPct: adj30 != null ? adj30 * 100 : null,
     gatePassed: gatePassed,
     lastUpdated: new Date().toISOString(),
