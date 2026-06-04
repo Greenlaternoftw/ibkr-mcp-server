@@ -2353,6 +2353,11 @@
             </div>
 
             <div class="qx-construct-row">
+              <span class="qx-c-key">Realized vol (IV proxy)</span>
+              <span class="qx-c-val" id="loopRvol">—</span>
+            </div>
+
+            <div class="qx-construct-row">
               <span class="qx-c-key">SPY market regime</span>
               <span class="qx-c-val" id="loopRegime">—</span>
             </div>
@@ -5186,6 +5191,22 @@ function _renderPivotResult(d) {
     } else {
       volEl.textContent = `⚠ ${d.volume_ratio.toFixed(2)}× avg (low conviction)`;
       volEl.style.color = 'var(--stop)';
+    }
+  }
+
+  // Realized-vol "IV proxy" row (Phase D). Three states:
+  //   null = not enough bars   true = vol stable   false = vol expanding
+  const rvolEl = document.getElementById('loopRvol');
+  if (rvolEl) {
+    if (d.vol_ok === null || d.vol_ok === undefined) {
+      rvolEl.textContent = '—';
+      rvolEl.style.color = 'var(--muted)';
+    } else if (d.vol_ok) {
+      rvolEl.textContent = `✓ ${d.recent_vol_pct}% recent vs ${d.lookback_vol_pct}% avg (${d.vol_ratio.toFixed(2)}×)`;
+      rvolEl.style.color = 'var(--go)';
+    } else {
+      rvolEl.textContent = `⚠ ${d.recent_vol_pct}% recent vs ${d.lookback_vol_pct}% avg (${d.vol_ratio.toFixed(2)}× expanding)`;
+      rvolEl.style.color = 'var(--stop)';
     }
   }
 

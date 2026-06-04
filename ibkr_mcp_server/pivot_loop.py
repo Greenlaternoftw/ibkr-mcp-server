@@ -218,6 +218,16 @@ def decide_next_action(
                 action="no_op",
                 reason="SPY market regime is risk-off (trend/ADX gate failed)",
             )
+        # Realized-vol "IV proxy" gate (Phase D). vol_ok=False means
+        # recent realized vol has expanded vs baseline -- likely an
+        # event being priced in even without a named catalyst.
+        if getattr(analysis, "vol_ok", None) is False:
+            vr = getattr(analysis, "vol_ratio", None)
+            return Decision(
+                action="no_op",
+                reason=f"realized vol expanding (ratio {vr:.2f}× baseline)" if vr is not None
+                       else "realized vol expanding above threshold",
+            )
         # Volume confirmation gate (Phase C). None means bars don't carry
         # volume (test fixtures or odd ib_async build); skip. False means
         # recent volume is below the threshold -- low-conviction pivot.

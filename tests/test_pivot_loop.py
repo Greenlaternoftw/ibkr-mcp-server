@@ -36,6 +36,8 @@ def make_analysis(
     volume_ok=None,
     volume_ratio=None,
     market_regime_enabled=None,
+    vol_ok=None,
+    vol_ratio=None,
 ):
     """Build a PivotAnalysis-shaped object (SimpleNamespace duck-types fine
     -- decide_next_action only reads attributes)."""
@@ -52,6 +54,8 @@ def make_analysis(
         volume_ok=volume_ok,
         volume_ratio=volume_ratio,
         market_regime_enabled=market_regime_enabled,
+        vol_ok=vol_ok,
+        vol_ratio=vol_ratio,
     )
 
 
@@ -272,6 +276,41 @@ class TestEngineHonorsRegimeAndVolume:
                                           last_3_cycles_losses=0)
         assert d.action == "no_op"
         assert "catalyst" in d.reason.lower()
+
+    def test_vol_expansion_blocks_entry(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            vol_ok=False, vol_ratio=1.85,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "vol" in d.reason.lower()
+        assert "1.85" in d.reason
+
+    def test_vol_unknown_does_not_block(self):
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            vol_ok=None,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "place_entry"
+
+    def test_regime_takes_precedence_over_vol_expansion(self):
+        # Regime check fires first in the precedence ordering
+        loop = make_loop(status="waiting")
+        a = make_analysis(
+            current_price=100.0, suggested_entry=100.0,
+            market_regime_enabled=False,
+            vol_ok=False, vol_ratio=2.0,
+        )
+        d = pivot_loop.decide_next_action(loop, a, has_open_position=False,
+                                          last_3_cycles_losses=0)
+        assert d.action == "no_op"
+        assert "regime" in d.reason.lower()
 
     def test_downtrend_blocks_before_regime_check(self):
         # Downtrend guard fires before regime gate

@@ -78,6 +78,15 @@ class PivotAnalysis:
     # supply a regime result; True/False otherwise.
     market_regime_enabled: Optional[bool] = None
 
+    # Realized-volatility "IV proxy" (Phase D). Stdev of daily returns;
+    # we compare a short recent window vs the full window. When the
+    # recent ratio is unusually high, an event is probably being priced
+    # in even if we can't see a named catalyst on the calendar.
+    recent_vol_pct: Optional[float] = None        # stdev of last 5 returns
+    lookback_vol_pct: Optional[float] = None      # stdev of full window
+    vol_ratio: Optional[float] = None             # recent / lookback
+    vol_ok: Optional[bool] = None                 # ratio <= max_vol_ratio
+
     recommendation: str = ""         # BUY / WAIT / HOLD / SELL / EXIT-CATALYST
     notes: List[str] = field(default_factory=list)
 
@@ -194,6 +203,58 @@ def _compute_volume_stats(bars, min_volume_ratio: float) -> Dict[str, Any]:
     }
 
 
+def _compute_vol_stats(bars, max_vol_ratio: float) -> Dict[str, Any]:
+    """Realized-volatility 'IV proxy' (Phase D).
+
+    True implied volatility requires options-chain data (paid, slow).
+    A close-second proxy: realized vol expansion. When the recent
+    short-window stdev of daily returns spikes vs the full-window
+    baseline, an event is being priced in even if we can't see a
+    named catalyst on the calendar (M&A rumor, sector blow-up,
+    macro surprise, etc).
+
+    Refuses entry when ``recent_vol / lookback_vol`` >= ``max_vol_ratio``
+    (default 1.5 -- recent vol is 50% above its own baseline).
+
+    Computed as % stdev: returns the value as a percentage so the
+    operator-facing display reads naturally ("2.4% recent vs 1.6% avg").
+
+    Returns dict shaped:
+      {recent_vol_pct, lookback_vol_pct, vol_ratio, vol_ok}
+    """
+    if len(bars) < 4:
+        return {
+            "recent_vol_pct": None, "lookback_vol_pct": None,
+            "vol_ratio": None, "vol_ok": None,
+        }
+    try:
+        closes = bars["close"].astype(float)
+        # Daily simple returns; pandas pct_change gives us one NaN at [0].
+        returns = closes.pct_change().dropna()
+        if len(returns) < 3:
+            return {
+                "recent_vol_pct": None, "lookback_vol_pct": None,
+                "vol_ratio": None, "vol_ok": None,
+            }
+        # Full-window vol = stdev of all returns.
+        lookback_vol = float(returns.std()) * 100.0
+        # Recent vol = stdev of last 5 returns (or all if window is shorter).
+        recent_window = min(5, len(returns))
+        recent_vol = float(returns.tail(recent_window).std()) * 100.0
+        ratio = recent_vol / lookback_vol if lookback_vol > 0 else 0.0
+        return {
+            "recent_vol_pct": round(recent_vol, 3),
+            "lookback_vol_pct": round(lookback_vol, 3),
+            "vol_ratio": round(ratio, 3),
+            "vol_ok": bool(ratio <= max_vol_ratio),
+        }
+    except Exception:
+        return {
+            "recent_vol_pct": None, "lookback_vol_pct": None,
+            "vol_ratio": None, "vol_ok": None,
+        }
+
+
 def analyze_pivot_loop(
     bars,
     catalysts: Optional[List[Dict[str, Any]]] = None,
@@ -202,6 +263,7 @@ def analyze_pivot_loop(
     stop_buffer_pct: float = 0.03,
     catalyst_horizon_days: int = 2,
     min_volume_ratio: float = 0.8,
+    max_vol_ratio: float = 1.5,
     market_regime_enabled: Optional[bool] = None,
 ) -> PivotAnalysis:
     """Compute the pivot-loop analysis from a bars DataFrame + catalyst list.
@@ -291,8 +353,10 @@ def analyze_pivot_loop(
             f"⚠️ {c['type']} on {c['date']} ({c['days_away']}d away) — "
             "exit before this"
         )
-    # Volume + market-regime gates (Phases C + E).
+    # Volume + market-regime gates (Phases C + E) + realized-vol "IV
+    # proxy" (Phase D).
     vol_stats = _compute_volume_stats(bars, min_volume_ratio)
+    rvol_stats = _compute_vol_stats(bars, max_vol_ratio)
 
     # Trend annotation -- always surface so the operator sees what
     # adjustment the algo made.
@@ -307,6 +371,14 @@ def analyze_pivot_loop(
         notes.append(
             f"⚠️ volume ratio {vol_stats['volume_ratio']:.2f} below "
             f"{min_volume_ratio:.2f} -- recent bars are low-conviction"
+        )
+    if rvol_stats["vol_ok"] is False:
+        notes.append(
+            f"⚠️ realized volatility expanding: recent "
+            f"{rvol_stats['recent_vol_pct']}% vs {rvol_stats['lookback_vol_pct']}% "
+            f"baseline (ratio {rvol_stats['vol_ratio']:.2f}× > "
+            f"{max_vol_ratio:.2f}× threshold) -- unseen event risk likely "
+            "being priced in"
         )
     if market_regime_enabled is False:
         notes.append(
@@ -342,6 +414,13 @@ def analyze_pivot_loop(
         recommendation = (
             "WAIT — broader market regime risk-off; don't fight the "
             "tape on a mean-reversion entry"
+        )
+    elif rvol_stats["vol_ok"] is False:
+        # Phase D -- realized vol expansion = unseen event being priced in.
+        recommendation = (
+            f"WAIT — realized vol expanding "
+            f"({rvol_stats['vol_ratio']:.2f}× baseline); event likely "
+            "being priced in even without a named catalyst"
         )
     elif vol_stats["volume_ok"] is False:
         # Low volume = institutions aren't participating. Pivot
@@ -392,6 +471,10 @@ def analyze_pivot_loop(
         volume_ratio=vol_stats["volume_ratio"],
         volume_ok=vol_stats["volume_ok"],
         market_regime_enabled=market_regime_enabled,
+        recent_vol_pct=rvol_stats["recent_vol_pct"],
+        lookback_vol_pct=rvol_stats["lookback_vol_pct"],
+        vol_ratio=rvol_stats["vol_ratio"],
+        vol_ok=rvol_stats["vol_ok"],
         recommendation=recommendation,
         notes=notes,
     )

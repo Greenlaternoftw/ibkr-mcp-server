@@ -338,6 +338,64 @@ class TestRegimeGate:
         assert any("market regime" in n.lower() for n in a.notes)
 
 
+class TestVolExpansionGate:
+    """Phase D -- realized vol expansion blocks new entries (IV proxy)."""
+
+    def _bars_with_returns(self, return_pcts):
+        """Synthesise close prices that produce the given % returns.
+        Returns a flat-trend bars DataFrame at the pivot low so the
+        recommendation only blocks on the vol gate."""
+        closes = [100.0]
+        for r in return_pcts:
+            closes.append(closes[-1] * (1 + r / 100))
+        rows = [(c + 1, c - 1, c) for c in closes]
+        return pd.DataFrame(rows, columns=["high", "low", "close"])
+
+    def test_calm_vol_passes(self):
+        # Mix of small +/- returns -- recent and lookback std are similar
+        # (alternating +/-0.5% has the same stdev across any subwindow)
+        bars = self._bars_with_returns([0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5])
+        a = pivot.analyze_pivot_loop(bars)
+        # Vol stats populated, ratio close to 1.0, vol_ok True
+        assert a.vol_ok is True
+        assert a.vol_ratio == pytest.approx(1.0, abs=0.15)
+
+    def test_expanding_vol_blocks(self):
+        # Long calm history + wild recent. Recent window (5) is all wild;
+        # lookback (20) is mostly calm. Ratio clears 1.5×.
+        bars = self._bars_with_returns(
+            [0.1, -0.1] * 8 + [8.0, -8.0, 8.0, -8.0]
+        )
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.vol_ratio > 1.5, f"got vol_ratio={a.vol_ratio}"
+        assert a.vol_ok is False
+        assert "vol" in a.recommendation.lower()
+
+    def test_custom_max_vol_ratio_strict(self):
+        # Stricter threshold blocks a setup the default would pass
+        bars = self._bars_with_returns([0.5, -0.5, 0.5, -0.5, 0.7, -0.7, 0.7, -0.7])
+        a_default = pivot.analyze_pivot_loop(bars)
+        assert a_default.vol_ok is True   # ratio ~1.4 -- under default 1.5
+        a_strict = pivot.analyze_pivot_loop(bars, max_vol_ratio=1.0)
+        assert a_strict.vol_ok is False   # over the stricter 1.0 threshold
+
+    def test_too_few_bars_skips_gate(self):
+        # 3 bars -> 2 returns -> not enough; gate disabled
+        bars = pd.DataFrame(
+            [(101, 99, 100), (101, 99, 100), (101, 99, 100)],
+            columns=["high", "low", "close"],
+        )
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.vol_ok is None
+
+    def test_vol_annotation_in_notes_when_blocked(self):
+        bars = self._bars_with_returns(
+            [0.1, -0.1] * 8 + [8.0, -8.0, 8.0, -8.0]
+        )
+        a = pivot.analyze_pivot_loop(bars)
+        assert any("realized vol" in n.lower() for n in a.notes)
+
+
 class TestCombinedGates:
     """Both gates together -- the realistic Phase C+E scenario."""
 
