@@ -1996,6 +1996,8 @@
       <input id="portfolioAddInput" class="portfolio-add-input" placeholder="Add ticker..." maxlength="6" autocomplete="off"
              onkeydown="if(event.key==='Enter') addStockToActivePortfolio();" />
       <button class="portfolio-btn primary" onclick="addStockToActivePortfolio()" id="portfolioAddBtn">Add Stock</button>
+      <button class="portfolio-btn" onclick="manualSyncPositions()" id="syncNowBtn" title="Pull latest IBKR positions into all portfolio-type tabs immediately">⟳ Sync from IBKR</button>
+      <span id="syncStatus" class="label" style="margin-left:8px; color:var(--text-2); text-transform:none; letter-spacing:0;"></span>
     </div>
     <table class="portfolio-table">
       <thead>
@@ -5048,13 +5050,27 @@ function startAccountSummaryPolling() {
 const POSITIONS_REFRESH_INTERVAL_MS = 30 * 1000;
 let _positionsTimer = null;
 
+// Track sync state so the status indicator stays accurate across
+// auto-tick AND manual taps.
+let _lastSyncAt = null;
+let _lastSyncError = null;
+
+function _updateSyncStatus(msg, color) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = color || 'var(--text-2)';
+}
+
 async function refreshPositions() {
   let positions = [];
   try {
     const r = await daemonGet('/chat/api/positions');
     positions = r.positions || [];
+    _lastSyncError = null;
   } catch (e) {
-    // Quiet failure -- IBKR disconnect, market closed, etc.
+    _lastSyncError = e.message || 'fetch failed';
+    _updateSyncStatus('✗ sync failed: ' + _lastSyncError, 'var(--stop)');
     return;
   }
 
@@ -5109,7 +5125,25 @@ async function refreshPositions() {
     }
   }
 
-  if (mutated) renderPortfolios();
+  _lastSyncAt = new Date();
+  const hh = _lastSyncAt.getHours().toString().padStart(2, '0');
+  const mm = _lastSyncAt.getMinutes().toString().padStart(2, '0');
+  const ss = _lastSyncAt.getSeconds().toString().padStart(2, '0');
+  _updateSyncStatus(`✓ synced ${live.size} position${live.size === 1 ? '' : 's'} at ${hh}:${mm}:${ss}`,
+                    'var(--go)');
+  // Always render -- even if nothing mutated, the status indicator
+  // above lets the operator see the poller IS running.
+  renderPortfolios();
+}
+
+// Manual trigger from the "⟳ Sync from IBKR" button. Useful as a
+// diagnostic when the operator expects positions but doesn't see them.
+async function manualSyncPositions() {
+  const btn = document.getElementById('syncNowBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Syncing…'; }
+  _updateSyncStatus('checking IBKR…', 'var(--accent)');
+  await refreshPositions();
+  if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync from IBKR'; }
 }
 
 function startPositionsPolling() {
