@@ -1349,6 +1349,32 @@
     gap: 6px;
     margin-bottom: 12px;
   }
+  /* Variant for the dashboard chat-exec row (3 buttons). Forces all
+     three onto a single line on iPhone by sharing width equally and
+     suppressing wrap. The chat-view's 6-button quick-actions row does
+     NOT get this -- it intentionally wraps on narrow screens. */
+  .quick-actions--fit {
+    flex-wrap: nowrap;
+  }
+  .quick-actions--fit .quick-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    white-space: nowrap;
+    text-align: center;
+    padding-left: 6px;
+    padding-right: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* On the narrowest screens, shrink the letter-spacing + font slightly
+     so "BUY W/ TRAILING" fits without truncating. */
+  @media (max-width: 420px) {
+    .quick-actions--fit .quick-btn {
+      font-size: 9px;
+      letter-spacing: 0.04em;
+      padding: 6px 4px;
+    }
+  }
   .quick-btn {
     background: var(--surface);
     border: 1px solid var(--hairline);
@@ -2079,8 +2105,9 @@
         <span class="label" style="color:var(--text-2); text-transform:none; letter-spacing:0;">type → copy → paste to Claude</span>
       </div>
       <div class="ticket" style="padding:16px;">
-        <div class="quick-actions">
-          <!-- Ordered by lifecycle: open position → manage profits → exit/cancel -->
+        <div class="quick-actions quick-actions--fit">
+          <!-- Ordered by lifecycle: open position → manage profits → exit/cancel.
+               The --fit modifier forces all three onto one row on iPhone. -->
           <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">Buy w/ Trailing</button>
           <button class="quick-btn tp" onclick="dispatchQuickAction('sellAllTP')">Take Profits</button>
           <button class="quick-btn" onclick="dispatchQuickAction('cancel')">Cancel All</button>
