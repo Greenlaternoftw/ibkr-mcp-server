@@ -2082,7 +2082,7 @@
         <div class="quick-actions">
           <button class="quick-btn tp" onclick="dispatchQuickAction('sellAllTP')">↑ Take Profits</button>
           <button class="quick-btn" onclick="dispatchQuickAction('cancel')">Cancel all orders</button>
-          <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">＋ Buy with Stop Loss</button>
+          <button class="quick-btn" onclick="openBuyStop()" style="background:var(--go); color:#fff; border-color:var(--go);">＋ Buy with Trailing Stop</button>
         </div>
         <textarea id="chatExecBox" class="chat-exec-box"
           placeholder='e.g.  Place a BUY 100 NVDA at LMT 178.50 with attached STP at 175.00. Or:  What is the current bid/ask for SPY?  Or:  Cancel order 12345.'
@@ -4640,28 +4640,33 @@ function executeBuyStop() {
     return;
   }
 
-  // Compose a complete BUY-with-attached-STP order command. Claude
+  // Compose a complete BUY-with-attached-TRAIL order command. Claude
   // calls place_oca_group (or place_order with attached child) on the
   // daemon side; the confirmation gate intercepts before transmit.
-  const stopMult = (1 - stopPct / 100).toFixed(4);
+  // TRAIL is supported in this codebase for both BUY and SELL actions
+  // (orders.py: ot in ("TRAIL", "TRAIL LIMIT")) -- the child is a
+  // SELL TRAIL that locks in gains as the post-fill price rises.
+  const initialStopMult = (1 - stopPct / 100).toFixed(4);
   const portfolioName = portfolios.active || 'active account';
   const command =
-`Claude, execute a PROTECTED BUY via the ibkr MCP — enter ${sym} with a hard stop loss attached:
+`Claude, execute a PROTECTED BUY via the ibkr MCP — enter ${sym} with a TRAILING stop loss attached:
 
 Position
   symbol:           ${sym}
   side:             BUY
   target notional:  $${dollar.toLocaleString()}
-  source:           Dashboard "Buy with Stop Loss" · ${portfolioName} tab
-  stop loss:        ${stopPct}% below fill price (HARD STOP, not trailing)
+  source:           Dashboard "Buy with Trailing Stop" · ${portfolioName} tab
+  protection:       SELL TRAIL ${stopPct}% (adjusts UP only, never down)
 
 Order strategy
   Parent: LMT IOC at ask + 0.30% (min $0.10 buffer), routed through
   IBKR Adaptive Algorithm with priority=Urgent. Sizing:
   floor(target_notional / live_ask). Integer shares.
 
-  Attached child: STP at <fill_price × ${stopMult}>, GTC, OCA-linked
-  to the parent fill. Triggers a market sell if price crosses below.
+  Attached child: SELL TRAIL trail_percent=${stopPct}, GTC, OCA-linked
+  to the parent fill. IBKR tracks the post-fill high-water and triggers
+  a market sell when price reverses by ${stopPct}% from that high.
+  Locks in gains automatically as price rises.
 
 IBKR primitives — parent BUY
   order_type:       LMT
@@ -4673,9 +4678,11 @@ IBKR primitives — parent BUY
   routing:          SMART
   outside_rth:      false
 
-IBKR primitives — attached STP child
-  order_type:       STP
-  stop_price:       <fill_price> × ${stopMult}
+IBKR primitives — attached SELL TRAIL child
+  action:           SELL
+  order_type:       TRAIL
+  trail_percent:    ${stopPct}    (use trail_percent, NOT trail_amount)
+  trail_stop_price: <fill_price> × ${initialStopMult}   (initial trigger; IBKR ratchets up only)
   tif:              GTC
   parent_id:        <buy order id>
   oca_group:        ${sym}_BS_${Date.now()}
@@ -4687,20 +4694,25 @@ Execution steps
   3) Calculate shares: floor($${dollar.toLocaleString()} / limit)
   4) Place parent LMT IOC with Adaptive(Urgent)
   5) If parent CANCELLED (no fill): retry once at ask + 0.50%, then escalate to MKT
-  6) On parent FILL: immediately place attached STP child at fill_price × ${stopMult}
-  7) Confirm: parent fill price, shares, attached STP placed + active
+  6) On parent FILL: immediately place attached SELL TRAIL child with
+     trail_percent=${stopPct}, trail_stop_price = fill_price × ${initialStopMult}
+  7) Confirm: parent fill price, shares filled, attached TRAIL placed + active
   8) Add ${sym} to the Portfolio tab (auto-sync should pick it up within 30s)
 
 Risk envelope
-  Max risk: $${(dollar * stopPct / 100).toFixed(2)} (${stopPct}% of capital deployed).
+  Initial max risk: $${(dollar * stopPct / 100).toFixed(2)} (${stopPct}% of capital deployed)
+    -- AT ENTRY only. As price rises, trail ratchets up and locked-in
+    gain replaces this number.
   Max slippage on entry: 0.75% from reference.
-  Stop is HARD (STP, not TRAIL) -- will not adjust upward on profit.
-  If you want trailing, ask separately or run start_swing_strategy after fill.`;
+  Stop is TRAILING: adjusts UP as price rises, never down. If price
+  rises 10% and then reverses, the SELL fires at high − ${stopPct}%,
+  preserving the run-up minus one trail width of give-back.
+  For a HARD fixed stop instead, ask separately ("buy with hard stop").`;
 
   closeBuyStop();
   const hint = document.getElementById('chatExecHint');
   if (hint) {
-    hint.innerHTML = `<span style="color:var(--go); font-weight:600;">→ Dispatching BUY+STOP ${sym} ($${dollar.toLocaleString()}, stop ${stopPct}%) to Claude…</span> confirm in the chat panel.`;
+    hint.innerHTML = `<span style="color:var(--go); font-weight:600;">→ Dispatching BUY+TRAIL ${sym} ($${dollar.toLocaleString()}, trail ${stopPct}%) to Claude…</span> confirm in the chat panel.`;
     setTimeout(() => { hint.textContent = ''; }, 8000);
   }
   dispatchToChat(command);
@@ -5570,13 +5582,13 @@ pinLoadConfig();
 </div>
 
 <!-- ============ SETTINGS MODAL ============ -->
-<!-- ============ BUY WITH STOP LOSS OVERLAY ============ -->
+<!-- ============ BUY WITH TRAILING STOP LOSS OVERLAY ============ -->
 <div class="qx-overlay" id="buyStopOverlay" onclick="if(event.target===this) closeBuyStop()">
   <div class="qx-modal" style="border-top-color: var(--go); max-width: 460px;" role="dialog" aria-labelledby="bsTitle">
     <div class="qx-header">
       <div>
-        <div class="qx-eyebrow" style="color: var(--go);">BUY + STOP LOSS</div>
-        <h2 class="qx-title" id="bsTitle">New protected entry</h2>
+        <div class="qx-eyebrow" style="color: var(--go);">BUY + TRAILING STOP</div>
+        <h2 class="qx-title" id="bsTitle">New protected entry (trailing)</h2>
       </div>
       <button class="qx-close" onclick="closeBuyStop()" aria-label="Close">✕</button>
     </div>
@@ -5594,12 +5606,12 @@ pinLoadConfig();
                onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('bsStopPct').focus();}" />
       </div>
       <div class="qx-row">
-        <label class="qx-label" for="bsStopPct">Stop loss (% below entry)</label>
+        <label class="qx-label" for="bsStopPct">Trailing stop (% below high-water)</label>
         <input type="number" id="bsStopPct" class="qx-qty-input" placeholder="8" step="0.5" min="0.5" max="50"
                value="8" inputmode="decimal"
                onkeydown="if(event.key==='Enter'){event.preventDefault();executeBuyStop();}" />
         <div style="margin-top:6px; font-size:11px; color: var(--text-2); line-height:1.5;">
-          Hard stop only -- order placed as an attached STP child, no trailing. Common values: 5% for tight risk, 8% standard, 12% wide swing.
+          TRAIL child order — adjusts UP as price rises (locks in gains), never down. Triggers a market sell when price reverses by this % from the post-fill high. Common values: 5% tight, 8% standard, 12% wide swing.
         </div>
         <div id="bsError" style="margin-top:10px; font-size:12px; color: var(--stop); min-height:14px;"></div>
       </div>
