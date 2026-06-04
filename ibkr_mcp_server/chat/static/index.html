@@ -5093,12 +5093,14 @@ async function refreshPositions() {
       if (!wl.stocks[sym]) {
         try { await daemonPost(`/chat/api/watchlists/${wl.id}/stocks`, { symbol: sym }); }
         catch (_) { /* may 409 if a sibling tab already added; harmless */ }
+        const initPx = (p.market_price && p.market_price > 0) ? p.market_price : null;
         wl.stocks[sym] = {
           symbol: sym,
           rating: null,
-          currentPrice: p.market_price ?? null,
+          currentPrice: initPx,
           targetPrice: null,
           range: null,
+          potentialMovePct: null,
           updatedAt: new Date().toISOString(),
         };
         mutated = true;
@@ -5110,8 +5112,17 @@ async function refreshPositions() {
       const px = (p.market_price && p.market_price > 0) ? p.market_price : null;
       if (px !== null && s.currentPrice !== px) {
         s.currentPrice = px;
-        s.updatedAt = new Date().toISOString();
         mutated = true;
+      }
+      // Always refresh the Updated timestamp -- so the operator can see
+      // the row is being touched by auto-sync even when the price is
+      // stable. Otherwise "Updated" stays empty on freshly-added rows.
+      s.updatedAt = new Date().toISOString();
+      // Recompute potential move when both target and current are known.
+      // (Previously only refreshOneStock did this; auto-sync silently
+      // left s.potentialMovePct stale or undefined.)
+      if (s.targetPrice && s.currentPrice) {
+        s.potentialMovePct = ((s.targetPrice - s.currentPrice) / s.currentPrice) * 100;
       }
       s.quantity = p.quantity;
       s.avgCost = p.avg_cost;
