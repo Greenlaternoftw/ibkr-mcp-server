@@ -2764,12 +2764,31 @@ class IBKRClient:
         except Exception as e:
             self.logger.debug(f"pivot-loop {symbol}: news fetch failed: {e}")
             news = None
+        # Per-loop tunables (Phase 6). Fall back to the function-level
+        # defaults when None -- the loop row may have these unset for
+        # symbols the operator hasn't customized.
+        kwargs_overrides = {}
+        if loop.get("min_volume_ratio") is not None:
+            kwargs_overrides["min_volume_ratio"] = float(loop["min_volume_ratio"])
+        if loop.get("max_vol_ratio") is not None:
+            kwargs_overrides["max_vol_ratio"] = float(loop["max_vol_ratio"])
+        # news threshold is applied by news_sentiment.evaluate_sentiment;
+        # if the operator set a custom threshold, re-evaluate here.
+        if (news is not None
+                and loop.get("news_block_threshold") is not None):
+            from . import news_sentiment as news_mod
+            news = dict(news)  # shallow copy so we don't mutate cache
+            news["sentiment_ok"] = news_mod.evaluate_sentiment(
+                news.get("score"),
+                block_threshold=int(loop["news_block_threshold"]),
+            )
         try:
             analysis = pivot_mod.analyze_pivot_loop(
                 bars, catalysts,
                 catalyst_horizon_days=loop["catalyst_horizon_days"],
                 market_regime_enabled=market_regime_enabled,
                 news_sentiment=news,
+                **kwargs_overrides,
             )
         except ValueError as e:
             self.logger.warning(f"pivot-loop {symbol}: analysis failed: {e}")

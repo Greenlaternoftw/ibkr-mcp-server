@@ -2323,6 +2323,38 @@
           </div>
         </div>
 
+        <!-- Advanced gate-threshold tunables (Phase 6). Collapsed by
+             default; expand only if the operator needs to tune per-
+             symbol sensitivity. Leaving them blank uses daemon defaults. -->
+        <details style="margin-bottom:14px; font-size:11px;">
+          <summary style="cursor:pointer; color:var(--text-2); padding:6px 0;">
+            ⚙ Advanced gate thresholds (optional — leave blank for daemon defaults)
+          </summary>
+          <div class="field-row" style="margin-top:8px;">
+            <div class="col">
+              <label>Min volume ratio</label>
+              <input id="loopMinVolumeRatio" type="number" step="0.1" min="0.1" max="10"
+                     placeholder="0.8 (default)" />
+            </div>
+            <div class="col">
+              <label>Max vol ratio</label>
+              <input id="loopMaxVolRatio" type="number" step="0.1" min="1.1" max="10"
+                     placeholder="1.5 (default)" />
+            </div>
+            <div class="col">
+              <label>News block threshold</label>
+              <input id="loopNewsThreshold" type="number" step="1" min="-50" max="0"
+                     placeholder="-5 (default)" />
+            </div>
+          </div>
+          <div style="font-size:10px; color:var(--muted); line-height:1.5; margin-top:4px;">
+            Lower min-volume = looser volume gate. Higher max-vol = tolerates more recent
+            vol expansion. Lower (more negative) news threshold = needs worse news to block.
+            Persisted per-loop in SQLite; applied by both the dashboard "Analyze" button
+            and the autonomous engine tick.
+          </div>
+        </details>
+
         <button class="submit-btn" style="width:100%; padding:11px;"
                 onclick="runPivotAnalysis()" id="loopAnalyzeBtn">
           Analyze Pivot Loop
@@ -5358,9 +5390,20 @@ async function dispatchLoopWatchToChat() {
   const compound = _loopReadCompound();
 
   _loopHint('Creating SQLite-backed loop record…', 'var(--accent)');
+  // Read the advanced-threshold inputs; only include in POST if set
+  // (so undefined = "use daemon default" on the server side).
+  const _readOpt = (id) => {
+    const v = document.getElementById(id)?.value;
+    if (v === undefined || v === null || v === '') return undefined;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const minVR = _readOpt('loopMinVolumeRatio');
+  const maxVR = _readOpt('loopMaxVolRatio');
+  const newsT = _readOpt('loopNewsThreshold');
   let loop;
   try {
-    loop = await daemonPost('/chat/api/loops', {
+    const body = {
       symbol: sym,
       initial_capital: capital,
       lookback_days: _loopLookback,
@@ -5371,7 +5414,11 @@ async function dispatchLoopWatchToChat() {
       catalyst_horizon_days: 2,
       max_drawdown_pct: 50,
       client_id: DAEMON_CLIENT_ID,
-    });
+    };
+    if (minVR !== undefined) body.min_volume_ratio = minVR;
+    if (maxVR !== undefined) body.max_vol_ratio = maxVR;
+    if (newsT !== undefined) body.news_block_threshold = Math.round(newsT);
+    loop = await daemonPost('/chat/api/loops', body);
   } catch (e) {
     if (e.status === 409) {
       _loopHint(`A loop already exists for ${sym}. Stop it first.`, 'var(--stop)');

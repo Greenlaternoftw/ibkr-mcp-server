@@ -430,6 +430,9 @@ async def pivot_loops_create(request: Request) -> Response:
             stop_price=body.get("stop_price"),
             catalyst_horizon_days=int(body.get("catalyst_horizon_days", 2)),
             max_drawdown_pct=float(body.get("max_drawdown_pct", 50.0)),
+            min_volume_ratio=body.get("min_volume_ratio"),
+            max_vol_ratio=body.get("max_vol_ratio"),
+            news_block_threshold=body.get("news_block_threshold"),
             notes=body.get("notes"),
         )
     except ValueError as e:

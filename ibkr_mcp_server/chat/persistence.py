@@ -256,6 +256,14 @@ class ChatStore:
                     cumulative_realized      REAL NOT NULL DEFAULT 0,
                     catalyst_horizon_days    INTEGER NOT NULL DEFAULT 2,
                     max_drawdown_pct         REAL NOT NULL DEFAULT 50.0,
+                    -- Per-loop gate tunables (Phase 6).  Each loop carries
+                    -- its own thresholds for the volume / realized-vol /
+                    -- news gates so different symbols can run different
+                    -- sensitivities. NULL = use the daemon default
+                    -- (passed through to analyze_pivot_loop's kwargs).
+                    min_volume_ratio         REAL,
+                    max_vol_ratio            REAL,
+                    news_block_threshold     INTEGER,
                     notes                    TEXT,
                     created_at               TEXT NOT NULL,
                     updated_at               TEXT NOT NULL,
@@ -264,6 +272,21 @@ class ChatStore:
                 )
                 """
             )
+            # Schema additions for existing DBs (idempotent column-adds).
+            # CREATE TABLE IF NOT EXISTS doesn't add columns to an
+            # existing table -- we have to do it manually. Each ALTER
+            # is wrapped in a try because SQLite raises if the column
+            # already exists (no IF NOT EXISTS for ALTER COLUMN).
+            for col_ddl in (
+                "ALTER TABLE pivot_loops ADD COLUMN min_volume_ratio REAL",
+                "ALTER TABLE pivot_loops ADD COLUMN max_vol_ratio REAL",
+                "ALTER TABLE pivot_loops ADD COLUMN news_block_threshold INTEGER",
+            ):
+                try:
+                    c.execute(col_ddl)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pivot_loop_cycles (
@@ -728,6 +751,7 @@ class ChatStore:
         "stop_price", "current_shares", "entry_fill_price",
         "cycle_count", "win_count", "loss_count", "cumulative_realized",
         "catalyst_horizon_days", "max_drawdown_pct", "notes",
+        "min_volume_ratio", "max_vol_ratio", "news_block_threshold",
     }
 
     def create_pivot_loop(
@@ -742,11 +766,18 @@ class ChatStore:
         stop_price: Optional[float] = None,
         catalyst_horizon_days: int = 2,
         max_drawdown_pct: float = 50.0,
+        min_volume_ratio: Optional[float] = None,
+        max_vol_ratio: Optional[float] = None,
+        news_block_threshold: Optional[int] = None,
         notes: Optional[str] = None,
     ) -> dict:
         """Start a new pivot loop for `symbol`. Fails (IntegrityError) if
         a loop already exists for that symbol -- caller should stop the
         existing one first via stop_pivot_loop.
+
+        Per-loop gate tunables (min_volume_ratio / max_vol_ratio /
+        news_block_threshold) are optional -- if None they fall back to
+        the daemon-wide defaults at analysis time.
         """
         symbol = symbol.upper().strip()
         if not symbol:
@@ -755,6 +786,12 @@ class ChatStore:
             raise ValueError("initial_capital must be >= 100")
         if not (3 <= lookback_days <= 180):
             raise ValueError("lookback_days must be 3-180")
+        if min_volume_ratio is not None and not (0 < min_volume_ratio < 10):
+            raise ValueError("min_volume_ratio must be in (0, 10)")
+        if max_vol_ratio is not None and not (1 < max_vol_ratio < 10):
+            raise ValueError("max_vol_ratio must be in (1, 10)")
+        if news_block_threshold is not None and not (-50 <= news_block_threshold <= 0):
+            raise ValueError("news_block_threshold must be in [-50, 0]")
         now = _utc_now_iso()
         with self._conn() as c:
             cur = c.execute(
@@ -763,14 +800,16 @@ class ChatStore:
                     symbol, status, initial_capital, current_capital,
                     compound, lookback_days, entry_price, target_price,
                     stop_price, catalyst_horizon_days, max_drawdown_pct,
+                    min_volume_ratio, max_vol_ratio, news_block_threshold,
                     notes, created_at, updated_at
-                ) VALUES (?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol, initial_capital, initial_capital,
                     1 if compound else 0, lookback_days,
                     entry_price, target_price, stop_price,
                     catalyst_horizon_days, max_drawdown_pct,
+                    min_volume_ratio, max_vol_ratio, news_block_threshold,
                     notes, now, now,
                 ),
             )

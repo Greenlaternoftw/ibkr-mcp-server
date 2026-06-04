@@ -595,6 +595,18 @@ TOOLS = [
                     "type": "number", "default": 50.0,
                     "description": "Auto-stop the loop when cumulative loss exceeds this % of initial capital.",
                 },
+                "min_volume_ratio": {
+                    "type": "number",
+                    "description": "Per-loop override of the Phase C volume gate. recent_vol / lookback_vol must meet this. Default daemon-wide is 0.8.",
+                },
+                "max_vol_ratio": {
+                    "type": "number",
+                    "description": "Per-loop override of the Phase D realized-vol gate. recent_rvol / lookback_rvol must NOT exceed this. Default is 1.5.",
+                },
+                "news_block_threshold": {
+                    "type": "integer",
+                    "description": "Per-loop override of the Phase F news gate. Block entry when sentiment score is ≤ this value. Default is -5.",
+                },
                 "notes": {"type": "string"},
             },
             "required": ["symbol", "initial_capital", "lookback_days"],
@@ -1101,6 +1113,9 @@ async def call_tool(
                     stop_price=arguments.get("stop_price"),
                     catalyst_horizon_days=int(arguments.get("catalyst_horizon_days", 2)),
                     max_drawdown_pct=float(arguments.get("max_drawdown_pct", 50.0)),
+                    min_volume_ratio=arguments.get("min_volume_ratio"),
+                    max_vol_ratio=arguments.get("max_vol_ratio"),
+                    news_block_threshold=arguments.get("news_block_threshold"),
                     notes=arguments.get("notes"),
                 )
                 # Spawn the autonomous tick task so the loop starts

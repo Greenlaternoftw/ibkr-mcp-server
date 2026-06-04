@@ -232,6 +232,50 @@ class TestPivotLoops:
         with pytest.raises(ValueError, match="lookback_days"):
             store.create_pivot_loop("AAPL", 1000.0, 200)
 
+    def test_create_with_per_loop_thresholds(self, store):
+        # Phase 6 -- per-loop tunable gate thresholds. Test that the
+        # row stores them and that the values survive round-trip.
+        loop = store.create_pivot_loop(
+            "AAPL", 1000.0, 7,
+            min_volume_ratio=0.5,
+            max_vol_ratio=2.0,
+            news_block_threshold=-3,
+        )
+        assert loop["min_volume_ratio"] == 0.5
+        assert loop["max_vol_ratio"] == 2.0
+        assert loop["news_block_threshold"] == -3
+        # Reload from DB and verify they persisted
+        again = store.get_pivot_loop("AAPL")
+        assert again["min_volume_ratio"] == 0.5
+        assert again["max_vol_ratio"] == 2.0
+        assert again["news_block_threshold"] == -3
+
+    def test_create_default_thresholds_are_null(self, store):
+        # When not passed, thresholds are None (engine falls back to
+        # daemon-wide defaults at analysis time).
+        loop = store.create_pivot_loop("AAPL", 1000.0, 7)
+        assert loop["min_volume_ratio"] is None
+        assert loop["max_vol_ratio"] is None
+        assert loop["news_block_threshold"] is None
+
+    def test_create_rejects_bad_thresholds(self, store):
+        with pytest.raises(ValueError, match="min_volume_ratio"):
+            store.create_pivot_loop("AAPL", 1000.0, 7, min_volume_ratio=-1)
+        with pytest.raises(ValueError, match="min_volume_ratio"):
+            store.create_pivot_loop("AAPL", 1000.0, 7, min_volume_ratio=20)
+        with pytest.raises(ValueError, match="max_vol_ratio"):
+            store.create_pivot_loop("AAPL", 1000.0, 7, max_vol_ratio=0.5)
+        with pytest.raises(ValueError, match="news_block_threshold"):
+            store.create_pivot_loop("AAPL", 1000.0, 7, news_block_threshold=5)
+        with pytest.raises(ValueError, match="news_block_threshold"):
+            store.create_pivot_loop("AAPL", 1000.0, 7, news_block_threshold=-100)
+
+    def test_update_thresholds_via_patch(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        out = store.update_pivot_loop("AAPL", min_volume_ratio=0.3, max_vol_ratio=2.5)
+        assert out["min_volume_ratio"] == 0.3
+        assert out["max_vol_ratio"] == 2.5
+
     def test_list_excludes_stopped_by_default(self, store):
         store.create_pivot_loop("AAPL", 1000.0, 7)
         store.create_pivot_loop("F", 500.0, 14)
