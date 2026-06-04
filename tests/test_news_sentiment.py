@@ -102,6 +102,81 @@ class TestEvaluateSentiment:
         assert ns.evaluate_sentiment(None) is None
 
 
+class TestLexiconClassifier:
+    """Phase F (Path B): yfinance + local keyword scoring.
+
+    Lexicon is intentionally conservative -- the goal is to avoid false
+    positives that would block real entries, even at the cost of
+    occasionally missing a real negative event. The gate threshold (-5)
+    is a second filter; only strong net-negative CLUSTERS block.
+    """
+
+    def test_neutral_headline(self):
+        impact, mag = ns._classify_headline("AAPL trading volume average for Q2")
+        assert impact == "NEUTRAL"
+        assert mag == 0
+
+    def test_clear_positive(self):
+        impact, mag = ns._classify_headline("Apple beats Q3 earnings estimates")
+        assert impact == "POSITIVE"
+        assert mag >= 3
+
+    def test_clear_negative(self):
+        impact, mag = ns._classify_headline("Tesla downgraded to Sell at Morgan Stanley")
+        assert impact == "NEGATIVE"
+        assert mag >= 3
+
+    def test_very_negative_caps_at_5(self):
+        # Multiple strong negative words → magnitude clamped to 5
+        impact, mag = ns._classify_headline(
+            "Stock plunges as bankruptcy filing reveals fraud and lawsuit"
+        )
+        assert impact == "NEGATIVE"
+        assert mag == 5
+
+    def test_summary_text_considered(self):
+        impact, mag = ns._classify_headline(
+            title="Mixed Q3 results",
+            summary="Company reports earnings beat with raises guidance for next quarter",
+        )
+        assert impact == "POSITIVE"
+        assert mag >= 3
+
+    def test_offsetting_words_net_to_neutral(self):
+        # Equal weights → neutral
+        impact, mag = ns._classify_headline(
+            "Mixed results: earnings beat but layoffs announced"
+        )
+        # beat=3, layoffs=3 → net 0 → NEUTRAL
+        assert impact == "NEUTRAL"
+
+    def test_case_insensitive(self):
+        lower = ns._classify_headline("apple beats earnings")
+        upper = ns._classify_headline("APPLE BEATS EARNINGS")
+        mixed = ns._classify_headline("Apple Beats Earnings")
+        assert lower == upper == mixed
+        assert lower[0] == "POSITIVE"
+
+    def test_empty_headline(self):
+        impact, mag = ns._classify_headline("")
+        assert impact == "NEUTRAL"
+        assert mag == 0
+
+    def test_specific_lexicon_terms(self):
+        # Spot-check a few high-importance terms each scoring as expected
+        assert ns._classify_headline("FDA approval granted for drug X")[0] == "POSITIVE"
+        assert ns._classify_headline("Company files Chapter 11 bankruptcy")[0] == "NEGATIVE"
+        assert ns._classify_headline("Q3 results: company misses revenue")[0] == "NEGATIVE"
+        assert ns._classify_headline("Board announces buyback of $5B")[0] == "POSITIVE"
+
+    def test_misleading_keyword_not_overweighted(self):
+        # "high" alone shouldn't move sentiment (the word is too vague)
+        impact, mag = ns._classify_headline("Stock hits new high for the year")
+        # Should be NEUTRAL because "high" isn't in our lexicon
+        # (intentional design choice -- avoids false positives)
+        assert impact == "NEUTRAL"
+
+
 class TestCache:
     def teardown_method(self):
         ns.clear_cache()
