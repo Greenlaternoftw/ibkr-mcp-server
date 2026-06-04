@@ -2294,6 +2294,11 @@
             </div>
 
             <div class="qx-construct-row">
+              <span class="qx-c-key">Trend</span>
+              <span class="qx-c-val" id="loopTrend">—</span>
+            </div>
+
+            <div class="qx-construct-row">
               <span class="qx-c-key">Pivot low → current → pivot high</span>
               <span class="qx-c-val">
                 <span id="loopPivotLow">—</span>
@@ -2303,7 +2308,15 @@
             </div>
 
             <div class="qx-construct-row">
-              <span class="qx-c-key">Distance from low</span>
+              <span class="qx-c-key">Effective floor (used for entry/stop)</span>
+              <span class="qx-c-val">
+                <strong id="loopEffLow">—</strong>
+                <span id="loopEffLowSrc" style="display:block; font-size:10px; color:var(--muted); margin-top:2px;">—</span>
+              </span>
+            </div>
+
+            <div class="qx-construct-row">
+              <span class="qx-c-key">Distance from effective floor</span>
               <span class="qx-c-val" id="loopDistLow">—</span>
             </div>
 
@@ -5104,7 +5117,22 @@ function _renderPivotResult(d) {
   setText('loopPivotLow', _fmtMoneyShort(d.pivot_low));
   setText('loopCurrent', _fmtMoneyShort(d.current_price));
   setText('loopPivotHigh', _fmtMoneyShort(d.pivot_high));
+  setText('loopEffLow', _fmtMoneyShort(d.effective_low));
+  setText('loopEffLowSrc', d.effective_low_source || '—');
   setText('loopDistLow', _fmtPctShort(d.distance_from_low_pct));
+
+  // Trend row: direction arrow + strength + signed % change, color-coded
+  const trendEl = document.getElementById('loopTrend');
+  if (trendEl) {
+    const arrow = d.trend_direction === 'up' ? '↑'
+                : d.trend_direction === 'down' ? '↓'
+                : '→';
+    trendEl.textContent =
+      `${arrow} ${d.trend_strength} ${d.trend_direction} (${_fmtPctShort(d.trend_pct_change)} over window)`;
+    trendEl.style.color = d.trend_direction === 'up' ? 'var(--go)'
+                        : d.trend_direction === 'down' ? 'var(--stop)'
+                        : 'var(--text-2)';
+  }
   setText('loopAvgRange', _fmtMoneyShort(d.avg_daily_range));
   setText('loopAvgRise', _fmtMoneyShort(d.avg_close_to_low));
   setText('loopEntry', _fmtMoneyShort(d.suggested_entry));

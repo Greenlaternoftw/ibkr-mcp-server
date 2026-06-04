@@ -50,36 +50,40 @@ class TestPivotMath:
 
 
 class TestRecommendation:
-    def _at_entry_bars(self):
-        # last close = 100 (the pivot low) -> distance_from_low = 0
-        return make_bars([(110, 100, 105), (108, 100, 104), (107, 100, 100)])
+    # Note: these tests use FLAT-trend sample data (first close ≈ last
+    # close within ±2%) so the trend-aware override doesn't fire and we
+    # can isolate the pure price-vs-level recommendation logic.
+    # Downtrend-overrides-BUY behavior is covered in TestTrendAdjustment.
 
     def test_below_entry_recommends_buy(self):
-        bars = self._at_entry_bars()
+        # Flat trend (close stable at ~100), current = pivot_low
+        bars = make_bars([(110, 100, 100), (108, 100, 100), (107, 100, 100)])
         a = pivot.analyze_pivot_loop(bars, entry_buffer_pct=0.01)
-        # entry = 100 * 1.01 = 101; current = 100 < 101 → BUY
-        assert a.recommendation.startswith("BUY")
+        # entry = 100 × 1.01 = 101; current = 100 < 101 → BUY
+        assert a.recommendation.startswith("BUY"), f"got: {a.recommendation}"
 
     def test_close_to_entry_recommends_wait(self):
-        # current sits between entry and 2× the buffer above pivot
-        bars = make_bars([(110, 100, 105), (108, 100, 104), (107, 100, 101.5)])
+        # Flat trend; current sits between entry and 2× buffer above pivot
+        bars = make_bars([(110, 100, 101), (108, 100, 101), (107, 100, 101.5)])
         a = pivot.analyze_pivot_loop(bars, entry_buffer_pct=0.01)
         # entry = 101; current = 101.5; 2× buffer = 102 → WAIT
-        assert a.recommendation.startswith("WAIT")
+        assert a.recommendation.startswith("WAIT"), f"got: {a.recommendation}"
 
     def test_above_target_recommends_sell(self):
-        # Need: current >= entry + close_to_low rise
-        # Pivot low 100, avg close-to-low ~5, entry ~100.5, target ~105.5
-        bars = make_bars([(108, 100, 105), (107, 100, 105), (110, 100, 109)])
+        # Flat trend; current price clearly above target.
+        # entry = 100 × 1.005 = 100.5; median_close_to_low = 6 -> target = 106.5
+        # current = 107 > 106.5 → SELL
+        bars = make_bars([(108, 100, 106), (107, 100, 106), (110, 100, 107)])
         a = pivot.analyze_pivot_loop(bars, entry_buffer_pct=0.005)
         assert a.recommendation.startswith("SELL"), f"got: {a.recommendation}"
 
     def test_between_entry_and_target_recommends_hold(self):
-        bars = make_bars([(108, 100, 102), (107, 100, 103), (106, 100, 103)])
+        # Flat trend; current between entry and target
+        bars = make_bars([(108, 100, 103), (107, 100, 103), (106, 100, 103)])
         a = pivot.analyze_pivot_loop(bars, entry_buffer_pct=0.005)
-        # entry ~100.5, target ~ entry + close_to_low (~2.67) ≈ 103.17
+        # entry ~100.5, target ~ entry + median_close_to_low (~3) ≈ 103.5
         # current = 103 → HOLD
-        assert a.recommendation.startswith("HOLD")
+        assert a.recommendation.startswith("HOLD"), f"got: {a.recommendation}"
 
 
 class TestCatalystGate:
@@ -124,6 +128,122 @@ class TestCatalystGate:
         a = pivot.analyze_pivot_loop(bars, catalysts)
         assert a.blocked_by_catalyst is False
         assert a.catalysts == []  # filtered out
+
+
+class TestTrendAdjustment:
+    """The 'auto-adjust if price is trending' feature -- operator-requested."""
+
+    def test_flat_trend_uses_raw_pivot_low(self):
+        # All bars hover around the same price
+        bars = make_bars([
+            (101, 99, 100), (101, 99, 100), (102, 99, 100),
+            (101, 99, 100), (102, 99, 101),
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.trend_direction == "flat"
+        assert a.effective_low == pytest.approx(99.0)
+        assert "flat" in a.effective_low_source.lower()
+
+    def test_uptrend_uses_trailing_3d_low_not_full_window(self):
+        # Steady climb: window low is on day 1 (95), but trailing 3d
+        # low is much higher (108).
+        bars = make_bars([
+            (96, 95, 95.5),    # window low here
+            (100, 96, 99),
+            (104, 100, 103),
+            (108, 104, 107),
+            (112, 108, 111),   # trailing-3 low starts here
+            (116, 112, 115),
+            (120, 116, 119),   # +25% over window -> strong uptrend
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.trend_direction == "up"
+        assert a.trend_strength == "strong"
+        assert a.pivot_low == 95.0
+        # Effective low should be trailing 3d min, which is 108
+        assert a.effective_low == pytest.approx(108.0)
+        assert "trailing" in a.effective_low_source.lower()
+        # Suggested entry derives from effective_low, not pivot_low
+        assert a.suggested_entry > 100  # would be ~95.5 if using pivot_low
+
+    def test_downtrend_projects_floor_forward(self):
+        # Steady decline: window low is today (90); slope says tomorrow
+        # is probably lower.
+        bars = make_bars([
+            (108, 100, 105),
+            (106, 98, 100),
+            (102, 95, 97),
+            (99, 92, 94),
+            (96, 90, 91),   # -13% over window -> strong downtrend
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.trend_direction == "down"
+        assert a.trend_strength == "strong"
+        assert a.pivot_low == 90.0
+        # Effective low should be BELOW raw pivot_low (projecting drift)
+        assert a.effective_low < a.pivot_low
+        assert "projected" in a.effective_low_source.lower()
+
+    def test_downtrend_recommendation_is_wait_not_buy_even_at_entry(self):
+        # Downtrending + current price at pivot low -- old algo said BUY,
+        # new algo says WAIT (don't catch a falling knife).
+        bars = make_bars([
+            (108, 100, 105),
+            (106, 98, 100),
+            (102, 95, 97),
+            (99, 92, 94),
+            (95, 90, 90),    # current = 90 = pivot_low; strong downtrend
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.trend_direction == "down"
+        assert a.recommendation.startswith("WAIT"), f"got: {a.recommendation}"
+        assert "downtrend" in a.recommendation.lower()
+
+    def test_strong_uptrend_past_target_returns_trending_not_sell(self):
+        # Strong uptrend, price already ran past target -- old algo
+        # said SELL, new algo says TRENDING (don't chase).
+        bars = make_bars([
+            (96, 95, 95.5),
+            (100, 96, 99),
+            (104, 100, 103),
+            (108, 104, 107),
+            (112, 108, 111),
+            (116, 112, 115),
+            (120, 116, 119),
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        assert a.trend_direction == "up"
+        assert a.trend_strength == "strong"
+        # With effective_low ≈ 108 and current = 119, we're well past target
+        assert a.recommendation.startswith("TRENDING"), f"got: {a.recommendation}"
+
+    def test_trend_annotation_in_notes(self):
+        bars = make_bars([
+            (108, 100, 105),
+            (106, 98, 100),
+            (102, 95, 97),
+            (99, 92, 94),
+            (96, 90, 91),
+        ])
+        a = pivot.analyze_pivot_loop(bars)
+        # Trend annotation should be in notes
+        assert any("downtrend" in n.lower() for n in a.notes)
+
+    def test_catalyst_block_overrides_uptrend_recommendation(self):
+        # Even in a beautiful uptrend, an earnings call in 1 day = EXIT
+        bars = make_bars([
+            (96, 95, 95.5),
+            (100, 96, 99),
+            (104, 100, 103),
+            (108, 104, 107),
+            (112, 108, 111),
+            (116, 112, 115),
+            (120, 116, 119),
+        ])
+        catalysts = [{"type": "earnings", "date": "2026-07-29", "days_away": 1}]
+        a = pivot.analyze_pivot_loop(bars, catalysts)
+        assert a.trend_direction == "up"
+        assert a.recommendation.startswith("EXIT")
 
 
 class TestEdgeCases:
