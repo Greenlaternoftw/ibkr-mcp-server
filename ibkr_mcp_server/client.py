@@ -259,6 +259,10 @@ class IBKRClient:
             # Layer 5a: real-time fill detection for active strategies.
             self.ib.execDetailsEvent += self._on_exec_details_for_strategies
             self.ib.orderStatusEvent += self._on_order_status_for_strategies
+            # Layer 5b: push every fill into the operator's active chat
+            # thread as a synthetic message so the chat panel reflects
+            # real-time order outcomes without the operator polling.
+            self.ib.execDetailsEvent += self._on_fill_for_chat
             
             # Wait for connection to stabilize
             await asyncio.sleep(2)
@@ -2519,6 +2523,76 @@ class IBKRClient:
                 )
                 asyncio.create_task(self._swing_tick(symbol))
                 return
+
+    def _on_fill_for_chat(self, trade, fill) -> None:
+        """Forward every execution to the operator's active chat thread
+        as a synthetic 'system fill' message.
+
+        Fired by ib_async on execDetails. Runs in the ib event loop
+        (sync); we schedule the SQLite write + SSE publish as an
+        asyncio task so the event handler returns immediately.
+
+        Defensive against every external failure -- a missing
+        activeThreadId pref, a stale thread, an SSE publish error -- so
+        a chat-bridge hiccup never affects order routing or strategy
+        ticks.
+        """
+        try:
+            exec_ = getattr(fill, "execution", None)
+            contract = getattr(trade, "contract", None)
+            order = getattr(trade, "order", None)
+            if exec_ is None or contract is None or order is None:
+                return
+            symbol = getattr(contract, "symbol", "?")
+            side = getattr(order, "action", "?")
+            qty = int(getattr(exec_, "shares", 0) or 0)
+            price = float(getattr(exec_, "price", 0) or 0)
+            order_id = getattr(order, "orderId", 0)
+            # IB times in YYYYMMDD hh:mm:ss + sometimes a timezone suffix.
+            t = getattr(exec_, "time", None)
+            try:
+                time_str = t.strftime("%H:%M:%S") if t else "??:??:??"
+            except Exception:
+                time_str = str(t)[:8] if t else "??:??:??"
+            marker = "🟢" if side == "BUY" else "🔴"
+            msg = (
+                f"{marker} FILL · {side} {qty} {symbol} @ ${price:.2f} "
+                f"· {time_str} · order #{order_id}"
+            )
+            # Schedule the async write -- the event handler is sync.
+            asyncio.create_task(self._append_fill_to_chat(msg, order_id))
+        except Exception as e:
+            self.logger.warning(f"chat fill handler failed: {e}")
+
+    async def _append_fill_to_chat(self, msg: str, order_id: int) -> None:
+        """Find the active thread, append the synthetic message, fire SSE.
+
+        Written as a `user` message (not `assistant`) so Claude on the
+        next turn sees it as context but doesn't treat it as its own
+        prior utterance to continue. The visible '🟢 FILL' prefix makes
+        it obviously not-the-operator to the human reader too.
+        """
+        try:
+            from .chat.routes import _get_store, _publish
+            store = _get_store()
+            active_tid = store.get_pref("activeThreadId")
+            if not active_tid:
+                # No chat conversation started yet -- silently drop.
+                return
+            # Idempotency: if we already appended this order_id's fill
+            # (e.g. a retry / restart), skip. Cheap check on the most
+            # recent N messages.
+            recent = store.get_messages(active_tid)[-10:]
+            for m in recent:
+                content = m.get("content")
+                if isinstance(content, str) and f"order #{order_id}" in content:
+                    return
+            if store.append_message(active_tid, role="user", content=msg):
+                await _publish(
+                    "thread_updated", client_id=None, thread_id=active_tid,
+                )
+        except Exception as e:
+            self.logger.warning(f"chat fill append failed: {e}")
 
     def _on_order_status_for_strategies(self, trade) -> None:
         """Order status changes (Cancelled, Filled, etc). Forward to the same

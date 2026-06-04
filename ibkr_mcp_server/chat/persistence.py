@@ -372,6 +372,42 @@ class ChatStore:
             for r in rows
         ]
 
+    def append_message(
+        self,
+        thread_id: str,
+        role: str,
+        content,
+    ) -> bool:
+        """Append ONE message to a thread without touching the others.
+
+        Used by the IBKR-fills bridge to inject "🟢 FILL ..." synthetic
+        messages into the operator's active thread without rewriting the
+        whole conversation (which `persist_conversation` does).
+
+        Returns True if appended, False if thread doesn't exist. Bumps
+        the thread's updated_at so it sorts to the top of the threads
+        list.
+        """
+        if role not in ("user", "assistant", "system"):
+            raise ValueError(f"invalid role: {role}")
+        now = _utc_now_iso()
+        with self._conn() as c:
+            exists = c.execute(
+                "SELECT 1 FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+            if not exists:
+                return False
+            c.execute(
+                "INSERT INTO messages(thread_id, role, content_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (thread_id, role, json.dumps(content, default=str), now),
+            )
+            c.execute(
+                "UPDATE threads SET updated_at = ? WHERE id = ?",
+                (now, thread_id),
+            )
+        return True
+
     # --- auth config (PIN) ---------------------------------------------
 
     def get_pin(self) -> Optional[str]:

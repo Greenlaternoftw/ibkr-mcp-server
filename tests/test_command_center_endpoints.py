@@ -152,6 +152,56 @@ class TestUserPrefs:
             store.set_pref("k", "x" * (65_536 + 1))
 
 
+# --- append_message (fills-into-chat bridge) -----------------------------
+
+
+class TestAppendMessage:
+    def test_append_to_existing_thread(self, store):
+        thread = store.create_thread("test")
+        ok = store.append_message(thread["id"], role="user", content="🟢 FILL · BUY 100 AAPL @ $310.50 · order #42")
+        assert ok is True
+        msgs = store.get_messages(thread["id"])
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+        assert "FILL" in msgs[0]["content"]
+        assert "order #42" in msgs[0]["content"]
+
+    def test_append_preserves_existing_messages(self, store):
+        thread = store.create_thread("test")
+        # Seed with a normal conversation
+        store.replace_messages(thread["id"], [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ])
+        # Append a fill notification
+        store.append_message(thread["id"], role="user", content="🟢 FILL · BUY 100 AAPL @ $310.50")
+        msgs = store.get_messages(thread["id"])
+        assert len(msgs) == 3
+        # Existing messages intact
+        assert msgs[0]["content"] == "hi"
+        assert msgs[1]["content"] == "hello"
+        # New one appended at the end
+        assert "FILL" in msgs[2]["content"]
+
+    def test_append_to_missing_thread_returns_false(self, store):
+        ok = store.append_message("thr_nope", role="user", content="x")
+        assert ok is False
+
+    def test_append_rejects_unknown_role(self, store):
+        thread = store.create_thread("test")
+        with pytest.raises(ValueError, match="invalid role"):
+            store.append_message(thread["id"], role="bogus", content="x")
+
+    def test_append_bumps_thread_updated_at(self, store):
+        import time as _time
+        thread = store.create_thread("test")
+        original_updated = store.get_thread(thread["id"])["updated_at"]
+        _time.sleep(0.01)  # ensure microsecond clock ticks
+        store.append_message(thread["id"], role="user", content="ping")
+        new_updated = store.get_thread(thread["id"])["updated_at"]
+        assert new_updated > original_updated
+
+
 # --- pivot loops ---------------------------------------------------------
 
 
