@@ -2272,6 +2272,23 @@
                  oninput="onCustomLookbackChange()" />
         </div>
 
+        <div class="field-row">
+          <div class="col">
+            <label>Capital to deploy ($)</label>
+            <input id="loopCapital" type="number" min="100" step="100"
+                   placeholder="1000" value="1000" />
+          </div>
+          <div class="col" style="display:flex; align-items:flex-end;">
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding-bottom:9px;">
+              <input id="loopCompound" type="checkbox" checked
+                     style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);" />
+              <span style="font-size:11px; color:var(--text-2); text-transform:none; letter-spacing:0;">
+                Compound profits — recycle each sale's P&amp;L into the next entry's capital
+              </span>
+            </label>
+          </div>
+        </div>
+
         <button class="submit-btn" style="width:100%; padding:11px;"
                 onclick="runPivotAnalysis()" id="loopAnalyzeBtn">
           Analyze Pivot Loop
@@ -2355,10 +2372,18 @@
             <div id="loopNotes" style="margin-top:6px; font-size:12px; color:var(--warn); line-height:1.6;"></div>
           </div>
 
-          <div style="display:flex; gap:8px; margin-top:12px;">
-            <button class="portfolio-btn" style="flex:1; padding:10px;"
+          <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+            <button class="portfolio-btn" style="flex:1; min-width:140px; padding:10px; background:var(--go); color:#fff; border-color:var(--go);"
                     onclick="dispatchLoopWatchToChat()" id="loopDispatchBtn">
-              Send watch instructions to chat
+              Start Loop Watch →
+            </button>
+            <button class="portfolio-btn" style="flex:1; min-width:120px; padding:10px;"
+                    onclick="dispatchLoopStatusToChat()" id="loopStatusBtn">
+              Loop Status
+            </button>
+            <button class="portfolio-btn" style="flex:1; min-width:120px; padding:10px; background:var(--stop); color:#fff; border-color:var(--stop);"
+                    onclick="dispatchLoopStopToChat()" id="loopStopBtn">
+              Stop Loop
             </button>
           </div>
         </div>
@@ -5166,47 +5191,172 @@ function _renderPivotResult(d) {
   notes.innerHTML = (d.notes || []).map(n => `<div>${n}</div>`).join('');
 }
 
-// Dispatch a "watch this symbol, alert me when X" prompt through the
-// chat agent. Uses the current analysis result + the OPERATOR
-// PRE-AUTHORIZED contract so Claude doesn't ask for confirmation.
-function dispatchLoopWatchToChat() {
-  const sym = document.getElementById('loopResultSymbol').textContent;
-  const entry = document.getElementById('loopEntry').textContent;
-  const target = document.getElementById('loopTarget').textContent;
-  const stop = document.getElementById('loopStop').textContent;
-  const cat = document.getElementById('loopCatalyst').textContent;
-  const rec = document.getElementById('loopRec').textContent;
-  if (!sym || sym === '—') return;
+// --- Pivot Loop chat dispatchers -------------------------------------
+//
+// Loop state lives in the daemon's SQLite (pivot_loops +
+// pivot_loop_cycles tables). The dashboard creates / queries / stops
+// loops via REST (/chat/api/loops/...); Claude reads/writes through the
+// matching MCP tools (start/get/update/record/stop_pivot_loop). Both
+// surfaces see the same canonical state. Operator controls the loop
+// with three buttons: Start (POST a new loop, dispatch a chat prompt
+// telling Claude to take it from here), Status (ask Claude to fetch +
+// summarize), Stop (DELETE the loop, after Claude closes any open pos).
 
+function _loopReadCapital() {
+  const raw = parseFloat(document.getElementById('loopCapital').value);
+  return (Number.isFinite(raw) && raw >= 100) ? raw : 1000;
+}
+
+function _loopReadCompound() {
+  return document.getElementById('loopCompound').checked;
+}
+
+function _loopActiveSymbol() {
+  // Prefer the analyzed-result symbol if present, else the input field.
+  const fromResult = document.getElementById('loopResultSymbol').textContent;
+  if (fromResult && fromResult !== '—') return fromResult;
+  return (document.getElementById('loopSymbol').value || '').trim().toUpperCase();
+}
+
+// Start a SQLite-backed loop: POST /chat/api/loops with the analyzed
+// levels, then dispatch a chat prompt telling Claude the loop is armed
+// and to drive it via the pivot MCP tools.
+async function dispatchLoopWatchToChat() {
+  const sym = _loopActiveSymbol();
+  if (!sym) { _loopHint('Analyze a symbol first.', 'var(--warn)'); return; }
+  // Strip currency formatting from the displayed levels to get raw numbers.
+  const _num = (txt) => {
+    const n = parseFloat((txt || '').replace(/[^\d.-]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  };
+  const entry = _num(document.getElementById('loopEntry').textContent);
+  const target = _num(document.getElementById('loopTarget').textContent);
+  const stop = _num(document.getElementById('loopStop').textContent);
+  const capital = _loopReadCapital();
+  const compound = _loopReadCompound();
+
+  _loopHint('Creating SQLite-backed loop record…', 'var(--accent)');
+  let loop;
+  try {
+    loop = await daemonPost('/chat/api/loops', {
+      symbol: sym,
+      initial_capital: capital,
+      lookback_days: _loopLookback,
+      compound,
+      entry_price: entry,
+      target_price: target,
+      stop_price: stop,
+      catalyst_horizon_days: 2,
+      max_drawdown_pct: 50,
+      client_id: DAEMON_CLIENT_ID,
+    });
+  } catch (e) {
+    if (e.status === 409) {
+      _loopHint(`A loop already exists for ${sym}. Stop it first.`, 'var(--stop)');
+    } else {
+      _loopHint('✗ create failed: ' + e.message, 'var(--stop)');
+    }
+    return;
+  }
+
+  _loopHint(`✓ loop created for ${sym} (capital $${capital.toLocaleString()}, compound ${compound ? 'ON' : 'OFF'})`,
+            'var(--go)');
+  setTimeout(() => _loopHint(''), 6000);
+
+  // Tell Claude the loop is armed via SQLite. The TRUTH lives in
+  // pivot_loops -- Claude reads it via get_pivot_loop_status and
+  // writes via update_pivot_loop_state / record_pivot_loop_cycle.
+  // No chat-thread state-holding.
   const prompt =
-`Claude, set up a pivot-loop watch on ${sym}:
+`*** OPERATOR PRE-AUTHORIZED *** (Pivot Loop tab → Start Loop Watch)
 
-*** OPERATOR PRE-AUTHORIZED *** (dashboard "Pivot Loop" tab)
+A persistent pivot-loop record has been created in SQLite for ${sym}.
+Call get_pivot_loop_status(symbol="${sym}") first to load its config,
+then drive the loop via these MCP tools:
 
-Watch parameters (from dashboard analysis):
-  - Lookback window:  ${_loopLookback}d
-  - Suggested entry:  ${entry}
-  - Suggested target: ${target}
-  - Suggested stop:   ${stop}
-  - Next catalyst:    ${cat}
-  - Current rec:      ${rec}
+  - start_pivot_loop       (already called by the dashboard; do NOT call again)
+  - get_pivot_loop_status  (read current state + cycle history any time)
+  - update_pivot_loop_state(symbol, status?, current_capital?, entry_*?, ...)
+        Use during a cycle to track entry/exit progress
+        (status='entry_pending' → 'holding' → 'exit_pending')
+  - record_pivot_loop_cycle(symbol, capital_at_start, realized_pnl, exit_reason, ...)
+        Call ONCE after each completed cycle. Atomically appends to the
+        cycle history AND updates roll-up counters AND applies
+        compounding (if compound=ON, current_capital += realized_pnl).
+  - stop_pivot_loop(symbol) -- end the loop; row stays for history.
 
-What I need from you:
-  1. Note the levels above; I'll monitor the dashboard for the
-     entry trigger.
-  2. When I tell you to "execute the ${sym} loop entry", place a
-     BUY LMT IOC at the entry price + small buffer, with an
-     attached SELL LMT GTC at the target price (OCA-linked to the
-     entry fill) AND a SELL STP at the stop price (also OCA-linked).
-     Use place_oca_group with confirm=true.
-  3. If the next catalyst is within 2 trading days at execution time,
-     refuse the trade and tell me why -- the loop thesis breaks
-     through earnings/ex-div windows.
-  4. After the entry fills, ntfy me with the fill price and the
-     two attached children so I can verify.
+EXECUTION CONTRACT
+  1. ENTRY trigger ("execute ${sym} loop entry" / "go ${sym}" / "fire ${sym}"):
+       a. Reload state: get_pivot_loop_status("${sym}").
+       b. Recheck conditions: current price ≤ entry_price × 1.005,
+          trend not strongly down (call get_historical_bars + analyze
+          via the pivot endpoint if uncertain), no catalyst within
+          catalyst_horizon_days (default 2).
+       c. If checks pass: place BUY LMT IOC for floor(current_capital /
+          live_ask) shares with adaptive=Urgent + outside_rth=true.
+          confirm=true. Then place_oca_group(target LMT GTC + stop STP),
+          confirm=true.
+       d. update_pivot_loop_state(symbol, status="holding",
+                                  current_shares, entry_fill_price).
 
-Acknowledge the watch is set and summarize the trigger conditions in
-one line. Don't place any orders yet.`;
+  2. EXIT (target/stop fills naturally / catalyst within 2d /
+     operator says "close ${sym} now"):
+       - For catalyst / manual: fast SELL LMT IOC + cancel_all_orders.
+       - record_pivot_loop_cycle(symbol, capital_at_start=<current_capital
+         at entry>, entry_fill, exit_fill, shares, exit_reason,
+         realized_pnl). This auto-resets status to 'waiting',
+         clears the position, and (if compound=ON) updates
+         current_capital.
+
+  3. HARD STOPS (auto-call stop_pivot_loop + close any position first):
+       - cumulative_realized < -max_drawdown_pct% of initial_capital
+       - 3 consecutive losing cycles
+       - Operator says "stop ${sym} loop"
+
+  4. STATUS: when asked, get_pivot_loop_status + report the loop block
+     plus a one-line summary.
+
+Acknowledge that the loop is armed, call get_pivot_loop_status to
+verify, and wait for the entry trigger. Do NOT place any orders yet.`;
+  dispatchToChat(prompt);
+}
+
+// "Loop Status" button: ask Claude to fetch state via the MCP tool
+// (which reads from the same SQLite the dashboard wrote to) and report.
+function dispatchLoopStatusToChat() {
+  const sym = _loopActiveSymbol();
+  if (!sym) { _loopHint('Enter a symbol first.', 'var(--warn)'); return; }
+  const prompt =
+`Call get_pivot_loop_status(symbol="${sym}") and report:
+  - The loop block (status, capital, counters, position)
+  - The last 5 cycles (entry/exit fills, P&L per cycle, exit_reason)
+  - One-line summary: "Cycle N, capital $X (initial $Y), total P&L $Z, status W."
+If no loop exists for ${sym}, say so plainly.`;
+  dispatchToChat(prompt);
+}
+
+// "Stop Loop" button: dispatch a chat prompt telling Claude to close
+// any open position FIRST, then call stop_pivot_loop (which marks the
+// SQLite row 'stopped'; history preserved).
+function dispatchLoopStopToChat() {
+  const sym = _loopActiveSymbol();
+  if (!sym) { _loopHint('Enter a symbol first.', 'var(--warn)'); return; }
+  if (!confirm(`Stop the ${sym} pivot loop?\n\nClaude will check for an open position first; if one exists it will be closed immediately (fast SELL LMT IOC + cancel OCA siblings) and recorded as a cycle. Then the loop's SQLite row is marked 'stopped' (history preserved). The loop will not accept new entries until restarted.`)) return;
+  const prompt =
+`*** OPERATOR PRE-AUTHORIZED *** (Pivot Loop tab → Stop Loop)
+
+Stop the ${sym} pivot loop NOW.
+
+  1. get_pivot_loop_status(symbol="${sym}") -- check if current_shares > 0.
+  2. If open position: close it immediately. SELL LMT IOC at bid - 0.30%
+     during RTH (outside_rth=true so the same construct works in OTH
+     as LMT DAY). cancel_all_orders(symbol="${sym}", confirm=true) for
+     OCA siblings. confirm=true on every call.
+  3. record_pivot_loop_cycle(...) for the just-closed position with the
+     real fill price + exit_reason="manual".
+  4. stop_pivot_loop(symbol="${sym}") -- marks 'stopped' in SQLite.
+  5. Report the final ledger from the stop response: cycle count, win
+     rate, total realized P&L, final capital after compounding.`;
   dispatchToChat(prompt);
 }
 

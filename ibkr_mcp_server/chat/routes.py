@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import List, Optional
 
@@ -362,6 +363,150 @@ async def prefs_delete(request: Request) -> Response:
     client_id = request.query_params.get("client_id")
     await _publish("pref_changed", client_id=client_id, key=key, value=None)
     return Response(status_code=204)
+
+
+async def pivot_loops_list(request: Request) -> Response:
+    """List active pivot loops (optionally include stopped via ?include_stopped=1)."""
+    include = request.query_params.get("include_stopped", "0") in ("1", "true", "yes")
+    loops = _get_store().list_pivot_loops(include_stopped=include)
+    return JSONResponse({"loops": loops})
+
+
+async def pivot_loops_create(request: Request) -> Response:
+    """Start a new pivot loop.  Body:
+       ``{symbol, initial_capital, lookback_days, compound?,
+          entry_price?, target_price?, stop_price?,
+          catalyst_horizon_days?, max_drawdown_pct?, notes?}``
+    Fails 409 if a loop already exists for that symbol.
+    """
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    symbol = (body.get("symbol") or "").strip().upper()
+    try:
+        initial_capital = float(body.get("initial_capital"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "initial_capital required"}, status_code=400)
+    try:
+        lookback_days = int(body.get("lookback_days"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "lookback_days required"}, status_code=400)
+
+    try:
+        loop = _get_store().create_pivot_loop(
+            symbol,
+            initial_capital=initial_capital,
+            lookback_days=lookback_days,
+            compound=bool(body.get("compound", True)),
+            entry_price=body.get("entry_price"),
+            target_price=body.get("target_price"),
+            stop_price=body.get("stop_price"),
+            catalyst_horizon_days=int(body.get("catalyst_horizon_days", 2)),
+            max_drawdown_pct=float(body.get("max_drawdown_pct", 50.0)),
+            notes=body.get("notes"),
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except sqlite3.IntegrityError:
+        return JSONResponse(
+            {"error": f"a loop already exists for {symbol}; stop it first"},
+            status_code=409,
+        )
+    await _publish(
+        "pivot_loop_changed",
+        client_id=body.get("client_id"),
+        symbol=symbol,
+        action="created",
+    )
+    return JSONResponse(loop, status_code=201)
+
+
+async def pivot_loop_get(request: Request) -> Response:
+    """Return a loop's state + cycle history (most recent first)."""
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    store = _get_store()
+    loop = store.get_pivot_loop(sym)
+    if loop is None:
+        return JSONResponse({"error": "no loop for that symbol"}, status_code=404)
+    cycles = store.get_pivot_loop_cycles(sym, limit=50)
+    return JSONResponse({"loop": loop, "cycles": cycles})
+
+
+async def pivot_loop_patch(request: Request) -> Response:
+    """Update mutable fields of a loop. Used by the chat agent's
+    update_pivot_loop_state MCP tool when tracking entry/exit progress.
+    Body is a flat object of allowed fields; unknown keys → 400.
+    """
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    client_id = body.pop("client_id", None)
+    try:
+        out = _get_store().update_pivot_loop(sym, **body)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if out is None:
+        return JSONResponse({"error": "no loop for that symbol"}, status_code=404)
+    await _publish(
+        "pivot_loop_changed", client_id=client_id, symbol=sym, action="updated",
+    )
+    return JSONResponse(out)
+
+
+async def pivot_loop_record_cycle(request: Request) -> Response:
+    """Append a completed cycle to the loop. Body must include the cycle's
+    entry/exit data and realized_pnl. Atomically updates roll-up counters
+    + (if compounding) the current_capital.
+    """
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        loop = _get_store().record_pivot_loop_cycle(
+            sym,
+            capital_at_start=float(body["capital_at_start"]),
+            entry_price=body.get("entry_price"),
+            entry_fill=body.get("entry_fill"),
+            entry_at=body.get("entry_at"),
+            shares=body.get("shares"),
+            exit_fill=body.get("exit_fill"),
+            exit_at=body.get("exit_at"),
+            exit_reason=body.get("exit_reason"),
+            realized_pnl=float(body["realized_pnl"]),
+        )
+    except (KeyError, ValueError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    await _publish(
+        "pivot_loop_changed",
+        client_id=body.get("client_id"),
+        symbol=sym,
+        action="cycle_recorded",
+    )
+    return JSONResponse(loop)
+
+
+async def pivot_loop_stop(request: Request) -> Response:
+    """Mark a loop as stopped. Row + cycle history preserved for review.
+    Returns the final state (with stopped_at timestamp)."""
+    sym = (request.path_params.get("symbol") or "").strip().upper()
+    out = _get_store().stop_pivot_loop(sym)
+    if out is None:
+        return JSONResponse(
+            {"error": "no active loop for that symbol"}, status_code=404
+        )
+    await _publish(
+        "pivot_loop_changed",
+        client_id=request.query_params.get("client_id"),
+        symbol=sym,
+        action="stopped",
+    )
+    return JSONResponse(out)
 
 
 async def pivot_analysis(request: Request) -> Response:
@@ -1155,6 +1300,19 @@ def chat_routes() -> List:
         Route("/chat/api/account/summary", account_summary, methods=["GET"]),
         Route("/chat/api/positions", positions, methods=["GET"]),
         Route("/chat/api/pivot/{symbol}", pivot_analysis, methods=["GET"]),
+        # Pivot-loop persistent state (SQLite-backed). Claude reads/writes
+        # through these endpoints (and the matching MCP tools) so loop
+        # state survives restarts + cross-device + multi-thread.
+        Route("/chat/api/loops", pivot_loops_list, methods=["GET"]),
+        Route("/chat/api/loops", pivot_loops_create, methods=["POST"]),
+        Route("/chat/api/loops/{symbol}", pivot_loop_get, methods=["GET"]),
+        Route("/chat/api/loops/{symbol}", pivot_loop_patch, methods=["PATCH"]),
+        Route("/chat/api/loops/{symbol}", pivot_loop_stop, methods=["DELETE"]),
+        Route(
+            "/chat/api/loops/{symbol}/cycles",
+            pivot_loop_record_cycle,
+            methods=["POST"],
+        ),
         # Command Center -- watchlists / portfolios CRUD
         Route("/chat/api/watchlists", watchlists_list, methods=["GET"]),
         Route("/chat/api/watchlists", watchlists_create, methods=["POST"]),

@@ -231,6 +231,63 @@ class ChatStore:
                 )
                 """
             )
+            # Pivot-loop persistence. One row per symbol (UNIQUE) for the
+            # current loop state; cycles table is the append-only audit
+            # trail.  When a loop is stopped, the row stays with
+            # status='stopped' so we keep the historical record.
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pivot_loops (
+                    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol                   TEXT NOT NULL UNIQUE,
+                    status                   TEXT NOT NULL,
+                    initial_capital          REAL NOT NULL,
+                    current_capital          REAL NOT NULL,
+                    compound                 INTEGER NOT NULL DEFAULT 1,
+                    lookback_days            INTEGER NOT NULL,
+                    entry_price              REAL,
+                    target_price             REAL,
+                    stop_price               REAL,
+                    current_shares           INTEGER NOT NULL DEFAULT 0,
+                    entry_fill_price         REAL,
+                    cycle_count              INTEGER NOT NULL DEFAULT 0,
+                    win_count                INTEGER NOT NULL DEFAULT 0,
+                    loss_count               INTEGER NOT NULL DEFAULT 0,
+                    cumulative_realized      REAL NOT NULL DEFAULT 0,
+                    catalyst_horizon_days    INTEGER NOT NULL DEFAULT 2,
+                    max_drawdown_pct         REAL NOT NULL DEFAULT 50.0,
+                    notes                    TEXT,
+                    created_at               TEXT NOT NULL,
+                    updated_at               TEXT NOT NULL,
+                    stopped_at               TEXT,
+                    CHECK (status IN ('waiting','entry_pending','holding','exit_pending','paused','stopped'))
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pivot_loop_cycles (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loop_id             INTEGER NOT NULL REFERENCES pivot_loops(id) ON DELETE CASCADE,
+                    cycle_number        INTEGER NOT NULL,
+                    capital_at_start    REAL NOT NULL,
+                    entry_price         REAL,
+                    entry_fill          REAL,
+                    entry_at            TEXT,
+                    shares              INTEGER,
+                    exit_fill           REAL,
+                    exit_at             TEXT,
+                    exit_reason         TEXT,
+                    realized_pnl        REAL,
+                    win                 INTEGER,
+                    created_at          TEXT NOT NULL
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pivot_loop_cycles_loop_id "
+                "ON pivot_loop_cycles(loop_id)"
+            )
             c.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -624,3 +681,240 @@ class ChatStore:
             except Exception:
                 c.execute("ROLLBACK")
                 raise
+
+    # --- pivot loops -------------------------------------------------
+
+    # Allowlist of mutable fields for update_pivot_loop(). Any other key
+    # raises -- prevents typos or arbitrary column writes from MCP-tool
+    # callers.
+    _PIVOT_LOOP_UPDATABLE = {
+        "status", "current_capital", "entry_price", "target_price",
+        "stop_price", "current_shares", "entry_fill_price",
+        "cycle_count", "win_count", "loss_count", "cumulative_realized",
+        "catalyst_horizon_days", "max_drawdown_pct", "notes",
+    }
+
+    def create_pivot_loop(
+        self,
+        symbol: str,
+        initial_capital: float,
+        lookback_days: int,
+        *,
+        compound: bool = True,
+        entry_price: Optional[float] = None,
+        target_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        catalyst_horizon_days: int = 2,
+        max_drawdown_pct: float = 50.0,
+        notes: Optional[str] = None,
+    ) -> dict:
+        """Start a new pivot loop for `symbol`. Fails (IntegrityError) if
+        a loop already exists for that symbol -- caller should stop the
+        existing one first via stop_pivot_loop.
+        """
+        symbol = symbol.upper().strip()
+        if not symbol:
+            raise ValueError("symbol required")
+        if initial_capital < 100:
+            raise ValueError("initial_capital must be >= 100")
+        if not (3 <= lookback_days <= 180):
+            raise ValueError("lookback_days must be 3-180")
+        now = _utc_now_iso()
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO pivot_loops (
+                    symbol, status, initial_capital, current_capital,
+                    compound, lookback_days, entry_price, target_price,
+                    stop_price, catalyst_horizon_days, max_drawdown_pct,
+                    notes, created_at, updated_at
+                ) VALUES (?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol, initial_capital, initial_capital,
+                    1 if compound else 0, lookback_days,
+                    entry_price, target_price, stop_price,
+                    catalyst_horizon_days, max_drawdown_pct,
+                    notes, now, now,
+                ),
+            )
+            return self._row_to_pivot_loop_dict(
+                c.execute(
+                    "SELECT * FROM pivot_loops WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+            )
+
+    def get_pivot_loop(self, symbol: str) -> Optional[dict]:
+        """Fetch the loop for a symbol (any status -- waiting/holding/stopped)."""
+        symbol = symbol.upper().strip()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM pivot_loops WHERE symbol = ?", (symbol,)
+            ).fetchone()
+        return self._row_to_pivot_loop_dict(row) if row else None
+
+    def list_pivot_loops(self, *, include_stopped: bool = False) -> List[dict]:
+        """List all pivot loops, optionally including stopped ones."""
+        with self._conn() as c:
+            if include_stopped:
+                rows = c.execute(
+                    "SELECT * FROM pivot_loops ORDER BY updated_at DESC"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM pivot_loops WHERE status != 'stopped' "
+                    "ORDER BY updated_at DESC"
+                ).fetchall()
+        return [self._row_to_pivot_loop_dict(r) for r in rows]
+
+    def update_pivot_loop(self, symbol: str, **fields) -> Optional[dict]:
+        """Update mutable fields of a loop. Returns the updated row.
+
+        Unknown fields raise ValueError to prevent typos sneaking in from
+        MCP-tool callers (Claude inventing column names is a real risk).
+        """
+        symbol = symbol.upper().strip()
+        bad = set(fields) - self._PIVOT_LOOP_UPDATABLE
+        if bad:
+            raise ValueError(
+                f"non-updatable fields: {sorted(bad)} "
+                f"(allowed: {sorted(self._PIVOT_LOOP_UPDATABLE)})"
+            )
+        if not fields:
+            return self.get_pivot_loop(symbol)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        params = list(fields.values()) + [_utc_now_iso(), symbol]
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE pivot_loops SET {sets}, updated_at = ? WHERE symbol = ?",
+                params,
+            )
+            row = c.execute(
+                "SELECT * FROM pivot_loops WHERE symbol = ?", (symbol,)
+            ).fetchone()
+        return self._row_to_pivot_loop_dict(row) if row else None
+
+    def stop_pivot_loop(self, symbol: str) -> Optional[dict]:
+        """Mark a loop as stopped. Row + cycle history is preserved."""
+        symbol = symbol.upper().strip()
+        now = _utc_now_iso()
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE pivot_loops SET status = 'stopped', stopped_at = ?, "
+                "updated_at = ? WHERE symbol = ? AND status != 'stopped'",
+                (now, now, symbol),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = c.execute(
+                "SELECT * FROM pivot_loops WHERE symbol = ?", (symbol,)
+            ).fetchone()
+        return self._row_to_pivot_loop_dict(row) if row else None
+
+    def record_pivot_loop_cycle(
+        self,
+        symbol: str,
+        *,
+        capital_at_start: float,
+        entry_price: Optional[float],
+        entry_fill: Optional[float],
+        entry_at: Optional[str],
+        shares: Optional[int],
+        exit_fill: Optional[float],
+        exit_at: Optional[str],
+        exit_reason: Optional[str],
+        realized_pnl: float,
+    ) -> dict:
+        """Append a completed cycle to the audit trail AND update the
+        loop's roll-up counters (cycle_count, win/loss, cumulative_realized,
+        current_capital). Atomic in one transaction.
+        """
+        symbol = symbol.upper().strip()
+        now = _utc_now_iso()
+        win = 1 if realized_pnl > 0 else 0
+        with self._conn() as c:
+            loop = c.execute(
+                "SELECT * FROM pivot_loops WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            if loop is None:
+                raise ValueError(f"no pivot loop for {symbol}")
+            cycle_number = (loop["cycle_count"] or 0) + 1
+
+            c.execute(
+                """
+                INSERT INTO pivot_loop_cycles (
+                    loop_id, cycle_number, capital_at_start, entry_price,
+                    entry_fill, entry_at, shares, exit_fill, exit_at,
+                    exit_reason, realized_pnl, win, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    loop["id"], cycle_number, capital_at_start, entry_price,
+                    entry_fill, entry_at, shares, exit_fill, exit_at,
+                    exit_reason, realized_pnl, win, now,
+                ),
+            )
+            new_capital = (
+                loop["current_capital"] + realized_pnl
+                if loop["compound"] else loop["initial_capital"]
+            )
+            new_cum = loop["cumulative_realized"] + realized_pnl
+            c.execute(
+                """
+                UPDATE pivot_loops SET
+                    cycle_count = ?,
+                    win_count = ?,
+                    loss_count = ?,
+                    cumulative_realized = ?,
+                    current_capital = ?,
+                    current_shares = 0,
+                    entry_fill_price = NULL,
+                    status = 'waiting',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    cycle_number,
+                    loop["win_count"] + win,
+                    loop["loss_count"] + (1 - win),
+                    new_cum,
+                    new_capital,
+                    now,
+                    loop["id"],
+                ),
+            )
+            row = c.execute(
+                "SELECT * FROM pivot_loops WHERE id = ?", (loop["id"],)
+            ).fetchone()
+        out = self._row_to_pivot_loop_dict(row)
+        out["last_cycle"] = {
+            "cycle_number": cycle_number,
+            "realized_pnl": realized_pnl,
+            "win": bool(win),
+        }
+        return out
+
+    def get_pivot_loop_cycles(self, symbol: str, limit: int = 100) -> List[dict]:
+        """Return the cycle history for a loop, most recent first."""
+        symbol = symbol.upper().strip()
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT c.* FROM pivot_loop_cycles c
+                JOIN pivot_loops l ON c.loop_id = l.id
+                WHERE l.symbol = ?
+                ORDER BY c.cycle_number DESC
+                LIMIT ?
+                """,
+                (symbol, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_pivot_loop_dict(row) -> Optional[dict]:
+        """sqlite3.Row → JSON-friendly dict, with compound as a bool."""
+        if row is None:
+            return None
+        d = dict(row)
+        d["compound"] = bool(d.get("compound"))
+        return d

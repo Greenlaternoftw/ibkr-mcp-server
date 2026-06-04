@@ -152,6 +152,155 @@ class TestUserPrefs:
             store.set_pref("k", "x" * (65_536 + 1))
 
 
+# --- pivot loops ---------------------------------------------------------
+
+
+class TestPivotLoops:
+    def test_create_then_get(self, store):
+        loop = store.create_pivot_loop(
+            "AAPL", initial_capital=1000.0, lookback_days=7,
+            entry_price=305.0, target_price=315.0, stop_price=300.0,
+        )
+        assert loop["symbol"] == "AAPL"
+        assert loop["status"] == "waiting"
+        assert loop["initial_capital"] == 1000.0
+        assert loop["current_capital"] == 1000.0
+        assert loop["compound"] is True
+        got = store.get_pivot_loop("aapl")  # case-insensitive
+        assert got["id"] == loop["id"]
+
+    def test_create_duplicate_symbol_rejected(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_pivot_loop("AAPL", 2000.0, 14)
+
+    def test_create_validation(self, store):
+        with pytest.raises(ValueError, match="symbol required"):
+            store.create_pivot_loop("", 1000.0, 7)
+        with pytest.raises(ValueError, match="initial_capital"):
+            store.create_pivot_loop("AAPL", 50.0, 7)
+        with pytest.raises(ValueError, match="lookback_days"):
+            store.create_pivot_loop("AAPL", 1000.0, 200)
+
+    def test_list_excludes_stopped_by_default(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        store.create_pivot_loop("F", 500.0, 14)
+        store.stop_pivot_loop("F")
+        active = store.list_pivot_loops()
+        assert {l["symbol"] for l in active} == {"AAPL"}
+        all_loops = store.list_pivot_loops(include_stopped=True)
+        assert {l["symbol"] for l in all_loops} == {"AAPL", "F"}
+
+    def test_update_allowed_field(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        out = store.update_pivot_loop("AAPL", status="holding", current_shares=10)
+        assert out["status"] == "holding"
+        assert out["current_shares"] == 10
+
+    def test_update_rejects_unknown_field(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        with pytest.raises(ValueError, match="non-updatable fields"):
+            store.update_pivot_loop("AAPL", initial_capital=5000)  # immutable
+
+    def test_stop_marks_stopped_preserving_row(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        out = store.stop_pivot_loop("AAPL")
+        assert out["status"] == "stopped"
+        assert out["stopped_at"] is not None
+        # Row still queryable
+        assert store.get_pivot_loop("AAPL")["status"] == "stopped"
+
+    def test_stop_idempotent_returns_none_second_time(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        store.stop_pivot_loop("AAPL")
+        # Second stop is a no-op (row already stopped, can't transition again)
+        assert store.stop_pivot_loop("AAPL") is None
+
+    def test_record_cycle_updates_roll_ups_win(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        out = store.record_pivot_loop_cycle(
+            "AAPL",
+            capital_at_start=1000.0,
+            entry_price=305.0, entry_fill=305.10, entry_at="2026-06-03T14:00:00Z",
+            shares=3, exit_fill=310.50, exit_at="2026-06-03T18:30:00Z",
+            exit_reason="target", realized_pnl=16.20,
+        )
+        assert out["cycle_count"] == 1
+        assert out["win_count"] == 1
+        assert out["loss_count"] == 0
+        assert out["cumulative_realized"] == pytest.approx(16.20)
+        # Compounding ON by default -> current_capital grows by realized P&L
+        assert out["current_capital"] == pytest.approx(1016.20)
+        # Position cleared, status back to waiting
+        assert out["current_shares"] == 0
+        assert out["status"] == "waiting"
+        assert out["last_cycle"]["win"] is True
+
+    def test_record_cycle_loss_increments_loss_count(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        out = store.record_pivot_loop_cycle(
+            "AAPL", capital_at_start=1000.0,
+            entry_price=305, entry_fill=305, entry_at="2026-06-03T14:00:00Z",
+            shares=3, exit_fill=295, exit_at="2026-06-03T18:30:00Z",
+            exit_reason="stop", realized_pnl=-30.0,
+        )
+        assert out["loss_count"] == 1
+        assert out["win_count"] == 0
+        assert out["current_capital"] == pytest.approx(970.0)
+        assert out["last_cycle"]["win"] is False
+
+    def test_record_cycle_no_compound_keeps_fixed_capital(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7, compound=False)
+        out = store.record_pivot_loop_cycle(
+            "AAPL", capital_at_start=1000.0,
+            entry_price=305, entry_fill=305, entry_at="t",
+            shares=3, exit_fill=315, exit_at="t",
+            exit_reason="target", realized_pnl=30.0,
+        )
+        # Compounding OFF -> capital stays fixed
+        assert out["current_capital"] == pytest.approx(1000.0)
+        # But cumulative_realized still tracks lifetime P&L
+        assert out["cumulative_realized"] == pytest.approx(30.0)
+
+    def test_record_cycle_on_unknown_symbol_raises(self, store):
+        with pytest.raises(ValueError, match="no pivot loop"):
+            store.record_pivot_loop_cycle(
+                "GME", capital_at_start=1000.0,
+                entry_price=None, entry_fill=None, entry_at=None, shares=None,
+                exit_fill=None, exit_at=None, exit_reason="manual",
+                realized_pnl=0.0,
+            )
+
+    def test_get_cycles_returns_most_recent_first(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        for pnl in (10, 20, -5, 15):
+            store.record_pivot_loop_cycle(
+                "AAPL", capital_at_start=1000.0,
+                entry_price=None, entry_fill=None, entry_at=None, shares=1,
+                exit_fill=None, exit_at=None, exit_reason="manual",
+                realized_pnl=float(pnl),
+            )
+        cycles = store.get_pivot_loop_cycles("AAPL")
+        assert len(cycles) == 4
+        # Most recent (cycle_number=4) first
+        assert cycles[0]["cycle_number"] == 4
+        assert cycles[0]["realized_pnl"] == 15.0
+        assert cycles[-1]["cycle_number"] == 1
+
+    def test_stop_cascade_preserves_cycles(self, store):
+        store.create_pivot_loop("AAPL", 1000.0, 7)
+        store.record_pivot_loop_cycle(
+            "AAPL", capital_at_start=1000.0,
+            entry_price=None, entry_fill=None, entry_at=None, shares=1,
+            exit_fill=None, exit_at=None, exit_reason="manual",
+            realized_pnl=10.0,
+        )
+        store.stop_pivot_loop("AAPL")
+        # Row + cycles preserved (stop doesn't delete; just status flip)
+        assert store.get_pivot_loop("AAPL") is not None
+        assert len(store.get_pivot_loop_cycles("AAPL")) == 1
+
+
 # --- route registration smoke test ---------------------------------------
 
 
@@ -170,6 +319,12 @@ class TestRoutesRegistered:
             (("GET", "HEAD"), "/chat/api/account/summary"),
             (("GET", "HEAD"), "/chat/api/positions"),
             (("GET", "HEAD"), "/chat/api/pivot/{symbol}"),
+            (("GET", "HEAD"), "/chat/api/loops"),
+            (("POST",), "/chat/api/loops"),
+            (("GET", "HEAD"), "/chat/api/loops/{symbol}"),
+            (("PATCH",), "/chat/api/loops/{symbol}"),
+            (("DELETE",), "/chat/api/loops/{symbol}"),
+            (("POST",), "/chat/api/loops/{symbol}/cycles"),
             (("GET", "HEAD"), "/chat/api/watchlists"),
             (("POST",), "/chat/api/watchlists"),
             (("DELETE",), "/chat/api/watchlists/{wid}"),

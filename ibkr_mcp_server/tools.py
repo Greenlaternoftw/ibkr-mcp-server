@@ -563,6 +563,152 @@ TOOLS = [
         },
     ),
     Tool(
+        name="start_pivot_loop",
+        description=(
+            "Start a persistent pivot-loop strategy for a symbol. Loop "
+            "state (capital, current position, cycle counters, compound "
+            "flag) lives in SQLite -- survives restarts, cross-device, "
+            "and across separate chat conversations. One loop per "
+            "symbol; fails if a loop already exists (stop it first)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "initial_capital": {"type": "number", "minimum": 100},
+                "lookback_days": {
+                    "type": "integer", "minimum": 3, "maximum": 180,
+                },
+                "compound": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "If true, each cycle's realized P&L is added to the next cycle's capital.",
+                },
+                "entry_price": {"type": "number"},
+                "target_price": {"type": "number"},
+                "stop_price": {"type": "number"},
+                "catalyst_horizon_days": {
+                    "type": "integer", "default": 2,
+                    "description": "Refuse new entries within this many days of an earnings/ex-div event.",
+                },
+                "max_drawdown_pct": {
+                    "type": "number", "default": 50.0,
+                    "description": "Auto-stop the loop when cumulative loss exceeds this % of initial capital.",
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["symbol", "initial_capital", "lookback_days"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="get_pivot_loop_status",
+        description=(
+            "Get the current state + cycle history for a pivot loop. "
+            "Omit symbol to list all active loops (and stopped ones if "
+            "include_stopped=true)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "include_stopped": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="update_pivot_loop_state",
+        description=(
+            "Update mutable fields of a pivot loop (status, "
+            "current_capital, entry/target/stop prices, current_shares, "
+            "entry_fill_price, notes). Use this to track entry/exit "
+            "progress during a cycle. To record a COMPLETED cycle with "
+            "P&L, use record_pivot_loop_cycle instead -- it atomically "
+            "updates all the roll-up counters."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["waiting", "entry_pending", "holding",
+                             "exit_pending", "paused"],
+                },
+                "current_capital": {"type": "number"},
+                "entry_price": {"type": "number"},
+                "target_price": {"type": "number"},
+                "stop_price": {"type": "number"},
+                "current_shares": {"type": "integer"},
+                "entry_fill_price": {"type": "number"},
+                "notes": {"type": "string"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="record_pivot_loop_cycle",
+        description=(
+            "Append a completed cycle (entry+exit pair) to a loop's audit "
+            "trail AND atomically update the roll-up counters "
+            "(cycle_count, win/loss, cumulative_realized, current_capital). "
+            "Call this once per completed round-trip, AFTER the exit "
+            "fills. Compounding (if enabled) is applied here."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "capital_at_start": {
+                    "type": "number",
+                    "description": "Capital deployed for this cycle (= current_capital at entry).",
+                },
+                "entry_price": {"type": "number"},
+                "entry_fill": {"type": "number"},
+                "entry_at": {
+                    "type": "string",
+                    "description": "ISO timestamp of the entry fill.",
+                },
+                "shares": {"type": "integer"},
+                "exit_fill": {"type": "number"},
+                "exit_at": {
+                    "type": "string",
+                    "description": "ISO timestamp of the exit fill.",
+                },
+                "exit_reason": {
+                    "type": "string",
+                    "enum": ["target", "stop", "catalyst", "manual", "drawdown"],
+                },
+                "realized_pnl": {
+                    "type": "number",
+                    "description": "Signed $: (exit_fill - entry_fill) × shares.",
+                },
+            },
+            "required": ["symbol", "capital_at_start", "realized_pnl"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="stop_pivot_loop",
+        description=(
+            "Stop a pivot loop. The row + cycle history are preserved "
+            "(status flips to 'stopped' rather than being deleted) so "
+            "the final ledger remains queryable via get_pivot_loop_status. "
+            "Caller is responsible for closing any open position FIRST "
+            "via place_order before stopping."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="get_open_orders",
         description=(
             "List currently open orders (pending, partially filled, or "
@@ -941,6 +1087,107 @@ async def call_tool(
                 confirm=arguments.get("confirm", False),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "start_pivot_loop":
+            from .chat.routes import _get_store
+            try:
+                loop = _get_store().create_pivot_loop(
+                    arguments["symbol"],
+                    initial_capital=float(arguments["initial_capital"]),
+                    lookback_days=int(arguments["lookback_days"]),
+                    compound=bool(arguments.get("compound", True)),
+                    entry_price=arguments.get("entry_price"),
+                    target_price=arguments.get("target_price"),
+                    stop_price=arguments.get("stop_price"),
+                    catalyst_horizon_days=int(arguments.get("catalyst_horizon_days", 2)),
+                    max_drawdown_pct=float(arguments.get("max_drawdown_pct", 50.0)),
+                    notes=arguments.get("notes"),
+                )
+                return [TextContent(
+                    type="text", text=json.dumps(loop, indent=2, default=str),
+                )]
+            except Exception as e:
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(e)}, indent=2),
+                )]
+
+        elif name == "get_pivot_loop_status":
+            from .chat.routes import _get_store
+            store = _get_store()
+            sym = arguments.get("symbol")
+            if sym:
+                loop = store.get_pivot_loop(sym)
+                if loop is None:
+                    return [TextContent(
+                        type="text",
+                        text=json.dumps({"error": f"no loop for {sym}"}),
+                    )]
+                cycles = store.get_pivot_loop_cycles(sym, limit=50)
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({"loop": loop, "cycles": cycles}, indent=2, default=str),
+                )]
+            loops = store.list_pivot_loops(
+                include_stopped=bool(arguments.get("include_stopped", False))
+            )
+            return [TextContent(
+                type="text", text=json.dumps({"loops": loops}, indent=2, default=str),
+            )]
+
+        elif name == "update_pivot_loop_state":
+            from .chat.routes import _get_store
+            sym = arguments.pop("symbol")
+            try:
+                out = _get_store().update_pivot_loop(sym, **arguments)
+            except ValueError as e:
+                return [TextContent(
+                    type="text", text=json.dumps({"error": str(e)}),
+                )]
+            if out is None:
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({"error": f"no loop for {sym}"}),
+                )]
+            return [TextContent(
+                type="text", text=json.dumps(out, indent=2, default=str),
+            )]
+
+        elif name == "record_pivot_loop_cycle":
+            from .chat.routes import _get_store
+            try:
+                loop = _get_store().record_pivot_loop_cycle(
+                    arguments["symbol"],
+                    capital_at_start=float(arguments["capital_at_start"]),
+                    entry_price=arguments.get("entry_price"),
+                    entry_fill=arguments.get("entry_fill"),
+                    entry_at=arguments.get("entry_at"),
+                    shares=arguments.get("shares"),
+                    exit_fill=arguments.get("exit_fill"),
+                    exit_at=arguments.get("exit_at"),
+                    exit_reason=arguments.get("exit_reason"),
+                    realized_pnl=float(arguments["realized_pnl"]),
+                )
+                return [TextContent(
+                    type="text", text=json.dumps(loop, indent=2, default=str),
+                )]
+            except (KeyError, ValueError) as e:
+                return [TextContent(
+                    type="text", text=json.dumps({"error": str(e)}),
+                )]
+
+        elif name == "stop_pivot_loop":
+            from .chat.routes import _get_store
+            sym = arguments["symbol"]
+            out = _get_store().stop_pivot_loop(sym)
+            if out is None:
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({"error": f"no active loop for {sym}"}),
+                )]
+            return [TextContent(
+                type="text", text=json.dumps(out, indent=2, default=str),
+            )]
 
         elif name == "get_open_orders":
             result = await ibkr_client.get_open_orders(arguments.get("account"))
