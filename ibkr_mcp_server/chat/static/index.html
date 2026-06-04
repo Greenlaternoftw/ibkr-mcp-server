@@ -4679,12 +4679,20 @@ function executeBuyStop() {
   const command =
 `Claude, execute a PROTECTED BUY via the ibkr MCP — enter ${sym} with a TRAILING stop loss attached:
 
+*** OPERATOR PRE-AUTHORIZED *** (dashboard "Buy with Trailing Stop" modal, parameters entered + Execute tapped)
+Pass \`confirm: true\` on the place_order / place_oca_group call so the
+destructive-action gate doesn't block. The modal collected explicit
+parameters (symbol, dollar amount, trail %) -- that IS the authorization.
+DO NOT ask the operator to re-confirm in chat. Stream the order placement
+preview, then the fill confirmation.
+
 Position
   symbol:           ${sym}
   side:             BUY
   target notional:  $${dollar.toLocaleString()}
   source:           Dashboard "Buy with Trailing Stop" · ${portfolioName} tab
   protection:       SELL TRAIL ${stopPct}% (adjusts UP only, never down)
+  confirm:          true
 
 Order strategy
   Parent: LMT IOC at ask + 0.30% (min $0.10 buffer), routed through
@@ -4758,8 +4766,24 @@ function dispatchQuickAction(action) {
   const templates = {
     sellAllTP: buildTakeProfitsCommand(),
     cancel: sym && sym !== '<SYMBOL>'
-      ? `Claude, cancel ALL open orders for ${sym}. Confirm cancellation status for each.`
-      : 'Claude, cancel ALL open orders across all symbols. Confirm cancellation status for each.',
+      ? `Claude, cancel ALL open orders for ${sym}.
+
+*** OPERATOR PRE-AUTHORIZED *** (dashboard button press)
+Call cancel_all_orders(symbol="${sym}", confirm=true) ONCE -- that
+tool returns the per-order results in a single response. Do NOT ask
+for confirmation in chat. Do NOT iterate get_open_orders then
+cancel_order(...) per id unless cancel_all_orders errors first.
+
+Report cancelled count + any errors in a brief table.`
+      : `Claude, cancel ALL open orders across all symbols on the active IBKR account.
+
+*** OPERATOR PRE-AUTHORIZED *** (dashboard button press)
+Call cancel_all_orders(confirm=true) ONCE with NO symbol filter --
+that tool returns the per-order results in a single response. Do NOT
+ask for confirmation in chat. Do NOT iterate get_open_orders then
+cancel_order(...) per id unless cancel_all_orders errors first.
+
+Report cancelled count + any errors in a brief table.`,
   };
   const text = templates[action];
   if (!text) return;
@@ -4821,29 +4845,44 @@ function buildTakeProfitsCommand() {
   const portfolioName = portfolios.active || 'active account';
   return `Claude, execute SELL ALL TO TAKE PROFIT via the ibkr MCP — close every position currently in unrealized gain:
 
+*** OPERATOR PRE-AUTHORIZED ***
+This is a dashboard button press, which is itself the deliberate operator
+authorization. Pass \`confirm: true\` on every place_order / cancel_orders
+call to bypass the destructive-action confirmation gate. DO NOT ask the
+operator to confirm in chat -- they already confirmed by tapping the
+button. Speed matters; surface only the final summary table.
+
 Strategy
-  1) get_positions across the active IBKR account
-  2) For each position with unrealized P&L >= $0 (skip losers):
-       - Cancel any attached child orders (trailing stops, take-profits, OCA siblings)
-       - Place a fast-exit SELL via the same construct as the dashboard's EXIT button
+  1) get_portfolio (NOT get_positions; tool name is get_portfolio)
+     across the active IBKR account
+  2) For each position with unrealizedPNL >= $0 (skip losers):
+       - cancel_all_orders(symbol=<that_sym>, confirm=true) to clear
+         attached children (trailing stops, take-profits, OCA siblings)
+       - place_order(action="SELL", quantity=<full position>,
+         order_type="LMT", confirm=true, …) per the construct below
   3) Do NOT touch positions currently at a loss
   4) Report a summary table at the end
 
-Per-position order construct (winners only)
-  order_type:     LMT
+Per-position order construct (winners only) -- ABSOLUTE FASTEST EXIT
+  order_type:     MKT
   algo:           Adaptive
   algo_params:    { adaptivePriority: "Urgent" }
-  lmt_price:      <live_bid> - max(0.30% × bid, $0.10)
-  tif:            IOC (Immediate or Cancel)
+  tif:            DAY
   routing:        SMART
   quantity:       full position size
-  fallback:       If IOC cancels twice, escalate to MKT (accept slippage)
+  confirm:        true
+
+  Why MKT (not LMT IOC):
+    - MKT fills instantly at best available venue (IBKR smart router).
+    - No retry loop / no risk of an IOC cancel-and-respawn that
+      misses the exit while the bid keeps dropping.
+    - Adaptive Urgent still optimizes routing, just doesn't impose
+      a price ceiling. "Take Profits" means take them NOW.
 
 Execution rules
-  - Process positions in parallel where IBKR session permits (typically up to 5 at a time)
-  - Maximum slippage tolerance per position: 0.75% from reference
-  - Speed target: total run under 5 seconds across the account
-  - Skip any symbol with halt / no quote / illiquid order book
+  - Process positions in parallel where IBKR session permits (up to 5 at a time)
+  - Speed target: every order transmitted within 1 second of get_portfolio returning
+  - Skip any symbol with halt / no quote / illiquid order book -- those need a manual call
 
 Final report — return as a markdown table with columns:
   | Symbol | Qty | Entry avg | Exit fill | P&L $ | P&L % | Status |

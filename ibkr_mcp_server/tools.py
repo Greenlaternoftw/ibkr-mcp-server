@@ -562,6 +562,72 @@ TOOLS = [
             "additionalProperties": False,
         },
     ),
+    Tool(
+        name="get_open_orders",
+        description=(
+            "List currently open orders (pending, partially filled, or "
+            "awaiting cancellation) for the active IBKR account. Returns "
+            "order_id, symbol, action, order_type, quantity, prices, "
+            "status, parent_id, oca_group for each. Use before cancel_order "
+            "or cancel_all_orders to know what's out there."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="cancel_order",
+        description=(
+            "Cancel a single open order by its IB order_id. Honors the "
+            "destructive-action confirmation gate: returns a preview when "
+            "REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is on and confirm "
+            "is not true."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when the destructive-tool gate is on.",
+                },
+            },
+            "required": ["order_id"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="cancel_all_orders",
+        description=(
+            "Cancel every open order for the active IBKR account, optionally "
+            "filtered to a specific symbol. Returns a preview unless "
+            "confirm=true and the destructive-action gate is enabled. "
+            "Used by the dashboard's 'Cancel All' button + the Take "
+            "Profits flow (cancels attached child orders before the new "
+            "SELL is placed)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Optional. Filter cancellations to one symbol; omit to cancel everything.",
+                },
+                "account": {"type": "string"},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when the destructive-tool gate is on.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 
@@ -872,6 +938,25 @@ async def call_tool(
                 oca_group_name=arguments["oca_group_name"],
                 oca_type=arguments.get("oca_type", 1),
                 dry_run=arguments.get("dry_run", False),
+                confirm=arguments.get("confirm", False),
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "get_open_orders":
+            result = await ibkr_client.get_open_orders(arguments.get("account"))
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "cancel_order":
+            result = await ibkr_client.cancel_order(
+                order_id=arguments["order_id"],
+                confirm=arguments.get("confirm", False),
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+        elif name == "cancel_all_orders":
+            result = await ibkr_client.cancel_all_orders(
+                symbol=arguments.get("symbol"),
+                account=arguments.get("account"),
                 confirm=arguments.get("confirm", False),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]

@@ -405,7 +405,183 @@ class IBKRClient:
         except Exception as e:
             self.logger.error(f"Portfolio request failed: {e}")
             raise RuntimeError(f"IBKR API error: {str(e)}")
-    
+
+    async def get_open_orders(self, account: Optional[str] = None) -> List[Dict]:
+        """Return current open orders for the (active) account.
+
+        Uses ``ib.openTrades()`` which is the cached, account-update-driven
+        list of active trades (orders that have been transmitted and are
+        either pending fill, partially filled, or awaiting cancellation).
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+        target = account or self.current_account
+        trades = list(self.ib.openTrades())
+        out = []
+        for t in trades:
+            try:
+                if target and getattr(t.order, "account", None) != target:
+                    continue
+                out.append({
+                    "order_id": t.order.orderId,
+                    "perm_id": getattr(t.order, "permId", None),
+                    "symbol": t.contract.symbol,
+                    "sec_type": getattr(t.contract, "secType", "STK"),
+                    "action": t.order.action,
+                    "order_type": t.order.orderType,
+                    "quantity": float(t.order.totalQuantity or 0),
+                    "limit_price": float(t.order.lmtPrice) if t.order.lmtPrice else None,
+                    "stop_price": float(t.order.auxPrice) if t.order.auxPrice else None,
+                    "tif": t.order.tif,
+                    "status": t.orderStatus.status,
+                    "filled": float(t.orderStatus.filled or 0),
+                    "remaining": float(t.orderStatus.remaining or 0),
+                    "parent_id": getattr(t.order, "parentId", 0) or None,
+                    "oca_group": getattr(t.order, "ocaGroup", "") or None,
+                })
+            except Exception as e:
+                self.logger.warning(f"open_orders: skipping malformed trade: {e}")
+        return out
+
+    async def cancel_order(self, order_id: int, confirm: bool = False) -> Dict:
+        """Cancel one open order by IB order_id.
+
+        Honors the destructive-action confirmation gate: when
+        REQUIRE_CONFIRMATION_FOR_DESTRUCTIVE_TOOLS is set and ``confirm``
+        is False, returns a preview without cancelling.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+        try:
+            order_id = int(order_id)
+        except (TypeError, ValueError):
+            return {"status": "error", "message": f"invalid order_id: {order_id!r}"}
+
+        target = None
+        for t in self.ib.openTrades():
+            if t.order.orderId == order_id:
+                target = t
+                break
+        if target is None:
+            return {
+                "status": "not_found",
+                "order_id": order_id,
+                "message": f"no open order with id {order_id}",
+            }
+
+        if self._needs_confirmation(confirm):
+            return self._confirm_response(
+                action="cancel_order",
+                preview={
+                    "order_id": order_id,
+                    "symbol": target.contract.symbol,
+                    "action": target.order.action,
+                    "order_type": target.order.orderType,
+                    "quantity": float(target.order.totalQuantity or 0),
+                    "filled": float(target.orderStatus.filled or 0),
+                    "remaining": float(target.orderStatus.remaining or 0),
+                    "status": target.orderStatus.status,
+                },
+                hint="Pass confirm=true to cancel this order.",
+            )
+
+        try:
+            self.ib.cancelOrder(target.order)
+        except Exception as e:
+            return {"status": "error", "order_id": order_id, "message": str(e)}
+        return {
+            "status": "cancel_requested",
+            "order_id": order_id,
+            "symbol": target.contract.symbol,
+            "action": target.order.action,
+            "order_type": target.order.orderType,
+        }
+
+    async def cancel_all_orders(
+        self,
+        symbol: Optional[str] = None,
+        account: Optional[str] = None,
+        confirm: bool = False,
+    ) -> Dict:
+        """Cancel every open order for the active account, optionally
+        filtered by symbol.
+
+        Honors the destructive-action confirmation gate: returns a
+        preview with the list of targeted orders unless ``confirm=True``.
+        Uses per-order ``cancelOrder`` (not ``reqGlobalCancel``) so the
+        filter applies cleanly and we can report per-order results.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+        target_acct = account or self.current_account
+        sym_filter = symbol.upper() if isinstance(symbol, str) and symbol.strip() else None
+
+        targets = []
+        for t in self.ib.openTrades():
+            if target_acct and getattr(t.order, "account", None) != target_acct:
+                continue
+            if sym_filter and t.contract.symbol.upper() != sym_filter:
+                continue
+            targets.append(t)
+
+        if not targets:
+            return {
+                "status": "no_op",
+                "cancelled": 0,
+                "filter_symbol": sym_filter or "(all)",
+                "message": "no matching open orders",
+            }
+
+        if self._needs_confirmation(confirm):
+            preview_orders = [
+                {
+                    "order_id": t.order.orderId,
+                    "symbol": t.contract.symbol,
+                    "action": t.order.action,
+                    "order_type": t.order.orderType,
+                    "quantity": float(t.order.totalQuantity or 0),
+                    "remaining": float(t.orderStatus.remaining or 0),
+                    "status": t.orderStatus.status,
+                }
+                for t in targets[:30]   # cap preview to avoid wall-of-text
+            ]
+            return self._confirm_response(
+                action="cancel_all_orders",
+                preview={
+                    "count": len(targets),
+                    "filter_symbol": sym_filter or "(all symbols)",
+                    "orders": preview_orders,
+                    "truncated": len(targets) > 30,
+                },
+                hint=f"Pass confirm=true to cancel {len(targets)} order(s).",
+            )
+
+        cancelled = []
+        errors = []
+        for t in targets:
+            try:
+                self.ib.cancelOrder(t.order)
+                cancelled.append({
+                    "order_id": t.order.orderId,
+                    "symbol": t.contract.symbol,
+                    "action": t.order.action,
+                    "order_type": t.order.orderType,
+                })
+            except Exception as e:
+                errors.append({
+                    "order_id": t.order.orderId,
+                    "symbol": t.contract.symbol,
+                    "error": str(e),
+                })
+        return {
+            "status": "cancelled" if cancelled else "errored",
+            "count": len(cancelled),
+            "error_count": len(errors),
+            "filter_symbol": sym_filter or "(all)",
+            "cancelled": cancelled,
+            "errors": errors,
+        }
+
     # Bug #1 fix: ib_async's `reqAccountSummaryAsync()` no longer takes
     # positional `(group, tags)` args. The correct pattern is to start a
     # subscription with `reqAccountSummary()` (sync, no args) and read cached
