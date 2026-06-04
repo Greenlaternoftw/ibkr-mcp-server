@@ -414,6 +414,14 @@ async def pivot_loops_create(request: Request) -> Response:
             {"error": f"a loop already exists for {symbol}; stop it first"},
             status_code=409,
         )
+    # Spawn the autonomous tick task. Idempotent -- if a task already
+    # exists (e.g. operator deleted+recreated quickly), the engine
+    # returns "already_running" without spawning a duplicate.
+    try:
+        from ..client import ibkr_client
+        await ibkr_client.start_pivot_loop_task(symbol)
+    except Exception as e:
+        logger.warning(f"pivot loop {symbol} created but engine spawn failed: {e}")
     await _publish(
         "pivot_loop_changed",
         client_id=body.get("client_id"),
@@ -493,13 +501,20 @@ async def pivot_loop_record_cycle(request: Request) -> Response:
 
 async def pivot_loop_stop(request: Request) -> Response:
     """Mark a loop as stopped. Row + cycle history preserved for review.
-    Returns the final state (with stopped_at timestamp)."""
+    Also cancels the engine tick task. Returns the final state."""
     sym = (request.path_params.get("symbol") or "").strip().upper()
     out = _get_store().stop_pivot_loop(sym)
     if out is None:
         return JSONResponse(
             {"error": "no active loop for that symbol"}, status_code=404
         )
+    # Cancel the autonomous tick task -- engine.stop_pivot_loop_task is
+    # idempotent so a double-stop just yields "not_running".
+    try:
+        from ..client import ibkr_client
+        await ibkr_client.stop_pivot_loop_task(sym)
+    except Exception as e:
+        logger.warning(f"pivot loop {sym} marked stopped but task cancel failed: {e}")
     await _publish(
         "pivot_loop_changed",
         client_id=request.query_params.get("client_id"),

@@ -112,6 +112,11 @@ class IBKRClient:
         self._swing_tasks: Dict[str, asyncio.Task] = {}
         self._swing_state_path = SWING_STATE_PATH
 
+        # Layer 5 — pivot-loop engine (Phase B). One asyncio Task per
+        # active loop; state lives in chat.db (pivot_loops table). See
+        # ibkr_mcp_server.pivot_loop for the decision policy + tick logic.
+        self._pivot_tasks: Dict[str, asyncio.Task] = {}
+
         # Bug class #5/#6/#7 — single bad IB call could wedge the entire server
         # via unbounded awaits on a shared connection. Three defences:
         #   1. _order_lock serializes order placements so a slow one can't
@@ -2527,11 +2532,354 @@ class IBKRClient:
         # Reuse the same lookup as fill events; same outcome (schedule a tick).
         self._on_exec_details_for_strategies(trade, None)
 
+    # === Layer 5: Pivot-loop engine ====================================
+
+    async def start_pivot_loop_task(self, symbol: str) -> Dict[str, Any]:
+        """Spawn the autonomous tick task for ``symbol``. Idempotent --
+        if a task is already running for this symbol it's a no-op."""
+        symbol = symbol.upper().strip()
+        existing = self._pivot_tasks.get(symbol)
+        if existing and not existing.done():
+            return {"status": "already_running", "symbol": symbol}
+        self._pivot_tasks[symbol] = asyncio.create_task(
+            self._pivot_outer_loop(symbol)
+        )
+        self.logger.info(f"pivot-loop engine: started task for {symbol}")
+        return {"status": "started", "symbol": symbol}
+
+    async def stop_pivot_loop_task(self, symbol: str) -> Dict[str, Any]:
+        """Cancel the tick task. Does NOT close any open position --
+        caller is responsible for ordering the close first (the dashboard
+        Stop Loop button + the chat agent's stop_pivot_loop flow handle
+        that)."""
+        symbol = symbol.upper().strip()
+        task = self._pivot_tasks.pop(symbol, None)
+        if task and not task.done():
+            task.cancel()
+            self.logger.info(f"pivot-loop engine: cancelled task for {symbol}")
+            return {"status": "cancelled", "symbol": symbol}
+        return {"status": "not_running", "symbol": symbol}
+
+    async def _pivot_outer_loop(self, symbol: str) -> None:
+        """Outer task: tick → sleep → tick. Tick interval adapts to RTH
+        (60s) vs OTH (300s) so we don't burn CPU outside hours."""
+        from . import pivot_loop as engine_mod
+        try:
+            while True:
+                try:
+                    await self._pivot_tick(symbol)
+                except Exception:
+                    self.logger.exception(
+                        f"pivot-loop engine: tick failed for {symbol}"
+                    )
+                # Re-read the interval each iteration so we transition
+                # cadence cleanly at 9:30 ET / 16:00 ET.
+                await asyncio.sleep(engine_mod.current_tick_interval())
+        except asyncio.CancelledError:
+            self.logger.info(f"pivot-loop engine: outer loop for {symbol} cancelled")
+            raise
+
+    async def _pivot_tick(self, symbol: str) -> Dict[str, Any]:
+        """One tick: read state, decide, execute, record. Returns a
+        small dict describing what happened (for observability + tests).
+        Defensive against every external failure -- a bad IBKR call OR
+        a missing yfinance dep OR a SQLite hiccup just yields a logged
+        warning and a "skipped" result, never a tick-loop crash."""
+        # Lazy imports to avoid circular imports (pivot.py / catalysts.py
+        # import nothing from client; routes.py provides _get_store).
+        from .chat.routes import _get_store
+        from . import pivot as pivot_mod
+        from . import catalysts as cat_mod
+        from . import pivot_loop as engine_mod
+        try:
+            from .notify import send as _ntfy_send
+            def notify_warning(title, msg):
+                _ntfy_send(title, msg, priority=4, tags=["warning"])
+            def notify_info(title, msg):
+                _ntfy_send(title, msg, priority=3, tags=["chart_with_upwards_trend"])
+        except Exception:
+            notify_warning = notify_info = lambda *_a, **_k: None  # noqa: E731
+
+        store = _get_store()
+        loop = store.get_pivot_loop(symbol)
+        if loop is None or loop["status"] == "stopped":
+            # Loop is gone -- cancel ourselves (idempotent if already cancelled).
+            asyncio.create_task(self.stop_pivot_loop_task(symbol))
+            return {"action": "self_cancelled", "reason": "loop missing or stopped"}
+
+        # Fetch bars + catalysts for the analysis.
+        try:
+            bars = await self.get_historical_bars(
+                symbol, lookback_days=loop["lookback_days"] + 5
+            )
+        except Exception as e:
+            self.logger.warning(f"pivot-loop {symbol}: bars fetch failed: {e}")
+            return {"action": "skipped", "reason": f"bars: {e}"}
+        if len(bars) > loop["lookback_days"]:
+            bars = bars.tail(loop["lookback_days"]).reset_index(drop=True)
+        catalysts = cat_mod.get_upcoming_catalysts(
+            symbol, horizon_days=max(loop["lookback_days"], 30)
+        )
+        try:
+            analysis = pivot_mod.analyze_pivot_loop(
+                bars, catalysts,
+                catalyst_horizon_days=loop["catalyst_horizon_days"],
+            )
+        except ValueError as e:
+            self.logger.warning(f"pivot-loop {symbol}: analysis failed: {e}")
+            return {"action": "skipped", "reason": f"analysis: {e}"}
+
+        # Probe IBKR side-state needed by the decision policy.
+        has_open_position = await self._symbol_has_open_position(symbol)
+        cycles = store.get_pivot_loop_cycles(symbol, limit=3)
+        recent_losses = sum(1 for c in cycles if c.get("win") == 0)
+
+        decision = engine_mod.decide_next_action(
+            loop, analysis,
+            has_open_position=has_open_position,
+            last_3_cycles_losses=recent_losses,
+        )
+
+        # Execute the decision.
+        if decision.action == "no_op":
+            # If the decision flagged a revert-to-waiting (entry IOC
+            # didn't fill), unwind the entry_pending state.
+            if (decision.extra or {}).get("revert_to_waiting"):
+                store.update_pivot_loop(symbol, status="waiting")
+            return {"action": "no_op", "reason": decision.reason}
+
+        if decision.action == "auto_stop":
+            self.logger.warning(
+                f"pivot-loop {symbol}: AUTO-STOP -- {decision.reason}"
+            )
+            store.stop_pivot_loop(symbol)
+            notify_warning(
+                f"Pivot loop AUTO-STOPPED: {symbol}",
+                decision.reason,
+            )
+            asyncio.create_task(self.stop_pivot_loop_task(symbol))
+            return {"action": "auto_stop", "reason": decision.reason}
+
+        if decision.action == "place_entry":
+            return await self._pivot_place_entry(
+                symbol, loop, decision, notify_info, store,
+            )
+
+        if decision.action == "place_oca":
+            return await self._pivot_place_oca(
+                symbol, loop, decision, notify_info, store,
+            )
+
+        if decision.action == "force_exit":
+            return await self._pivot_force_exit(
+                symbol, loop, analysis, notify_warning, store,
+            )
+
+        if decision.action == "record_cycle":
+            return await self._pivot_record_cycle(
+                symbol, loop, notify_info, store,
+            )
+
+        # monitor_entry / monitor_holding -- just observability.
+        return {"action": decision.action, "reason": decision.reason}
+
+    # ----- pivot-tick execution helpers --------------------------------
+
+    async def _symbol_has_open_position(self, symbol: str) -> bool:
+        """Quick check: do we hold any shares of `symbol` in the active
+        account right now? Uses ib.portfolio() so we read live."""
+        try:
+            target = self.current_account
+            for item in self.ib.portfolio():
+                if (target and getattr(item, "account", None) != target):
+                    continue
+                if (getattr(item.contract, "symbol", "").upper() == symbol.upper()
+                        and abs(float(getattr(item, "position", 0) or 0)) > 0):
+                    return True
+        except Exception as e:
+            self.logger.debug(f"_symbol_has_open_position({symbol}): {e}")
+        return False
+
+    async def _pivot_place_entry(self, symbol, loop, decision, notify_info, store):
+        """Place a BUY LMT IOC sized to current_capital."""
+        extra = decision.extra or {}
+        # Live ask for sizing.
+        try:
+            md = await self.get_market_data(symbol)
+        except Exception as e:
+            return {"action": "entry_failed", "reason": f"market data: {e}"}
+        ask = float(md.get("ask") or md.get("last") or 0)
+        if ask <= 0:
+            return {"action": "entry_failed", "reason": "no live ask"}
+        capital = float(loop["current_capital"])
+        # Add a small price buffer above ask for IOC fill probability,
+        # then size to integer shares.
+        limit_price = round(ask * 1.003 + 0.10, 2)
+        shares = max(1, int(capital / limit_price))
+        result = await self.place_order(
+            symbol=symbol, action="BUY", quantity=shares,
+            order_type="LMT", limit_price=limit_price, tif="IOC",
+            outside_rth=True, confirm=True,
+        )
+        status = (result or {}).get("status")
+        if status in ("submitted", "transmitted", "filled", "needs_confirmation"):
+            store.update_pivot_loop(
+                symbol, status="entry_pending", current_shares=shares,
+                entry_price=ask,
+            )
+            notify_info(
+                f"Pivot loop entry submitted: {symbol}",
+                f"{shares} sh @ ~${ask:.2f} (cap ${capital:.0f})",
+            )
+            return {"action": "entry_placed", "shares": shares, "ask": ask}
+        return {"action": "entry_failed", "result": result}
+
+    async def _pivot_place_oca(self, symbol, loop, decision, notify_info, store):
+        """Entry filled -- attach OCA(target LMT GTC + stop STP)."""
+        extra = decision.extra or {}
+        target = float(extra.get("target_price") or loop.get("target_price") or 0)
+        stop = float(extra.get("stop_price") or loop.get("stop_price") or 0)
+        if target <= 0 or stop <= 0:
+            return {"action": "oca_failed", "reason": "missing target/stop"}
+        shares = int(loop.get("current_shares") or 0)
+        if shares <= 0:
+            # Re-derive from IBKR portfolio.
+            for it in self.ib.portfolio():
+                if (getattr(it.contract, "symbol", "").upper() == symbol.upper()
+                        and abs(float(getattr(it, "position", 0) or 0)) > 0):
+                    shares = abs(int(it.position))
+                    break
+        if shares <= 0:
+            return {"action": "oca_failed", "reason": "no position to protect"}
+        grp = f"pivot-{symbol.lower()}-{int(dt.datetime.now(dt.timezone.utc).timestamp())}"
+        legs = [
+            {"symbol": symbol, "action": "SELL", "quantity": shares,
+             "order_type": "LMT", "limit_price": target, "tif": "GTC",
+             "outside_rth": True},
+            {"symbol": symbol, "action": "SELL", "quantity": shares,
+             "order_type": "STP", "stop_price": stop, "tif": "GTC",
+             "outside_rth": True},
+        ]
+        try:
+            result = await self.place_oca_group(
+                oca_group_name=grp, orders=legs, confirm=True,
+            )
+        except Exception as e:
+            return {"action": "oca_failed", "reason": str(e)}
+
+        # Look up the entry fill price now.
+        entry_fill = None
+        for it in self.ib.portfolio():
+            if (getattr(it.contract, "symbol", "").upper() == symbol.upper()
+                    and abs(float(getattr(it, "position", 0) or 0)) > 0):
+                entry_fill = float(getattr(it, "averageCost", 0) or 0)
+                break
+        store.update_pivot_loop(
+            symbol, status="holding", current_shares=shares,
+            entry_fill_price=entry_fill,
+        )
+        notify_info(
+            f"Pivot loop HOLDING: {symbol}",
+            f"{shares} sh @ ${entry_fill:.2f}; OCA target ${target} / stop ${stop}",
+        )
+        return {"action": "oca_placed", "target": target, "stop": stop,
+                "entry_fill": entry_fill}
+
+    async def _pivot_force_exit(self, symbol, loop, analysis, notify_warning, store):
+        """Catalyst-driven close: cancel OCA siblings, fast SELL LMT IOC."""
+        # Cancel any open orders for this symbol first (the OCA pair).
+        try:
+            await self.cancel_all_orders(symbol=symbol, confirm=True)
+        except Exception as e:
+            self.logger.warning(f"pivot-loop {symbol}: pre-exit cancel failed: {e}")
+        # Get bid for the LMT IOC.
+        try:
+            md = await self.get_market_data(symbol)
+        except Exception as e:
+            return {"action": "force_exit_failed", "reason": f"market data: {e}"}
+        bid = float(md.get("bid") or md.get("last") or 0)
+        if bid <= 0:
+            return {"action": "force_exit_failed", "reason": "no live bid"}
+        shares = int(loop.get("current_shares") or 0)
+        if shares <= 0:
+            return {"action": "force_exit_failed", "reason": "no shares to close"}
+        limit_price = round(max(bid * 0.997 - 0.10, 0.01), 2)
+        result = await self.place_order(
+            symbol=symbol, action="SELL", quantity=shares,
+            order_type="LMT", limit_price=limit_price, tif="DAY",
+            outside_rth=True, confirm=True,
+        )
+        store.update_pivot_loop(symbol, status="exit_pending")
+        notify_warning(
+            f"Pivot loop catalyst exit: {symbol}",
+            f"closing {shares} sh @ LMT ${limit_price} (catalyst in {analysis.days_to_next_catalyst}d)",
+        )
+        return {"action": "force_exit_placed", "result": result}
+
+    async def _pivot_record_cycle(self, symbol, loop, notify_info, store):
+        """Position has been closed externally (OCA child fired). Record
+        the realized cycle by looking up the most recent SELL fill on
+        this symbol from ib.trades()."""
+        entry_fill = float(loop.get("entry_fill_price") or 0)
+        shares = int(loop.get("current_shares") or 0)
+        if entry_fill <= 0 or shares <= 0:
+            # Nothing to compute -- just reset to waiting.
+            store.update_pivot_loop(symbol, status="waiting", current_shares=0,
+                                    entry_fill_price=None)
+            return {"action": "cycle_skipped",
+                    "reason": "no entry context to record"}
+
+        # Find the most recent filled SELL trade for this symbol.
+        exit_fill = None
+        exit_reason = "target"
+        try:
+            trades = list(self.ib.trades())
+        except Exception:
+            trades = []
+        for t in reversed(trades):
+            try:
+                if (getattr(t.contract, "symbol", "").upper() == symbol.upper()
+                        and getattr(t.order, "action", "") == "SELL"
+                        and getattr(t.orderStatus, "status", "") == "Filled"):
+                    exit_fill = float(t.orderStatus.avgFillPrice)
+                    # If it was a STP child, exit_reason = stop
+                    if getattr(t.order, "orderType", "") == "STP":
+                        exit_reason = "stop"
+                    break
+            except Exception:
+                continue
+        if exit_fill is None:
+            exit_fill = entry_fill  # break-even fallback; conservative
+            exit_reason = "manual"
+
+        realized = (exit_fill - entry_fill) * shares
+        capital_at_start = float(loop["current_capital"])
+        updated = store.record_pivot_loop_cycle(
+            symbol,
+            capital_at_start=capital_at_start,
+            entry_price=loop.get("entry_price"),
+            entry_fill=entry_fill,
+            entry_at=None,
+            shares=shares,
+            exit_fill=exit_fill,
+            exit_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            exit_reason=exit_reason,
+            realized_pnl=realized,
+        )
+        notify_info(
+            f"Pivot cycle {updated.get('cycle_count', '?')} ({exit_reason.upper()}): {symbol}",
+            f"P&L ${realized:+.2f}; capital now ${updated.get('current_capital', 0):.0f}",
+        )
+        return {"action": "cycle_recorded", "realized_pnl": realized,
+                "exit_reason": exit_reason}
+
+    # === end Pivot-loop engine =========================================
+
     async def resume_strategies_from_state(self) -> Dict[str, Any]:
         """On daemon startup, restart asyncio tasks for any active strategies
         that were running before the previous shutdown.
         """
-        resumed: Dict[str, Any] = {"reversal": [], "swing": []}
+        resumed: Dict[str, Any] = {"reversal": [], "swing": [], "pivot": []}
 
         # Reversal entries that were mid-execution
         for symbol, state in self._reversal_state_dict().items():
@@ -2562,6 +2910,26 @@ class IBKRClient:
                 self.logger.info(
                     f"resumed swing strategy for {symbol} (state={state.state.value})"
                 )
+
+        # Pivot loops that were running (Phase B). Read active loops
+        # from chat.db's pivot_loops table and spawn a tick task per
+        # symbol. Idempotent -- if a task already exists, skip.
+        try:
+            from .chat.routes import _get_store
+            for loop_row in _get_store().list_pivot_loops(include_stopped=False):
+                sym = loop_row["symbol"]
+                existing = self._pivot_tasks.get(sym)
+                if existing and not existing.done():
+                    continue
+                self._pivot_tasks[sym] = asyncio.create_task(
+                    self._pivot_outer_loop(sym)
+                )
+                resumed["pivot"].append(sym)
+                self.logger.info(
+                    f"resumed pivot loop for {sym} (status={loop_row['status']})"
+                )
+        except Exception as e:
+            self.logger.warning(f"could not resume pivot loops: {e}")
 
         return resumed
 

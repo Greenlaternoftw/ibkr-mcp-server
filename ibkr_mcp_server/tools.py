@@ -1103,6 +1103,12 @@ async def call_tool(
                     max_drawdown_pct=float(arguments.get("max_drawdown_pct", 50.0)),
                     notes=arguments.get("notes"),
                 )
+                # Spawn the autonomous tick task so the loop starts
+                # ticking immediately. Idempotent.
+                try:
+                    await ibkr_client.start_pivot_loop_task(arguments["symbol"])
+                except Exception as e:
+                    loop["engine_warning"] = f"engine spawn failed: {e}"
                 return [TextContent(
                     type="text", text=json.dumps(loop, indent=2, default=str),
                 )]
@@ -1185,6 +1191,13 @@ async def call_tool(
                     type="text",
                     text=json.dumps({"error": f"no active loop for {sym}"}),
                 )]
+            # Cancel the autonomous tick task too -- otherwise it would
+            # keep ticking against a 'stopped' row and immediately
+            # self-cancel on the next tick anyway.
+            try:
+                await ibkr_client.stop_pivot_loop_task(sym)
+            except Exception as e:
+                out["engine_warning"] = f"task cancel failed: {e}"
             return [TextContent(
                 type="text", text=json.dumps(out, indent=2, default=str),
             )]

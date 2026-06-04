@@ -191,7 +191,9 @@ class TestResumeStrategies:
         with patch.object(client, "_reversal_loop", _fake_loop), \
              patch.object(client, "_swing_loop", _fake_loop):
             resumed = await client.resume_strategies_from_state()
-        assert resumed == {"reversal": [], "swing": []}
+        # Pivot key added in Phase B (pivot loop engine).  No active
+        # pivot loops in this fixture so the list is empty.
+        assert resumed == {"reversal": [], "swing": [], "pivot": []}
 
 
 # --- reconciliation on startup --------------------------------------------
