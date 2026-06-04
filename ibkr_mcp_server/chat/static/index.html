@@ -3114,10 +3114,21 @@ function renderPortfolioStocks() {
     const ratingLabel = s.gatePassed
       ? s.rating
       : `<span style="font-size:13px; margin-right:4px;">✗</span> ${s.rating || 'GATE FAIL'}`;
-    const range = (s.projection30dLow != null && s.projection30dHigh != null)
-      ? `${fmt(s.projection30dLow)} – ${fmt(s.projection30dHigh)}`
+    // The 30D range and Updated columns get written under DIFFERENT
+    // field names depending on the code path:
+    //   - fresh research summary writes projection30dLow/High + lastUpdated
+    //   - load-from-DB writes s.range = [low, high] + updatedAt
+    //   - auto-sync writes (no range) + updatedAt
+    // Read both so all three paths render correctly. (Was a latent bug:
+    // the renderer only checked the summary names, so anything that
+    // reached the row via DB-load or auto-sync rendered as "—".)
+    const rangeLo = s.projection30dLow ?? (Array.isArray(s.range) ? s.range[0] : null);
+    const rangeHi = s.projection30dHigh ?? (Array.isArray(s.range) ? s.range[1] : null);
+    const range = (rangeLo != null && rangeHi != null)
+      ? `${fmt(rangeLo)} – ${fmt(rangeHi)}`
       : '—';
-    const updated = s.lastUpdated ? timeSince(s.lastUpdated) : '—';
+    const updatedIso = s.updatedAt || s.lastUpdated;
+    const updated = updatedIso ? timeSince(updatedIso) : '—';
     const status = s._loading
       ? '<td colspan="6" style="color:var(--accent); text-align:center; font-size:10px; letter-spacing:0.15em;">FETCHING…</td>'
       : s._error
