@@ -2764,6 +2764,15 @@ class IBKRClient:
         except Exception as e:
             self.logger.debug(f"pivot-loop {symbol}: news fetch failed: {e}")
             news = None
+        # Phase D2: forward-looking IV30 from the IBKR option chain.
+        # Cached 1h. None on fetch failure -> analysis falls back to
+        # the realized-vol proxy (Phase D, still wired).
+        try:
+            from . import iv30 as iv_mod
+            iv30_pct = await iv_mod.get_iv30_pct(self, symbol)
+        except Exception as e:
+            self.logger.debug(f"pivot-loop {symbol}: IV fetch failed: {e}")
+            iv30_pct = None
         # Per-loop tunables (Phase 6). Fall back to the function-level
         # defaults when None -- the loop row may have these unset for
         # symbols the operator hasn't customized.
@@ -2788,6 +2797,7 @@ class IBKRClient:
                 catalyst_horizon_days=loop["catalyst_horizon_days"],
                 market_regime_enabled=market_regime_enabled,
                 news_sentiment=news,
+                iv30_pct=iv30_pct,
                 **kwargs_overrides,
             )
         except ValueError as e:

@@ -85,7 +85,16 @@ class PivotAnalysis:
     recent_vol_pct: Optional[float] = None        # stdev of last 5 returns
     lookback_vol_pct: Optional[float] = None      # stdev of full window
     vol_ratio: Optional[float] = None             # recent / lookback
-    vol_ok: Optional[bool] = None                 # ratio <= max_vol_ratio
+    vol_ok: Optional[bool] = None                 # gate decision
+
+    # True implied volatility (Phase D2). ATM 30-day call IV from the
+    # IBKR option chain, expressed as annualized % (e.g. 22.4 = 22.4%).
+    # When provided AND > 0, the gate uses IV instead of realized vol:
+    # `iv_ok = iv30_pct <= iv_block_threshold_pct`. When None, the gate
+    # falls back to the realized-vol-ratio decision in vol_ok above
+    # (Phase D continues to apply as a fallback signal).
+    iv30_pct: Optional[float] = None
+    vol_signal_source: Optional[str] = None       # "iv30" / "realized" / None
 
     # News sentiment (Phase F). Computed by news_sentiment.py from the
     # last 7 days of headlines via Claude web-search, cached 6h.
@@ -272,6 +281,8 @@ def analyze_pivot_loop(
     max_vol_ratio: float = 1.5,
     market_regime_enabled: Optional[bool] = None,
     news_sentiment: Optional[Dict[str, Any]] = None,
+    iv30_pct: Optional[float] = None,
+    iv_block_threshold_pct: float = 50.0,
 ) -> PivotAnalysis:
     """Compute the pivot-loop analysis from a bars DataFrame + catalyst list.
 
@@ -379,14 +390,30 @@ def analyze_pivot_loop(
             f"⚠️ volume ratio {vol_stats['volume_ratio']:.2f} below "
             f"{min_volume_ratio:.2f} -- recent bars are low-conviction"
         )
-    if rvol_stats["vol_ok"] is False:
-        notes.append(
-            f"⚠️ realized volatility expanding: recent "
-            f"{rvol_stats['recent_vol_pct']}% vs {rvol_stats['lookback_vol_pct']}% "
-            f"baseline (ratio {rvol_stats['vol_ratio']:.2f}× > "
-            f"{max_vol_ratio:.2f}× threshold) -- unseen event risk likely "
-            "being priced in"
-        )
+    # Resolve effective vol-gate. IV (forward-looking) wins when
+    # available; realized vol is the fallback signal otherwise.
+    if iv30_pct is not None and iv30_pct > 0:
+        vol_signal_source = "iv30"
+        vol_gate_ok = iv30_pct <= iv_block_threshold_pct
+        # Stash IV-derived decision into the same field so downstream
+        # consumers (engine, dashboard) read a single gate result.
+        rvol_stats["vol_ok"] = vol_gate_ok
+        if not vol_gate_ok:
+            notes.append(
+                f"⚠️ IV30 {iv30_pct:.1f}% > {iv_block_threshold_pct:.0f}% "
+                f"threshold -- options market is pricing in significant "
+                "near-term volatility (event risk)"
+            )
+    else:
+        vol_signal_source = "realized" if rvol_stats["vol_ok"] is not None else None
+        if rvol_stats["vol_ok"] is False:
+            notes.append(
+                f"⚠️ realized volatility expanding: recent "
+                f"{rvol_stats['recent_vol_pct']}% vs {rvol_stats['lookback_vol_pct']}% "
+                f"baseline (ratio {rvol_stats['vol_ratio']:.2f}× > "
+                f"{max_vol_ratio:.2f}× threshold) -- unseen event risk likely "
+                "being priced in"
+            )
     if market_regime_enabled is False:
         notes.append(
             "⚠️ broader market regime is risk-off (SPY trend/ADX gate failed) "
@@ -436,12 +463,20 @@ def analyze_pivot_loop(
             "tape on a mean-reversion entry"
         )
     elif rvol_stats["vol_ok"] is False:
-        # Phase D -- realized vol expansion = unseen event being priced in.
-        recommendation = (
-            f"WAIT — realized vol expanding "
-            f"({rvol_stats['vol_ratio']:.2f}× baseline); event likely "
-            "being priced in even without a named catalyst"
-        )
+        # Phase D / D2 -- vol gate fired. Source tells the operator
+        # whether it's the forward-looking IV signal or the realized
+        # proxy.
+        if vol_signal_source == "iv30":
+            recommendation = (
+                f"WAIT — IV30 {iv30_pct:.1f}% > {iv_block_threshold_pct:.0f}% "
+                "threshold; options market pricing in event risk"
+            )
+        else:
+            recommendation = (
+                f"WAIT — realized vol expanding "
+                f"({rvol_stats['vol_ratio']:.2f}× baseline); event likely "
+                "being priced in even without a named catalyst"
+            )
     elif news_sentiment_ok is False:
         # Phase F -- recent news sentiment net-negative
         recommendation = (
@@ -501,6 +536,8 @@ def analyze_pivot_loop(
         lookback_vol_pct=rvol_stats["lookback_vol_pct"],
         vol_ratio=rvol_stats["vol_ratio"],
         vol_ok=rvol_stats["vol_ok"],
+        iv30_pct=iv30_pct,
+        vol_signal_source=vol_signal_source,
         news_score=news_score,
         news_sentiment_ok=news_sentiment_ok,
         news_top_negative=news_top_negative,

@@ -396,6 +396,60 @@ class TestVolExpansionGate:
         assert any("realized vol" in n.lower() for n in a.notes)
 
 
+class TestIV30Gate:
+    """Phase D2 -- forward-looking IV beats realized-vol when present."""
+
+    def _flat_at_entry(self):
+        return pd.DataFrame(
+            [(102, 100, 100)] * 5,
+            columns=["high", "low", "close"],
+        )
+
+    def test_iv30_none_falls_back_to_realized_vol(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(bars, iv30_pct=None)
+        assert a.iv30_pct is None
+        # vol_signal_source either 'realized' (if rvol computed) or None
+        assert a.vol_signal_source in ("realized", None)
+
+    def test_low_iv30_passes(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(bars, iv30_pct=22.0, iv_block_threshold_pct=50.0)
+        assert a.iv30_pct == 22.0
+        assert a.vol_signal_source == "iv30"
+        assert a.vol_ok is True
+        assert a.recommendation.startswith("BUY")
+
+    def test_high_iv30_blocks(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(bars, iv30_pct=65.0, iv_block_threshold_pct=50.0)
+        assert a.iv30_pct == 65.0
+        assert a.vol_signal_source == "iv30"
+        assert a.vol_ok is False
+        assert a.recommendation.startswith("WAIT")
+        assert "IV30" in a.recommendation or "iv30" in a.recommendation
+
+    def test_iv30_overrides_realized_vol_decision(self):
+        # Even if realized vol would have blocked (high recent stdev),
+        # a calm IV30 reading should pass -- forward-looking wins.
+        bars = pd.DataFrame(
+            # Construct big recent realized vol so vol_ok WOULD be False:
+            [(100, 99, 99.5)] * 15 + [(110, 90, 110), (90, 80, 80),
+                                       (110, 90, 110), (90, 80, 80)],
+            columns=["high", "low", "close"],
+        )
+        a = pivot.analyze_pivot_loop(bars, iv30_pct=20.0, iv_block_threshold_pct=50.0)
+        # IV says calm → vol_ok True regardless of realized chaos
+        assert a.vol_signal_source == "iv30"
+        assert a.vol_ok is True
+
+    def test_iv30_block_message_specific(self):
+        bars = self._flat_at_entry()
+        a = pivot.analyze_pivot_loop(bars, iv30_pct=70.0)
+        assert "IV30" in a.recommendation
+        assert "options market" in " ".join(a.notes).lower()
+
+
 class TestNewsSentimentGate:
     """Phase F -- net-negative news blocks new entries."""
 

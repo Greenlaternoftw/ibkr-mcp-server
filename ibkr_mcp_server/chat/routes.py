@@ -614,11 +614,20 @@ async def pivot_analysis(request: Request) -> Response:
     except Exception:
         news = None
 
+    # Phase D2 -- forward-looking IV30 from IBKR option chain.
+    # Cached 1h. None on failure -> falls back to realized-vol proxy.
+    from .. import iv30 as iv_mod
+    try:
+        iv30_pct = await iv_mod.get_iv30_pct(ibkr_client, sym)
+    except Exception:
+        iv30_pct = None
+
     try:
         analysis = pivot_mod.analyze_pivot_loop(
             bars, catalysts,
             market_regime_enabled=market_regime_enabled,
             news_sentiment=news,
+            iv30_pct=iv30_pct,
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

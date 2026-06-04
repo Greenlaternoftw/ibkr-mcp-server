@@ -2424,6 +2424,11 @@
             </div>
 
             <div class="qx-construct-row">
+              <span class="qx-c-key">IV30 (forward-looking)</span>
+              <span class="qx-c-val" id="loopIV30">—</span>
+            </div>
+
+            <div class="qx-construct-row">
               <span class="qx-c-key">SPY market regime</span>
               <span class="qx-c-val" id="loopRegime">—</span>
             </div>
@@ -5279,6 +5284,22 @@ function _renderPivotResult(d) {
     } else {
       rvolEl.textContent = `⚠ ${d.recent_vol_pct}% recent vs ${d.lookback_vol_pct}% avg (${d.vol_ratio.toFixed(2)}× expanding)`;
       rvolEl.style.color = 'var(--stop)';
+    }
+  }
+
+  // IV30 row (Phase D2). null = couldn't fetch (option chain
+  // unavailable, name doesn't have liquid options); number = annualized
+  // %. The vol_signal_source field tells us whether the gate is
+  // actually using this number ("iv30") or fell back to realized.
+  const ivEl = document.getElementById('loopIV30');
+  if (ivEl) {
+    if (d.iv30_pct === null || d.iv30_pct === undefined) {
+      ivEl.textContent = '— (fetch unavailable; using realized-vol fallback)';
+      ivEl.style.color = 'var(--muted)';
+    } else {
+      const live = d.vol_signal_source === 'iv30' ? '✓ active gate' : '(observed; gate using realized)';
+      ivEl.textContent = `${d.iv30_pct.toFixed(1)}% ${live}`;
+      ivEl.style.color = d.vol_ok === false ? 'var(--stop)' : 'var(--go)';
     }
   }
 
