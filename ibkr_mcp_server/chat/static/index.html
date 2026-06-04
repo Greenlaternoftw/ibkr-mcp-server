@@ -1993,6 +1993,20 @@
 </head>
 <body>
 
+<!-- ============ LIVE-MODE BANNER ============
+     Shown only when daemon reports live_mode=true. Two states:
+       - calm (yellow): live but breaker not tripped
+       - alarmed (red): live + daily-loss circuit breaker tripped
+     Hidden in paper mode. -->
+<div id="liveBanner" style="display:none; padding:10px 16px; text-align:center;
+     font-family:'JetBrains Mono', monospace; font-size:12px; font-weight:700;
+     letter-spacing:0.1em; text-transform:uppercase; position:sticky; top:0;
+     z-index:11; border-bottom:2px solid; cursor:pointer;"
+     onclick="dispatchToChat('Claude, what\\'s the live trading safety status? Call /chat/api/live/status and summarize.');">
+  <span id="liveBannerText">— LIVE MODE —</span>
+  <span id="liveBannerSub" style="font-weight:400; letter-spacing:0; margin-left:8px; opacity:0.85;"></span>
+</div>
+
 <!-- ============ LOGIN OVERLAY (PIN gate) ============ -->
 <div class="login-overlay" id="loginOverlay">
   <div class="login-card">
@@ -2835,6 +2849,7 @@ async function bootAppPostPin() {
     await refreshAccountSummary();
     startAccountSummaryPolling();
     startPositionsPolling();
+    startLiveBannerPolling();
     startLiveSyncStream();
     await _ensureActiveThread();
     renderChatMessages();
@@ -5908,6 +5923,58 @@ async function refreshAccountSummary() {
   } catch (e) {
     // Quiet failure: leave tiles as-is. Common on IBKR disconnect.
   }
+}
+
+/* ============================================================
+   LIVE-MODE BANNER -- polls /chat/api/live/status every 15s.
+   In paper mode the endpoint reports live_mode=false and the
+   banner stays hidden. In live mode the banner is always visible:
+     - yellow background = live + normal
+     - red background    = live + daily-loss circuit breaker tripped
+   Tapping the banner asks Claude to summarize the status block.
+============================================================ */
+const LIVE_BANNER_REFRESH_MS = 15 * 1000;
+let _liveBannerTimer = null;
+
+async function refreshLiveBanner() {
+  const banner = document.getElementById('liveBanner');
+  const text = document.getElementById('liveBannerText');
+  const sub = document.getElementById('liveBannerSub');
+  if (!banner || !text || !sub) return;
+  let s;
+  try {
+    s = await daemonGet('/chat/api/live/status');
+  } catch (_) {
+    return;  // leave the banner in whatever state it was
+  }
+  if (!s.live_mode) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'block';
+  if (s.breaker_tripped) {
+    banner.style.background = '#dc2626';     // red-600
+    banner.style.color = '#fff';
+    banner.style.borderBottomColor = '#7f1d1d';
+    text.textContent = '🛑 LIVE — CIRCUIT BREAKER TRIPPED';
+    const pnl = s.breaker_tripped_at_pnl != null
+      ? `daily P&L $${s.breaker_tripped_at_pnl.toFixed(2)}` : '';
+    sub.textContent = `${pnl} · all loops auto-paused · tap for status`;
+  } else {
+    banner.style.background = '#facc15';     // yellow-400
+    banner.style.color = '#1f2937';          // gray-800
+    banner.style.borderBottomColor = '#a16207'; // yellow-700
+    text.textContent = '⚠ LIVE TRADING';
+    const cap = s.max_order_size_effective;
+    const lim = s.daily_loss_limit;
+    sub.textContent = `max order ${cap} sh · daily loss limit $${lim} · tap for status`;
+  }
+}
+
+function startLiveBannerPolling() {
+  if (_liveBannerTimer) clearInterval(_liveBannerTimer);
+  refreshLiveBanner();
+  _liveBannerTimer = setInterval(refreshLiveBanner, LIVE_BANNER_REFRESH_MS);
 }
 
 function startAccountSummaryPolling() {

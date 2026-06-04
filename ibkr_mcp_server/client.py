@@ -2321,6 +2321,35 @@ class IBKRClient:
                 # immediately. No await needed; no timeout needed for this line.
                 trade = self.ib.placeOrder(contract, ib_order)
 
+            # Per-order ntfy in live mode (best-effort). The existing
+            # _on_fill_for_chat handler pushes the FILL into chat; this
+            # handler pushes the SUBMIT to the operator's phone so they
+            # know an order just hit IBKR in real money. Skip in paper.
+            try:
+                from . import live_safety
+                from .notify import send as _ntfy_send
+                if (live_safety.is_live_mode()
+                        and settings.live_ntfy_every_order):
+                    side_emoji = "🟢" if req.action == "BUY" else "🔴"
+                    px_str = (
+                        f"@ ${req.limit_price:.2f}" if req.limit_price
+                        else f"({req.order_type})"
+                    )
+                    _ntfy_send(
+                        title=(
+                            f"{side_emoji} LIVE order submitted: "
+                            f"{req.action} {req.quantity} {req.symbol}"
+                        ),
+                        message=(
+                            f"{req.order_type} {px_str} "
+                            f"· order #{getattr(trade.order, 'orderId', '?')}"
+                        ),
+                        priority=4,
+                        tags=["money_with_wings"],
+                    )
+            except Exception:
+                pass  # don't let ntfy errors fail the order response
+
             return self._order_response(
                 "submitted",
                 req=req,
@@ -2681,6 +2710,37 @@ class IBKRClient:
             asyncio.create_task(self.stop_pivot_loop_task(symbol))
             return {"action": "self_cancelled", "reason": "loop missing or stopped"}
 
+        # Live-mode circuit breaker (cross-symbol, account-wide). If
+        # today's realized P&L blew through the daily loss limit, NO
+        # autonomous entries fire regardless of per-loop math. Checked
+        # BEFORE bars/catalyst fetches so we don't burn API quota when
+        # the breaker has already tripped.
+        try:
+            from . import live_safety
+            from .config import settings as _s
+            if live_safety.is_live_mode():
+                try:
+                    raw = await self.get_account_summary()
+                    summ = (raw or {}).get("summary") or {}
+                    realized = float(summ.get("RealizedPnL") or 0)
+                except Exception:
+                    realized = 0.0
+                if live_safety.check_daily_pnl_breaker(realized):
+                    # Auto-pause this loop -- write to SQLite so the
+                    # dashboard + chat reflect the state. The breaker
+                    # itself stays tripped until tomorrow OR manual reset.
+                    store.update_pivot_loop(symbol, status="paused")
+                    asyncio.create_task(self.stop_pivot_loop_task(symbol))
+                    return {
+                        "action": "live_breaker_pause",
+                        "reason": (
+                            f"daily P&L ${realized:.2f} ≤ "
+                            f"${_s.live_daily_loss_limit:.2f}"
+                        ),
+                    }
+        except Exception as e:
+            self.logger.debug(f"pivot-loop {symbol}: breaker check skipped: {e}")
+
         # Fetch bars + catalysts for the analysis.
         try:
             bars = await self.get_historical_bars(
@@ -3000,10 +3060,45 @@ class IBKRClient:
         # Pivot loops that were running (Phase B). Read active loops
         # from chat.db's pivot_loops table and spawn a tick task per
         # symbol. Idempotent -- if a task already exists, skip.
+        #
+        # Live-mode auto-pause-on-first-connect: when we connect in live
+        # mode AND the operator has live_auto_pause_loops_on_connect=True
+        # (default), flip every still-active loop to 'paused' BEFORE
+        # spawning tasks. Forces a manual unpause per symbol so nothing
+        # trades automatically on a freshly-flipped account with
+        # paper-tuned parameters.
         try:
             from .chat.routes import _get_store
-            for loop_row in _get_store().list_pivot_loops(include_stopped=False):
+            from . import live_safety
+            store = _get_store()
+            auto_pause = (
+                live_safety.is_live_mode()
+                and settings.live_auto_pause_loops_on_connect
+            )
+            for loop_row in store.list_pivot_loops(include_stopped=False):
                 sym = loop_row["symbol"]
+                if auto_pause and loop_row["status"] != "paused":
+                    store.update_pivot_loop(sym, status="paused")
+                    self.logger.warning(
+                        f"live mode: auto-paused pivot loop for {sym} "
+                        f"(was {loop_row['status']}); operator must "
+                        f"manually resume"
+                    )
+                    try:
+                        from .notify import send
+                        send(
+                            title=f"⏸ Pivot loop auto-paused: {sym}",
+                            message=(
+                                f"Daemon connected in LIVE mode -- {sym} "
+                                f"loop paused (was {loop_row['status']}). "
+                                f"Resume manually from the dashboard."
+                            ),
+                            priority=4,
+                            tags=["pause_button"],
+                        )
+                    except Exception:
+                        pass
+                    continue  # don't spawn a tick task for paused loops
                 existing = self._pivot_tasks.get(sym)
                 if existing and not existing.done():
                     continue

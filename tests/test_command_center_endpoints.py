@@ -368,6 +368,8 @@ class TestRoutesRegistered:
         expected = [
             (("GET", "HEAD"), "/chat/api/account/summary"),
             (("GET", "HEAD"), "/chat/api/positions"),
+            (("GET", "HEAD"), "/chat/api/live/status"),
+            (("POST",), "/chat/api/live/reset-breaker"),
             (("GET", "HEAD"), "/chat/api/pivot/{symbol}"),
             (("GET", "HEAD"), "/chat/api/loops"),
             (("POST",), "/chat/api/loops"),

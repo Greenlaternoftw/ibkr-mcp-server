@@ -35,6 +35,35 @@ class Settings(BaseSettings):
     max_order_size: int = 1000
     require_order_confirmation: bool = True
 
+    # === LIVE-MODE SAFETY RAILS ===
+    # Active when ibkr_is_paper=False. Additive on top of the existing
+    # safety knobs above. The pivot loop engine + place_order both
+    # consult these in live mode and refuse / circuit-break accordingly.
+    #
+    # Daily realized P&L floor. When today's cumulative realized P&L
+    # falls below this number (e.g. -500 = "lost $500 today"), all
+    # autonomous loops auto-pause and a phone alert fires. Operator
+    # must manually resume. Set generously (~2× expected daily VaR);
+    # this is a stop-the-bleeding rail, not a normal-day signal.
+    live_daily_loss_limit: float = -500.0
+
+    # Override max_order_size in live mode. Default 100 vs 1000 paper
+    # default -- forces conservative position sizing until operator
+    # explicitly raises it after observation.
+    live_max_order_size: int = 100
+
+    # On the first connect in live mode, all existing pivot loops are
+    # auto-paused (status='paused' in SQLite). Operator must manually
+    # resume each one. Prevents the engine from immediately taking
+    # trades on a freshly-flipped account with parameters tuned on
+    # paper data. Set False to disable the auto-pause behavior.
+    live_auto_pause_loops_on_connect: bool = True
+
+    # Send an ntfy push for every order placement when in live mode
+    # (in addition to the existing disconnect/reconnect alerts).
+    # In paper mode this is off -- too noisy.
+    live_ntfy_every_order: bool = True
+
     # When True, tools that cancel orders, stop strategies, or transmit live
     # orders return a "needs_confirmation" preview unless called with
     # confirm=true. Designed to prevent unintended destructive actions from

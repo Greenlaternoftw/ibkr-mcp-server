@@ -365,6 +365,31 @@ async def prefs_delete(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def live_status(request: Request) -> Response:
+    """Live-mode safety status for the dashboard banner.
+
+    Returns the live-mode flag, the effective max-order-size cap, the
+    daily-loss limit + breaker state. Cheap (in-process state); the
+    dashboard polls every ~30s alongside the account summary.
+    """
+    from .. import live_safety
+    return JSONResponse(live_safety.status_dict())
+
+
+async def live_breaker_reset(request: Request) -> Response:
+    """Operator escape hatch -- clear the daily loss circuit breaker.
+
+    Used when the breaker tripped but the operator has decided the
+    setup is fine (e.g. an unusual but explainable loss). Logged
+    + ntfy'd; use sparingly. POST with no body.
+    """
+    from .. import live_safety
+    if not live_safety.is_live_mode():
+        return JSONResponse({"error": "not in live mode"}, status_code=400)
+    live_safety.manual_reset_breaker()
+    return JSONResponse(live_safety.status_dict())
+
+
 async def pivot_loops_list(request: Request) -> Response:
     """List active pivot loops (optionally include stopped via ?include_stopped=1)."""
     include = request.query_params.get("include_stopped", "0") in ("1", "true", "yes")
@@ -1332,6 +1357,9 @@ def chat_routes() -> List:
         # Command Center -- account summary strip
         Route("/chat/api/account/summary", account_summary, methods=["GET"]),
         Route("/chat/api/positions", positions, methods=["GET"]),
+        # Live-mode safety status (banner, breaker)
+        Route("/chat/api/live/status", live_status, methods=["GET"]),
+        Route("/chat/api/live/reset-breaker", live_breaker_reset, methods=["POST"]),
         Route("/chat/api/pivot/{symbol}", pivot_analysis, methods=["GET"]),
         # Pivot-loop persistent state (SQLite-backed). Claude reads/writes
         # through these endpoints (and the matching MCP tools) so loop
