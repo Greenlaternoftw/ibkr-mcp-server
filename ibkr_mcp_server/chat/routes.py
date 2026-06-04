@@ -370,6 +370,11 @@ async def positions(request: Request) -> Response:
     every 30s and reconciles each portfolio-type watchlist against
     the returned list.
 
+    Uses ``ib.portfolio()`` (PortfolioItem stream from account-update
+    subscription) NOT ``reqPositions`` (bare Position namedtuple with
+    no marketPrice). The first gives us live mark + unrealized P&L
+    for free; the second left every metric at 0.0.
+
     Response: ``{"positions": [{"symbol", "quantity", "avg_cost",
     "market_price", "market_value", "unrealized_pnl", "realized_pnl"},
     ...]}``. Equity-only filter applied -- we skip OPT/FUT/etc. for
@@ -377,25 +382,40 @@ async def positions(request: Request) -> Response:
     """
     from ..client import ibkr_client
     try:
-        raw = await ibkr_client.get_portfolio()
+        # Make sure the IBKR connection + account-update subscription
+        # is live. get_account_summary() side-effect-subscribes; calling
+        # it (and discarding the result) is the cheapest way to ensure
+        # portfolio() is populated.
+        if not await ibkr_client._ensure_connected():
+            return JSONResponse({"error": "Not connected to IBKR"}, status_code=503)
+        await ibkr_client.get_account_summary()
+        target = ibkr_client.current_account
+        items = ibkr_client.ib.portfolio()
     except Exception as e:
         logger.exception("positions fetch failed")
         return JSONResponse({"error": str(e)}, status_code=500)
+
     out = []
-    for p in raw or []:
-        if (p.get("secType") or "").upper() != "STK":
+    for it in items or []:
+        # Per-account filter: PortfolioItem has an `account` field.
+        if target and getattr(it, "account", None) != target:
             continue
-        qty = p.get("position") or 0
+        contract = getattr(it, "contract", None)
+        if contract is None:
+            continue
+        if (getattr(contract, "secType", "") or "").upper() != "STK":
+            continue
+        qty = float(getattr(it, "position", 0) or 0)
         if not qty:
             continue
         out.append({
-            "symbol": p.get("symbol"),
+            "symbol": contract.symbol,
             "quantity": qty,
-            "avg_cost": p.get("avgCost"),
-            "market_price": p.get("marketPrice"),
-            "market_value": p.get("marketValue"),
-            "unrealized_pnl": p.get("unrealizedPNL"),
-            "realized_pnl": p.get("realizedPNL"),
+            "avg_cost": float(getattr(it, "averageCost", 0) or 0),
+            "market_price": float(getattr(it, "marketPrice", 0) or 0),
+            "market_value": float(getattr(it, "marketValue", 0) or 0),
+            "unrealized_pnl": float(getattr(it, "unrealizedPNL", 0) or 0),
+            "realized_pnl": float(getattr(it, "realizedPNL", 0) or 0),
         })
     return JSONResponse({"positions": out})
 

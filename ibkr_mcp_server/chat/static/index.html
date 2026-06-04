@@ -5104,10 +5104,15 @@ async function refreshPositions() {
         mutated = true;
       }
       // 2. Enrich with IBKR position data on every tick.
+      // Don't let a zero from IBKR (no mark yet / closed market) clobber
+      // a real cached price -- treat 0/null/undefined the same way.
       const s = wl.stocks[sym];
-      const newPrice = p.market_price ?? s.currentPrice;
-      if (s.currentPrice !== newPrice) mutated = true;
-      s.currentPrice = newPrice;
+      const px = (p.market_price && p.market_price > 0) ? p.market_price : null;
+      if (px !== null && s.currentPrice !== px) {
+        s.currentPrice = px;
+        s.updatedAt = new Date().toISOString();
+        mutated = true;
+      }
       s.quantity = p.quantity;
       s.avgCost = p.avg_cost;
       s.unrealizedPnL = p.unrealized_pnl;
