@@ -364,6 +364,42 @@ async def prefs_delete(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def positions(request: Request) -> Response:
+    """Current IBKR positions for the active account, shaped for the
+    Command Center "Portfolio" tab auto-sync. The client polls this
+    every 30s and reconciles each portfolio-type watchlist against
+    the returned list.
+
+    Response: ``{"positions": [{"symbol", "quantity", "avg_cost",
+    "market_price", "market_value", "unrealized_pnl", "realized_pnl"},
+    ...]}``. Equity-only filter applied -- we skip OPT/FUT/etc. for
+    the dashboard tab (they have dedicated tools).
+    """
+    from ..client import ibkr_client
+    try:
+        raw = await ibkr_client.get_portfolio()
+    except Exception as e:
+        logger.exception("positions fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    out = []
+    for p in raw or []:
+        if (p.get("secType") or "").upper() != "STK":
+            continue
+        qty = p.get("position") or 0
+        if not qty:
+            continue
+        out.append({
+            "symbol": p.get("symbol"),
+            "quantity": qty,
+            "avg_cost": p.get("avgCost"),
+            "market_price": p.get("marketPrice"),
+            "market_value": p.get("marketValue"),
+            "unrealized_pnl": p.get("unrealizedPNL"),
+            "realized_pnl": p.get("realizedPNL"),
+        })
+    return JSONResponse({"positions": out})
+
+
 async def account_summary(request: Request) -> Response:
     """Compact account-summary JSON for the Command Center strip.
 
@@ -1038,6 +1074,7 @@ def chat_routes() -> List:
         Route("/chat/api/pin/change", pin_change, methods=["POST"]),
         # Command Center -- account summary strip
         Route("/chat/api/account/summary", account_summary, methods=["GET"]),
+        Route("/chat/api/positions", positions, methods=["GET"]),
         # Command Center -- watchlists / portfolios CRUD
         Route("/chat/api/watchlists", watchlists_list, methods=["GET"]),
         Route("/chat/api/watchlists", watchlists_create, methods=["POST"]),

@@ -1996,12 +1996,7 @@
       <input id="portfolioAddInput" class="portfolio-add-input" placeholder="Add ticker..." maxlength="6" autocomplete="off"
              onkeydown="if(event.key==='Enter') addStockToActivePortfolio();" />
       <button class="portfolio-btn primary" onclick="addStockToActivePortfolio()" id="portfolioAddBtn">Add Stock</button>
-      <button class="portfolio-btn" onclick="refreshActivePortfolio()" id="portfolioRefreshBtn">Refresh All</button>
-      <button class="portfolio-btn" onclick="diagnoseAPI()" id="diagBtn" title="Test API connection">Diagnose</button>
-      <button class="portfolio-btn" onclick="clearDiagnostic()" id="diagClearBtn" title="Clear diagnostic output" style="display:none;">Clear Diagnostic</button>
-      <button class="portfolio-btn danger" onclick="removeActivePortfolio()" style="margin-left:auto;">Delete Portfolio</button>
     </div>
-    <div id="diagOutput" style="display:none; background:var(--surface); border:1px solid var(--hairline); border-left:3px solid var(--accent); padding:14px 16px; margin-bottom:14px; font-family:'JetBrains Mono', monospace; font-size:11px; line-height:1.6;"></div>
     <table class="portfolio-table">
       <thead>
         <tr>
@@ -2605,6 +2600,7 @@ async function bootAppPostPin() {
     await loadPortfoliosFromStorage();
     await refreshAccountSummary();
     startAccountSummaryPolling();
+    startPositionsPolling();
     startLiveSyncStream();
     await _ensureActiveThread();
     renderChatMessages();
@@ -3078,7 +3074,14 @@ async function savePortfolios() {
 
 function renderPortfolios() {
   const tabs = document.getElementById('portfolioTabsRow');
-  const aliases = Object.keys(portfolios.data);
+  // Sort: portfolio-type tabs come first (left), then watchlists; within
+  // each group, alphabetical. Operator asked for "Portfolio to the left."
+  const aliases = Object.keys(portfolios.data).sort((a, b) => {
+    const ta = (portfolios.data[a].type || 'portfolio') === 'portfolio' ? 0 : 1;
+    const tb = (portfolios.data[b].type || 'portfolio') === 'portfolio' ? 0 : 1;
+    if (ta !== tb) return ta - tb;
+    return a.localeCompare(b);
+  });
   tabs.innerHTML = aliases.map(a => {
     const count = Object.keys(portfolios.data[a].stocks).length;
     const isActive = a === portfolios.active;
@@ -3128,14 +3131,18 @@ function renderPortfolioStocks() {
       ? `<button class="sell-btn" title="Quick exit — lock in gains with fast fill" onclick="sellStock('${s.symbol}')">EXIT</button>`
       : '';
     const buyBtn = `<button class="buy-btn" title="Quick buy — deploy capital with fast fill" onclick="buyStock('${s.symbol}')">BUY</button>`;
+    // Explicit "Remove" button (was a tiny ✕ icon; operator couldn't spot
+    // it on the phone). Confirms before removing so a stray tap doesn't
+    // nuke a row.
+    const removeBtn = `<button class="sell-btn" style="background:var(--stop); border-color:var(--stop); color:#fff; margin-left:8px;" title="Remove from this list" onclick="confirmRemoveStock('${s.symbol}')">REMOVE</button>`;
     return `
       <tr>
         <td><span class="sym">${s.symbol}</span></td>
         ${status}
         <td class="right" style="white-space:nowrap;">
           ${buyBtn}${sellBtn}
-          <button class="x-btn" title="Refresh" onclick="refreshOneStock('${s.symbol}')" style="margin-left:6px;">↻</button>
-          <button class="x-btn" title="Remove" onclick="removeStockFromActivePortfolio('${s.symbol}')">✕</button>
+          <button class="x-btn" title="Refresh row" onclick="refreshOneStock('${s.symbol}')" style="margin-left:6px;">↻</button>
+          ${removeBtn}
         </td>
       </tr>`;
   }).join('');
@@ -3274,6 +3281,22 @@ async function removeStockFromActivePortfolio(sym) {
   renderPortfolios();
   try { await daemonDelete(`/chat/api/watchlists/${wl.id}/stocks/${sym}`); }
   catch (e) { /* swallow -- next reload reconciles */ }
+}
+
+// Confirm-then-remove wrapper. Wired to the new explicit "REMOVE"
+// button on each row. For a portfolio (auto-synced from IBKR) we
+// warn the operator that the row will reappear on the next sync
+// unless they actually close the position.
+function confirmRemoveStock(sym) {
+  if (!portfolios.active) return;
+  const wl = portfolios.data[portfolios.active];
+  if (!wl) return;
+  const isPortfolio = (wl.type || 'portfolio') === 'portfolio';
+  const msg = isPortfolio
+    ? `Remove ${sym} from "${wl.alias}"?\n\nNote: portfolios auto-sync from your IBKR positions. If you still hold ${sym}, it will reappear on the next sync. To actually close the position, use the EXIT button.`
+    : `Remove ${sym} from "${wl.alias}" watchlist?`;
+  if (!confirm(msg)) return;
+  removeStockFromActivePortfolio(sym);
 }
 
 /* ============================================================
@@ -5013,6 +5036,89 @@ function startAccountSummaryPolling() {
 }
 
 /* ============================================================
+   PORTFOLIO AUTO-SYNC FROM IBKR POSITIONS
+   Every 30s, pull /chat/api/positions and reconcile each
+   portfolio-type tab against the real IBKR positions:
+     - Add rows for newly-opened positions (server-persisted)
+     - Enrich existing rows with quantity / avg_cost / unrealized P&L
+     - Remove rows for closed positions
+   Watchlist-type tabs are untouched -- they're user-curated.
+   Same account context as the rest of the dashboard.
+============================================================ */
+const POSITIONS_REFRESH_INTERVAL_MS = 30 * 1000;
+let _positionsTimer = null;
+
+async function refreshPositions() {
+  let positions = [];
+  try {
+    const r = await daemonGet('/chat/api/positions');
+    positions = r.positions || [];
+  } catch (e) {
+    // Quiet failure -- IBKR disconnect, market closed, etc.
+    return;
+  }
+
+  // Index by symbol so reconcile is O(1) per row.
+  const live = new Map();
+  for (const p of positions) {
+    if (p.symbol && p.quantity) live.set(p.symbol, p);
+  }
+
+  let mutated = false;
+
+  // Walk portfolio-type tabs and reconcile.
+  for (const alias of Object.keys(portfolios.data)) {
+    const wl = portfolios.data[alias];
+    const isPortfolio = (wl.type || 'portfolio') === 'portfolio';
+    if (!isPortfolio || !wl.id) continue;
+
+    // 1. Add missing positions (persist server-side too)
+    for (const [sym, p] of live) {
+      if (!wl.stocks[sym]) {
+        try { await daemonPost(`/chat/api/watchlists/${wl.id}/stocks`, { symbol: sym }); }
+        catch (_) { /* may 409 if a sibling tab already added; harmless */ }
+        wl.stocks[sym] = {
+          symbol: sym,
+          rating: null,
+          currentPrice: p.market_price ?? null,
+          targetPrice: null,
+          range: null,
+          updatedAt: new Date().toISOString(),
+        };
+        mutated = true;
+      }
+      // 2. Enrich with IBKR position data on every tick.
+      const s = wl.stocks[sym];
+      const newPrice = p.market_price ?? s.currentPrice;
+      if (s.currentPrice !== newPrice) mutated = true;
+      s.currentPrice = newPrice;
+      s.quantity = p.quantity;
+      s.avgCost = p.avg_cost;
+      s.unrealizedPnL = p.unrealized_pnl;
+      s.marketValue = p.market_value;
+    }
+
+    // 3. Remove rows for positions no longer held.
+    for (const sym of Object.keys(wl.stocks)) {
+      if (!live.has(sym)) {
+        try { await daemonDelete(`/chat/api/watchlists/${wl.id}/stocks/${sym}`); }
+        catch (_) {}
+        delete wl.stocks[sym];
+        mutated = true;
+      }
+    }
+  }
+
+  if (mutated) renderPortfolios();
+}
+
+function startPositionsPolling() {
+  if (_positionsTimer) clearInterval(_positionsTimer);
+  refreshPositions();  // immediate first tick on boot
+  _positionsTimer = setInterval(refreshPositions, POSITIONS_REFRESH_INTERVAL_MS);
+}
+
+/* ============================================================
    LIVE MULTI-TAB SYNC -- SSE event stream
    When another tab/device mutates a watchlist, this stream pushes
    a "thread_updated" event. We re-load the active watchlist so the
@@ -5098,6 +5204,7 @@ document.addEventListener('visibilitychange', () => {
   _refreshActivePrefFromServer();
   _refreshActiveThreadMessages();
   refreshAccountSummary();
+  refreshPositions();
 });
 
 /* ============================================================

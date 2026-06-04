@@ -168,6 +168,7 @@ class TestRoutesRegistered:
         # Spot-check the ones we just added.
         expected = [
             (("GET", "HEAD"), "/chat/api/account/summary"),
+            (("GET", "HEAD"), "/chat/api/positions"),
             (("GET", "HEAD"), "/chat/api/watchlists"),
             (("POST",), "/chat/api/watchlists"),
             (("DELETE",), "/chat/api/watchlists/{wid}"),
