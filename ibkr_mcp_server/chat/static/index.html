@@ -2092,21 +2092,39 @@
       <button class="portfolio-btn" onclick="manualSyncPositions()" id="syncNowBtn" title="Pull latest IBKR positions into all portfolio-type tabs immediately">⟳ Sync from IBKR</button>
       <span id="syncStatus" class="label" style="margin-left:8px; color:var(--text-2); text-transform:none; letter-spacing:0;"></span>
     </div>
+    <!-- Portfolio P&L summary strip: total unrealized P&L across all
+         rows in the active tab. Updates on every render. Hidden on
+         watchlist tabs (no real positions). -->
+    <div id="portfolioPnlStrip" class="qx-construct"
+         style="display:none; margin-bottom:12px; border-left-color:var(--accent);
+                padding:10px 14px; font-size:12px;">
+      <div class="qx-construct-row">
+        <span class="qx-c-key">Tab unrealized P&amp;L</span>
+        <span class="qx-c-val" id="portfolioPnlTotal" style="font-weight:700;">—</span>
+      </div>
+      <div class="qx-construct-row">
+        <span class="qx-c-key">Total market value</span>
+        <span class="qx-c-val" id="portfolioMVTotal">—</span>
+      </div>
+    </div>
+
     <table class="portfolio-table">
       <thead>
         <tr>
           <th>Symbol</th>
           <th>Rating</th>
+          <th class="right">Qty</th>
           <th class="right">Current</th>
           <th class="right">Target</th>
           <th class="right">30D Range</th>
           <th class="right">Potential</th>
+          <th class="right">Unrealized P&amp;L</th>
           <th class="right">Updated</th>
           <th></th>
         </tr>
       </thead>
       <tbody id="portfolioStocksBody">
-        <tr class="empty-row"><td colspan="8">Loading portfolios…</td></tr>
+        <tr class="empty-row"><td colspan="10">Loading portfolios…</td></tr>
       </tbody>
     </table>
   </div>
@@ -3399,19 +3417,65 @@ function renderPortfolios() {
   renderPortfolioStocks();
 }
 
+// Roll-up P&L strip above the portfolio table. Hidden on watchlist
+// tabs (no real positions). Color-coded by sign.
+function _renderPortfolioPnlStrip(totals, isPortfolio) {
+  const strip = document.getElementById('portfolioPnlStrip');
+  if (!strip) return;
+  if (!isPortfolio || !totals) {
+    strip.style.display = 'none';
+    return;
+  }
+  strip.style.display = '';
+  const pnlEl = document.getElementById('portfolioPnlTotal');
+  const mvEl = document.getElementById('portfolioMVTotal');
+  const pnl = totals.pnl || 0;
+  const pct = totals.cost > 0 ? (pnl / totals.cost) * 100 : 0;
+  const sign = pnl >= 0 ? '+' : '';
+  const color = pnl >= 0 ? 'var(--go)' : 'var(--stop)';
+  if (pnlEl) {
+    pnlEl.style.color = color;
+    pnlEl.textContent = `${sign}$${Math.abs(pnl).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
+      + ` (${sign}${pct.toFixed(2)}%)`;
+  }
+  if (mvEl) {
+    mvEl.textContent = totals.mv
+      ? `$${totals.mv.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
+      : '—';
+  }
+}
+
 function renderPortfolioStocks() {
   const tbody = document.getElementById('portfolioStocksBody');
   if (!portfolios.active) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No portfolio selected</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="10">No portfolio selected</td></tr>';
+    _renderPortfolioPnlStrip(null, false);
     return;
   }
   const activeTab = portfolios.data[portfolios.active];
   const isPortfolio = (activeTab.type || 'portfolio') === 'portfolio';
   const stocks = Object.values(activeTab.stocks || {});
   if (!stocks.length) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="8">No stocks in "${portfolios.active}". Add a ticker above to populate.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="10">No stocks in "${portfolios.active}". Add a ticker above to populate.</td></tr>`;
+    _renderPortfolioPnlStrip(null, isPortfolio);
     return;
   }
+  // Roll up unrealized P&L + market value across rows for the summary
+  // strip. Only show on portfolio-type tabs (watchlists have no real
+  // positions to sum).
+  let pnlTotal = 0;
+  let mvTotal = 0;
+  let costTotal = 0;
+  for (const s of stocks) {
+    if (typeof s.unrealizedPnL === 'number') pnlTotal += s.unrealizedPnL;
+    if (typeof s.marketValue === 'number') mvTotal += s.marketValue;
+    if (s.quantity && s.avgCost) costTotal += s.quantity * s.avgCost;
+  }
+  _renderPortfolioPnlStrip(
+    {pnl: pnlTotal, mv: mvTotal, cost: costTotal},
+    isPortfolio,
+  );
+
   tbody.innerHTML = stocks.map(s => {
     const moveColor = (s.potentialMovePct || 0) >= 0 ? 'var(--go)' : 'var(--stop)';
     const ratingColor = s.gatePassed ? 'var(--go)' : 'var(--stop)';
@@ -3433,16 +3497,34 @@ function renderPortfolioStocks() {
       : '—';
     const updatedIso = s.updatedAt || s.lastUpdated;
     const updated = updatedIso ? timeSince(updatedIso) : '—';
+    // Qty + unrealized P&L. Both come from auto-sync (refreshPositions
+    // stamps these from IBKR PortfolioItem). null on watchlist rows
+    // since they aren't tied to a real position.
+    const qty = (typeof s.quantity === 'number' && s.quantity !== 0)
+      ? `${Math.round(s.quantity).toLocaleString()}`
+      : '—';
+    let pnlCell = '—';
+    if (typeof s.unrealizedPnL === 'number'
+        && typeof s.avgCost === 'number' && s.avgCost > 0
+        && typeof s.quantity === 'number' && s.quantity !== 0) {
+      const cost = Math.abs(s.quantity) * s.avgCost;
+      const pct = cost > 0 ? (s.unrealizedPnL / cost) * 100 : 0;
+      const color = s.unrealizedPnL >= 0 ? 'var(--go)' : 'var(--stop)';
+      const sign = s.unrealizedPnL >= 0 ? '+' : '';
+      pnlCell = `<span style="color:${color};">${sign}$${Math.abs(s.unrealizedPnL).toFixed(2)} <span style="opacity:0.75; font-size:10px;">(${sign}${pct.toFixed(1)}%)</span></span>`;
+    }
     const status = s._loading
-      ? '<td colspan="6" style="color:var(--accent); text-align:center; font-size:10px; letter-spacing:0.15em;">FETCHING…</td>'
+      ? '<td colspan="8" style="color:var(--accent); text-align:center; font-size:10px; letter-spacing:0.15em;">FETCHING…</td>'
       : s._error
-        ? `<td colspan="6" style="color:var(--stop); font-size:10px;">ERROR: ${s._error}</td>`
+        ? `<td colspan="8" style="color:var(--stop); font-size:10px;">ERROR: ${s._error}</td>`
         : `
           <td><span class="rating-pill" style="color:${ratingColor};">${ratingLabel}</span></td>
+          <td class="right">${qty}</td>
           <td class="right${s.priceFlash ? ' price-flash' : ''}">${fmt(s.currentPrice)}</td>
           <td class="right">${fmt(s.targetPrice)}</td>
           <td class="right">${range}</td>
           <td class="right" style="color:${moveColor};">${fmtPct(s.potentialMovePct)}</td>
+          <td class="right">${pnlCell}</td>
           <td class="right" style="color:var(--muted); font-size:10px;">${updated}</td>`;
     const sellBtn = isPortfolio
       ? `<button class="sell-btn" title="Quick exit — lock in gains with fast fill" onclick="sellStock('${s.symbol}')">EXIT</button>`
