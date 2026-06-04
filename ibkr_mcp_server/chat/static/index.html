@@ -3455,6 +3455,11 @@ function executeQuickExit() {
   const command =
 `Claude, execute a FAST EXIT via the ibkr MCP — lock in gains with minimal slippage:
 
+*** OPERATOR PRE-AUTHORIZED *** (dashboard EXIT button + qty entered)
+Pass \`confirm: true\` on every place_order / cancel_all_orders call so
+the destructive-action gate doesn't block. The button + qty input IS
+the authorization. Surface the fill result, not a "are you sure" prompt.
+
 Position
   symbol:        ${sym}
   side:          SELL
@@ -3474,13 +3479,14 @@ IBKR primitives
   algo:          Adaptive
   algo_params:   { adaptivePriority: "Urgent" }
   lmt_price:     <current_bid> - max(0.30% × bid, $0.10)
-  tif:           IOC
+  tif:           IOC  during RTH; DAY during OTH
   routing:       SMART
-  outside_rth:   false
+  outside_rth:   true  (works in BOTH RTH and OTH; harmless during RTH)
+  confirm:       true  (operator pre-authorized via dashboard EXIT button)
 
 Execution steps
   1) get_market_data(${sym}) → fetch live bid, ask, last
-  2) ${isAll ? 'get_positions → look up exact share count for ' + sym + '\n  3) ' : ''}Cancel any attached child orders for ${sym}
+  2) ${isAll ? 'get_portfolio → look up exact share count for ' + sym + '\n  3) ' : ''}cancel_all_orders(symbol="${sym}", confirm=true) to clear attached child orders
      (trailing stops, take-profits, OCA siblings)
   ${isAll ? '4' : '3'}) Calculate limit price from live bid
   ${isAll ? '5' : '4'}) Place LMT IOC with Adaptive(Urgent)
@@ -3685,9 +3691,10 @@ IBKR primitives — parent BUY
   algo_params:      { adaptivePriority: "Urgent" }
   lmt_price:        <live_ask> + max(0.30% × ask, $0.10)
   quantity:         floor($${dollar.toLocaleString()} / lmt_price)
-  tif:              IOC
+  tif:              IOC  during RTH; DAY during OTH
   routing:          SMART
-  outside_rth:      false
+  outside_rth:      true  (works in BOTH RTH and OTH; harmless during RTH)
+  confirm:          true
 
 IBKR primitives — attached TRAIL stop (auto-fires on fill)
   order_type:       TRAIL
@@ -4710,9 +4717,10 @@ IBKR primitives — parent BUY
   algo_params:      { adaptivePriority: "Urgent" }
   lmt_price:        <live_ask> + max(0.30% × ask, $0.10)
   quantity:         floor($${dollar.toLocaleString()} / lmt_price)
-  tif:              IOC
+  tif:              IOC  during RTH; DAY during OTH
   routing:          SMART
-  outside_rth:      false
+  outside_rth:      true  (works in BOTH RTH and OTH; harmless during RTH)
+  confirm:          true
 
 IBKR primitives — attached SELL TRAIL child
   action:           SELL
@@ -4864,25 +4872,57 @@ Strategy
   4) Report a summary table at the end
 
 Per-position order construct (winners only) -- ABSOLUTE FASTEST EXIT
-  order_type:     MKT
-  algo:           Adaptive
-  algo_params:    { adaptivePriority: "Urgent" }
-  tif:            DAY
-  routing:        SMART
-  quantity:       full position size
-  confirm:        true
+  IBKR rejects MKT outside regular trading hours, so the construct
+  branches on whether the market is currently open. Use
+  get_connection_status / current UTC time to determine RTH:
+  RTH = weekday 13:30-20:00 UTC (Mar-Nov DST) or 14:30-21:00 UTC
+  (Nov-Mar). When uncertain, prefer the OTH construct -- it works
+  in BOTH regimes, just trades a little speed for portability.
 
-  Why MKT (not LMT IOC):
-    - MKT fills instantly at best available venue (IBKR smart router).
-    - No retry loop / no risk of an IOC cancel-and-respawn that
-      misses the exit while the bid keeps dropping.
-    - Adaptive Urgent still optimizes routing, just doesn't impose
-      a price ceiling. "Take Profits" means take them NOW.
+  RTH (regular hours) -- MAX SPEED
+    order_type:     MKT
+    algo:           Adaptive
+    algo_params:    { adaptivePriority: "Urgent" }
+    tif:            DAY
+    routing:        SMART
+    quantity:       full position size
+    outside_rth:    false
+    confirm:        true
+
+  OTH (pre/after-market, weekends) -- BEST AVAILABLE
+    order_type:     LMT
+    algo:           Adaptive
+    algo_params:    { adaptivePriority: "Urgent" }
+    lmt_price:      <live_bid> - max(0.50% × bid, $0.10)
+    tif:            DAY
+    routing:        SMART
+    outside_rth:    true       (REQUIRED for extended-hours trading)
+    quantity:       full position size
+    confirm:        true
+    Notes: IBKR rejects MKT outside RTH. LMT IOC w/ 0.5% buffer is
+           the fastest legal exit. If the position holds no extended-
+           hours liquidity (most small caps), the order will sit
+           until 9:30 ET -- report that on the summary table.
 
 Execution rules
   - Process positions in parallel where IBKR session permits (up to 5 at a time)
   - Speed target: every order transmitted within 1 second of get_portfolio returning
   - Skip any symbol with halt / no quote / illiquid order book -- those need a manual call
+
+Summary table requirements
+  Capture real-time P&L per position:
+    - Entry avg (from get_portfolio.avgCost)
+    - Exit fill (from the trade result, NOT the pre-fill quote)
+    - Quantity sold (in case of partial fill)
+    - Realized P&L $ = (exit - avg) × quantity
+    - Realized P&L % = (exit - avg) / avg × 100
+    - Status: filled / partial / cancelled / rejected (OTH no-liquidity)
+  Footer:
+    - Total realized P&L: sum of $ column
+    - Positions closed: N
+    - Positions skipped (losers / errors): M
+    - Market regime: "RTH" or "OTH" (so the operator knows
+      execution speed/quality context)
 
 Final report — return as a markdown table with columns:
   | Symbol | Qty | Entry avg | Exit fill | P&L $ | P&L % | Status |
