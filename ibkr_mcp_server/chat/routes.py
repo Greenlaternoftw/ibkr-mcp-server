@@ -365,6 +365,214 @@ async def prefs_delete(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def accounts_list(request: Request) -> Response:
+    """List managed accounts + the currently-active one.
+
+    Used by the dashboard's account selector. ``accounts`` is the full
+    list (typically 1-N, with multi-account setups when IBKR Advisor
+    sub-accounts are configured or the operator has both a regular +
+    Roth in one master).
+    """
+    from ..client import ibkr_client
+    if not ibkr_client.is_connected():
+        return JSONResponse({"error": "not connected to IBKR"}, status_code=503)
+    return JSONResponse({
+        "current_account": ibkr_client.current_account,
+        "accounts": list(ibkr_client.accounts or []),
+    })
+
+
+async def accounts_summary_all(request: Request) -> Response:
+    """Account summary for ALL managed accounts (not just current). Used
+    by the multi-account view + the balance-transfer flow to show cash
+    balances across accounts at a glance.
+    """
+    from ..client import ibkr_client
+    if not ibkr_client.is_connected():
+        return JSONResponse({"error": "not connected to IBKR"}, status_code=503)
+    accounts = list(ibkr_client.accounts or [])
+    out = []
+    for acct in accounts:
+        try:
+            raw = await ibkr_client.get_account_summary(account=acct)
+            summ = (raw or {}).get("summary") or {}
+            def _num(k):
+                v = summ.get(k)
+                try:
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
+            out.append({
+                "account": acct,
+                "net_liquidation": _num("NetLiquidation"),
+                "buying_power": _num("BuyingPower"),
+                "total_cash": _num("TotalCashValue"),
+                "excess_liquidity": _num("ExcessLiquidity"),
+                "unrealized_pnl": _num("UnrealizedPnL"),
+                "realized_pnl": _num("RealizedPnL"),
+            })
+        except Exception as e:
+            out.append({"account": acct, "error": str(e)})
+    return JSONResponse({
+        "current_account": ibkr_client.current_account,
+        "accounts": out,
+    })
+
+
+async def balance_transfer_plan(request: Request) -> Response:
+    """Compute a "balance transfer" plan between two managed accounts.
+
+    IBKR does NOT expose API-driven internal cash transfers for retail
+    accounts (it's a Client Portal manual action). What we can do:
+
+      1. Show the current cash balance in each account.
+      2. If the operator wants to move $X from A to B, compute the
+         "sell-and-rebuy" equivalent: which positions in A could be
+         sold to free $X, and what the resulting position in B would
+         look like with that cash.
+      3. Provide explicit instructions for the manual IBKR Portal
+         transfer route (the only API-free option).
+
+    This endpoint returns the plan ONLY -- it does not execute trades
+    or attempt any transfer. Body:
+       {"from_account": "DU...", "to_account": "DU...", "amount": <number>}
+    """
+    from ..client import ibkr_client
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    from_acct = (body.get("from_account") or "").strip()
+    to_acct = (body.get("to_account") or "").strip()
+    try:
+        amount = float(body.get("amount", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "amount must be a number"}, status_code=400)
+    if not from_acct or not to_acct or amount <= 0:
+        return JSONResponse(
+            {"error": "from_account, to_account, and positive amount required"},
+            status_code=400,
+        )
+    if from_acct == to_acct:
+        return JSONResponse({"error": "from and to must differ"}, status_code=400)
+    if not ibkr_client.is_connected():
+        return JSONResponse({"error": "not connected to IBKR"}, status_code=503)
+
+    # Read both account summaries
+    try:
+        a_raw = await ibkr_client.get_account_summary(account=from_acct)
+        b_raw = await ibkr_client.get_account_summary(account=to_acct)
+        a_summ = (a_raw or {}).get("summary") or {}
+        b_summ = (b_raw or {}).get("summary") or {}
+        a_cash = float(a_summ.get("TotalCashValue") or 0)
+        b_cash = float(b_summ.get("TotalCashValue") or 0)
+    except Exception as e:
+        return JSONResponse({"error": f"could not read summaries: {e}"},
+                            status_code=502)
+
+    # Check positions in source account (for sell-and-rebuy fallback)
+    try:
+        positions = await ibkr_client.get_portfolio(account=from_acct)
+    except Exception:
+        positions = []
+    liquid_value = sum(
+        float(p.get("marketValue") or 0)
+        for p in (positions or [])
+        if (p.get("secType") or "").upper() == "STK"
+    )
+
+    paths = []
+    # Option 1: direct IBKR Portal transfer (manual)
+    paths.append({
+        "method": "ibkr_portal_manual",
+        "label": "Manual transfer via IBKR Client Portal (recommended for clean cash transfer)",
+        "feasible": a_cash >= amount,
+        "rationale": (
+            f"Account {from_acct} has ${a_cash:,.2f} cash; "
+            f"requested ${amount:,.2f}. "
+            f"{'Sufficient cash on hand.' if a_cash >= amount else 'INSUFFICIENT cash; sell positions first.'}"
+        ),
+        "steps": [
+            f"Log into IBKR Client Portal (https://www.interactivebrokers.com/portal).",
+            f"Transfers & Pay → Internal Transfer.",
+            f"From: {from_acct}    To: {to_acct}    Amount: USD {amount:,.2f}",
+            "Confirm. Transfers between linked sub-accounts of the same master are typically instant.",
+            "Refresh the dashboard after the transfer settles to see the updated cash balances.",
+        ],
+    })
+    # Option 2: sell-and-rebuy (only if Option 1 insufficient AND positions exist)
+    if a_cash < amount:
+        gap = amount - a_cash
+        feasible = liquid_value >= gap
+        paths.append({
+            "method": "sell_and_rebuy",
+            "label": "Sell in source / buy in destination (avoids manual portal step but incurs commission + spread cost)",
+            "feasible": feasible,
+            "rationale": (
+                f"Cash shortfall ${gap:,.2f}. "
+                f"Liquid equity in {from_acct}: ${liquid_value:,.2f}. "
+                f"{'Selling proportionally would cover the gap.' if feasible else 'INSUFFICIENT liquid equity; cannot bridge.'}"
+            ),
+            "cost_estimate": {
+                "round_trip_commission_usd": "$0-10 depending on IBKR plan",
+                "spread_cost_pct": "~0.05-0.20% on liquid names",
+                "total_estimated_pct": "~0.1-0.3% of transferred amount",
+            },
+            "warning": (
+                "Real money moves twice (sell + rebuy) — commissions + slippage are real costs. "
+                "Only use this path if you can't do the IBKR Portal transfer above."
+            ),
+        })
+    return JSONResponse({
+        "from_account": from_acct,
+        "to_account": to_acct,
+        "amount_requested": amount,
+        "source_cash": a_cash,
+        "destination_cash": b_cash,
+        "source_liquid_equity": liquid_value,
+        "paths": paths,
+        "note": (
+            "IBKR's API does not expose internal cash transfers for retail "
+            "accounts. This endpoint computes a PLAN; execution is the "
+            "operator's action via Client Portal OR sell-and-rebuy via "
+            "place_order calls."
+        ),
+    })
+
+
+async def accounts_switch(request: Request) -> Response:
+    """Switch the daemon's active account context. Body:
+       ``{"account_id": "DU...", "client_id": "..."}``
+
+    All subsequent /chat/api/account/summary, /positions, /pivot etc.
+    calls will use the new active account. Per-account watchlists are
+    NOT a thing (the table is global) -- watchlists track what you
+    care about, positions track what you own.
+    """
+    from ..client import ibkr_client
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    account_id = (body.get("account_id") or "").strip()
+    if not account_id:
+        return JSONResponse({"error": "account_id required"}, status_code=400)
+    result = await ibkr_client.switch_account(account_id)
+    if not result.get("success"):
+        return JSONResponse(result, status_code=400)
+    # Persist the operator's choice so reloads land on the same account.
+    try:
+        _get_store().set_pref("activeAccount", account_id)
+    except Exception:
+        pass
+    await _publish(
+        "account_switched",
+        client_id=body.get("client_id"),
+        account_id=account_id,
+    )
+    return JSONResponse(result)
+
+
 async def live_status(request: Request) -> Response:
     """Live-mode safety status for the dashboard banner.
 
@@ -1372,6 +1580,11 @@ def chat_routes() -> List:
         # Live-mode safety status (banner, breaker)
         Route("/chat/api/live/status", live_status, methods=["GET"]),
         Route("/chat/api/live/reset-breaker", live_breaker_reset, methods=["POST"]),
+        # Multi-account: list, switch, cross-account summary, transfer plan
+        Route("/chat/api/accounts", accounts_list, methods=["GET"]),
+        Route("/chat/api/accounts/switch", accounts_switch, methods=["POST"]),
+        Route("/chat/api/accounts/summary-all", accounts_summary_all, methods=["GET"]),
+        Route("/chat/api/accounts/transfer-plan", balance_transfer_plan, methods=["POST"]),
         Route("/chat/api/pivot/{symbol}", pivot_analysis, methods=["GET"]),
         # Pivot-loop persistent state (SQLite-backed). Claude reads/writes
         # through these endpoints (and the matching MCP tools) so loop

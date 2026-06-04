@@ -2069,6 +2069,18 @@
     <span class="sub">v1 · analyst-gated execution</span>
   </div>
   <div class="status-cluster">
+    <!-- Account selector: only shown when daemon reports >1 managed
+         account. Single-account setups hide it entirely. -->
+    <select id="accountSelect" onchange="onAccountChange()"
+            title="Switch active account context for positions, orders, and pivot loops"
+            style="display:none; background:rgba(255,255,255,0.10); color:#fff;
+                   border:1px solid rgba(255,255,255,0.3); padding:8px 10px;
+                   font-family:'JetBrains Mono', monospace; font-size:11px;
+                   border-radius:0;">
+    </select>
+    <button class="view-toggle" id="accountsModalBtn" onclick="openAccountsModal()"
+            title="Multi-account view + balance transfer plan"
+            style="display:none; background:transparent; border:1px solid rgba(255,255,255,0.3); padding:9px 12px;">$</button>
     <button class="view-toggle" id="installAppBtn" onclick="triggerInstall()" title="Install as app" style="display:none; background:transparent; border:1px solid rgba(255,255,255,0.3);">↓ Install</button>
     <button class="view-toggle" id="settingsBtn" onclick="openSettings()" title="Settings" style="background:transparent; border:1px solid rgba(255,255,255,0.3); padding:9px 12px;">⚙</button>
     <button class="view-toggle" id="viewToggle" onclick="toggleView()" title="Switch to chat-focused view">
@@ -2917,9 +2929,169 @@ async function _restoreActiveView() {
 // Kicked off ONCE the user successfully unlocks (or the cached
 // token validated). Everything that needs the bearer token waits
 // for this -- keeps the empty-state UI from flickering during boot.
+/* ============================================================
+   MULTI-ACCOUNT SELECTOR + TRANSFER MODAL
+   The topbar dropdown shows when >1 managed account exists. Selecting
+   a different account switches the daemon's active context; all
+   subsequent polling endpoints (positions, summary, pivot) reflect
+   the new account. The "$" button opens a per-account matrix +
+   transfer-plan builder.
+============================================================ */
+
+async function refreshAccountSelector() {
+  let data;
+  try {
+    data = await daemonGet('/chat/api/accounts');
+  } catch (e) {
+    return;
+  }
+  const sel = document.getElementById('accountSelect');
+  const btn = document.getElementById('accountsModalBtn');
+  if (!sel || !btn) return;
+  const accounts = data.accounts || [];
+  if (accounts.length <= 1) {
+    sel.style.display = 'none';
+    btn.style.display = 'none';
+    return;
+  }
+  sel.style.display = '';
+  btn.style.display = '';
+  // Rebuild options if list size changed (rare; managed accounts list
+  // is stable once connected). Idempotent.
+  if (sel.options.length !== accounts.length) {
+    sel.innerHTML = accounts
+      .map(a => `<option value="${a}">${a}</option>`)
+      .join('');
+  }
+  sel.value = data.current_account || accounts[0];
+}
+
+async function onAccountChange() {
+  const sel = document.getElementById('accountSelect');
+  if (!sel) return;
+  const newAcct = sel.value;
+  try {
+    await daemonPost('/chat/api/accounts/switch', {
+      account_id: newAcct,
+      client_id: DAEMON_CLIENT_ID,
+    });
+  } catch (e) {
+    alert('Account switch failed: ' + e.message);
+    return;
+  }
+  // Refresh everything that's account-scoped.
+  refreshAccountSummary();
+  refreshPositions();
+  refreshLiveBanner();
+}
+
+function openAccountsModal() {
+  const ov = document.getElementById('accountsOverlay');
+  if (!ov) return;
+  ov.classList.add('show');
+  _loadAccountsMatrix();
+}
+
+function closeAccountsModal() {
+  document.getElementById('accountsOverlay')?.classList.remove('show');
+}
+
+async function _loadAccountsMatrix() {
+  const target = document.getElementById('acctMatrix');
+  if (!target) return;
+  target.innerHTML = '<div style="font-size:11px; color:var(--muted);">Loading…</div>';
+  let data;
+  try {
+    data = await daemonGet('/chat/api/accounts/summary-all');
+  } catch (e) {
+    target.innerHTML = `<div style="color:var(--stop); font-size:11px;">Error: ${e.message}</div>`;
+    return;
+  }
+  const rows = (data.accounts || []).map(a => {
+    if (a.error) {
+      return `<tr><td>${a.account}</td><td colspan="4" style="color:var(--stop);">${a.error}</td></tr>`;
+    }
+    const isActive = a.account === data.current_account;
+    const flag = isActive ? '<span style="color:var(--accent); font-weight:700;">●</span>' : '';
+    return `<tr>
+      <td>${flag} ${a.account}</td>
+      <td class="right">${a.net_liquidation != null ? '$' + a.net_liquidation.toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'}</td>
+      <td class="right">${a.total_cash != null ? '$' + a.total_cash.toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'}</td>
+      <td class="right">${a.buying_power != null ? '$' + a.buying_power.toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'}</td>
+      <td class="right" style="color:${(a.unrealized_pnl || 0) >= 0 ? 'var(--go)' : 'var(--stop)'};">${a.unrealized_pnl != null ? (a.unrealized_pnl >= 0 ? '+' : '') + '$' + a.unrealized_pnl.toFixed(2) : '—'}</td>
+    </tr>`;
+  }).join('');
+  target.innerHTML = `
+    <table class="portfolio-table" style="font-size:11px;">
+      <thead><tr>
+        <th>Account</th><th class="right">Net Liq</th><th class="right">Cash</th>
+        <th class="right">Buying Power</th><th class="right">Unrealized P&amp;L</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  // Populate transfer-plan dropdowns
+  const from = document.getElementById('acctFrom');
+  const to = document.getElementById('acctTo');
+  const accts = (data.accounts || []).filter(a => !a.error).map(a => a.account);
+  if (from && to) {
+    const html = accts.map(a => `<option value="${a}">${a}</option>`).join('');
+    from.innerHTML = html;
+    to.innerHTML = html;
+    if (accts.length > 1) to.value = accts[1];
+  }
+}
+
+async function computeTransferPlan() {
+  const from = document.getElementById('acctFrom').value;
+  const to = document.getElementById('acctTo').value;
+  const amount = parseFloat(document.getElementById('acctAmount').value);
+  const out = document.getElementById('acctPlanOutput');
+  if (!from || !to || !Number.isFinite(amount) || amount <= 0) {
+    out.innerHTML = '<span style="color:var(--warn);">Pick from + to accounts and enter a positive amount.</span>';
+    return;
+  }
+  if (from === to) {
+    out.innerHTML = '<span style="color:var(--warn);">From and To must be different accounts.</span>';
+    return;
+  }
+  out.innerHTML = '<span style="color:var(--accent);">Computing…</span>';
+  let plan;
+  try {
+    plan = await daemonPost('/chat/api/accounts/transfer-plan', {
+      from_account: from, to_account: to, amount,
+    });
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--stop);">Error: ${e.message}</span>`;
+    return;
+  }
+  const pathsHtml = (plan.paths || []).map(p => {
+    const status = p.feasible
+      ? '<span style="color:var(--go);">✓ feasible</span>'
+      : '<span style="color:var(--stop);">✗ not feasible</span>';
+    const steps = (p.steps || []).map(s => `<li>${s}</li>`).join('');
+    const stepsBlock = steps ? `<ol style="margin:6px 0 6px 18px; font-size:11px;">${steps}</ol>` : '';
+    const warn = p.warning ? `<div style="color:var(--warn); margin-top:4px; font-size:10px;">${p.warning}</div>` : '';
+    return `<div style="margin-top:10px; padding:10px; border:1px solid var(--hairline-2); border-left:3px solid var(--accent);">
+      <div style="font-weight:600;">${p.label} — ${status}</div>
+      <div style="color:var(--text-2); margin-top:4px;">${p.rationale}</div>
+      ${stepsBlock}
+      ${warn}
+    </div>`;
+  }).join('');
+  out.innerHTML = `
+    <div style="font-size:12px; color:var(--text-2); margin-bottom:6px;">
+      ${plan.from_account} has $${plan.source_cash.toFixed(2)} cash + $${plan.source_liquid_equity.toFixed(2)} liquid equity.
+      Requested: $${plan.amount_requested.toFixed(2)}.
+    </div>
+    ${pathsHtml}
+    <div style="margin-top:10px; font-size:10px; color:var(--muted); font-style:italic;">${plan.note}</div>
+  `;
+}
+
 async function bootAppPostPin() {
   try {
     await _ensurePrefsLoaded();
+    await refreshAccountSelector();   // populate dropdown before fetching account-scoped data
     await loadPortfoliosFromStorage();
     await refreshAccountSummary();
     startAccountSummaryPolling();
@@ -3882,6 +4054,7 @@ document.addEventListener('keydown', e => {
     if (document.getElementById('settingsOverlay')?.classList.contains('show')) closeSettings();
     if (document.getElementById('addPortfolioOverlay')?.classList.contains('show')) closeAddPortfolio();
     if (document.getElementById('buyStopOverlay')?.classList.contains('show')) closeBuyStop();
+    if (document.getElementById('accountsOverlay')?.classList.contains('show')) closeAccountsModal();
   }
 });
 
@@ -6546,6 +6719,58 @@ pinLoadConfig();
 </div>
 
 <!-- ============ SETTINGS MODAL ============ -->
+<!-- ============ ACCOUNTS / TRANSFER MODAL ============ -->
+<div class="qx-overlay" id="accountsOverlay" onclick="if(event.target===this) closeAccountsModal()">
+  <div class="qx-modal" style="max-width: 640px;" role="dialog">
+    <div class="qx-header">
+      <div>
+        <div class="qx-eyebrow" style="color: var(--accent);">ACCOUNTS</div>
+        <h2 class="qx-title">Multi-account view + transfer plan</h2>
+      </div>
+      <button class="qx-close" onclick="closeAccountsModal()" aria-label="Close">✕</button>
+    </div>
+    <div class="qx-body">
+      <!-- Per-account summary table -->
+      <div class="qx-row">
+        <label class="qx-label">Account balances</label>
+        <div id="acctMatrix" style="margin-top:8px;">
+          <div style="font-size:11px; color:var(--muted);">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Balance-transfer plan builder -->
+      <div class="qx-row" style="margin-top:16px; padding-top:16px; border-top:1px solid var(--hairline-2);">
+        <label class="qx-label">Balance transfer plan</label>
+        <div style="font-size:11px; color:var(--text-2); line-height:1.55; margin-bottom:10px;">
+          IBKR doesn't expose API-driven cash transfers for retail accounts.
+          This builder computes a PLAN (manual portal transfer OR
+          sell-and-rebuy) — it does not execute trades.
+        </div>
+        <div class="field-row">
+          <div class="col">
+            <label>From</label>
+            <select id="acctFrom" class="qx-qty-input"></select>
+          </div>
+          <div class="col">
+            <label>To</label>
+            <select id="acctTo" class="qx-qty-input"></select>
+          </div>
+          <div class="col">
+            <label>Amount $</label>
+            <input id="acctAmount" type="number" min="1" step="100" placeholder="1000" class="qx-qty-input" />
+          </div>
+        </div>
+        <button class="portfolio-btn primary" style="width:100%; padding:10px; margin-top:8px;"
+                onclick="computeTransferPlan()">Compute transfer plan</button>
+        <div id="acctPlanOutput" style="margin-top:10px; font-size:11px; line-height:1.5; min-height:14px;"></div>
+      </div>
+    </div>
+    <div class="qx-footer">
+      <button class="qx-execute" onclick="closeAccountsModal()" style="background:var(--accent);">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============ BUY WITH TRAILING STOP LOSS OVERLAY ============ -->
 <div class="qx-overlay" id="buyStopOverlay" onclick="if(event.target===this) closeBuyStop()">
   <div class="qx-modal" style="border-top-color: var(--go); max-width: 460px;" role="dialog" aria-labelledby="bsTitle">
