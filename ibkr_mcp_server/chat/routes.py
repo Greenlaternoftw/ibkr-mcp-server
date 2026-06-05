@@ -852,52 +852,94 @@ async def positions(request: Request) -> Response:
     every 30s and reconciles each portfolio-type watchlist against
     the returned list.
 
-    Uses ``ib.portfolio()`` (PortfolioItem stream from account-update
-    subscription) NOT ``reqPositions`` (bare Position namedtuple with
-    no marketPrice). The first gives us live mark + unrealized P&L
-    for free; the second left every metric at 0.0.
+    Source of truth is ``reqPositions`` (account-agnostic, returns every
+    position across ALL managed accounts), NOT ``ib.portfolio()``. The
+    portfolio() stream is driven by ``reqAccountUpdates`` which only ever
+    streams ONE account at a time and goes completely empty on a
+    multi-account login (e.g. 3 linked U-accounts) -- which silently
+    rendered this whole tab blank on live. reqPositions has no such
+    limitation.
+
+    Trade-off: reqPositions' Position rows carry no marketPrice/PnL, so we
+    enrich from the portfolio() stream when it happens to be populated for
+    the active account (keyed by symbol+account). When the stream is empty
+    (the multi-account case), positions still render with avg_cost and a
+    0 mark rather than vanishing entirely -- correct-but-incomplete beats
+    invisible.
 
     Response: ``{"positions": [{"symbol", "quantity", "avg_cost",
     "market_price", "market_value", "unrealized_pnl", "realized_pnl"},
     ...]}``. Equity-only filter applied -- we skip OPT/FUT/etc. for
     the dashboard tab (they have dedicated tools).
     """
+    import asyncio
     from ..client import ibkr_client
     try:
-        # Make sure the IBKR connection + account-update subscription
-        # is live. get_account_summary() side-effect-subscribes; calling
-        # it (and discarding the result) is the cheapest way to ensure
-        # portfolio() is populated.
         if not await ibkr_client._ensure_connected():
             return JSONResponse({"error": "Not connected to IBKR"}, status_code=503)
-        await ibkr_client.get_account_summary()
         target = ibkr_client.current_account
-        items = ibkr_client.ib.portfolio()
+
+        # Authoritative position list -- works across all managed accounts.
+        positions = await ibkr_client._bounded(
+            ibkr_client.ib.reqPositionsAsync(),
+            timeout=ibkr_client.SUMMARY_TIMEOUT,
+            op="reqPositions",
+        )
+
+        # Best-effort: nudge the account-update stream to subscribe to the
+        # ACTIVE account so portfolio() carries live mark + PnL for it.
+        # Harmless if already subscribed; idempotent on repeat polls.
+        try:
+            ibkr_client.ib.reqAccountUpdates(account=target or "")
+            await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+        # Build an enrichment map from whatever portfolio() has populated.
+        pf_by_key = {}
+        for pf in (ibkr_client.ib.portfolio() or []):
+            c = getattr(pf, "contract", None)
+            if c is not None:
+                pf_by_key[(getattr(c, "symbol", ""), getattr(pf, "account", None))] = pf
     except Exception as e:
         logger.exception("positions fetch failed")
         return JSONResponse({"error": str(e)}, status_code=500)
 
     out = []
-    for it in items or []:
-        # Per-account filter: PortfolioItem has an `account` field.
-        if target and getattr(it, "account", None) != target:
+    for pos in positions or []:
+        # Per-account filter: Position has an `account` field.
+        if target and getattr(pos, "account", None) != target:
             continue
-        contract = getattr(it, "contract", None)
+        contract = getattr(pos, "contract", None)
         if contract is None:
             continue
         if (getattr(contract, "secType", "") or "").upper() != "STK":
             continue
-        qty = float(getattr(it, "position", 0) or 0)
+        qty = float(getattr(pos, "position", 0) or 0)
         if not qty:
             continue
+        avg_cost = float(getattr(pos, "avgCost", 0) or 0)
+        pf = pf_by_key.get((contract.symbol, getattr(pos, "account", None)))
+        if pf is not None:
+            market_price = float(getattr(pf, "marketPrice", 0) or 0)
+            market_value = float(getattr(pf, "marketValue", 0) or 0)
+            unrealized = float(getattr(pf, "unrealizedPNL", 0) or 0)
+            realized = float(getattr(pf, "realizedPNL", 0) or 0)
+        else:
+            # Stream not populated for this account (multi-account login).
+            # Show the position with a 0 mark rather than dropping it.
+            market_price = 0.0
+            market_value = 0.0
+            unrealized = 0.0
+            realized = 0.0
         out.append({
             "symbol": contract.symbol,
             "quantity": qty,
-            "avg_cost": float(getattr(it, "averageCost", 0) or 0),
-            "market_price": float(getattr(it, "marketPrice", 0) or 0),
-            "market_value": float(getattr(it, "marketValue", 0) or 0),
-            "unrealized_pnl": float(getattr(it, "unrealizedPNL", 0) or 0),
-            "realized_pnl": float(getattr(it, "realizedPNL", 0) or 0),
+            "avg_cost": avg_cost,
+            "market_price": market_price,
+            "market_value": market_value,
+            "unrealized_pnl": unrealized,
+            "realized_pnl": realized,
         })
     return JSONResponse({"positions": out})
 
