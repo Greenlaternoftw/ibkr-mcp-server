@@ -186,7 +186,7 @@ class IBKRClient:
     # an IBKR-Gateway restart, where IBC needs 60-90 seconds to re-login.
     # The persistent loop below keeps polling until connect() succeeds or
     # RECONNECT_MAX_DURATION elapses.
-    RECONNECT_RETRY_INTERVAL = 5.0   # seconds between attempts
+    RECONNECT_RETRY_INTERVAL = 10.0  # seconds between attempts
     RECONNECT_MAX_DURATION = 600.0   # 10 min ceiling, then alert + give up
 
     async def _bounded(self, coro, *, timeout: float, op: str):

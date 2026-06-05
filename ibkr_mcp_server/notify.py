@@ -136,7 +136,7 @@ def alert_disconnect(reason: str = "") -> None:
     body = "Daemon lost its connection to IBKR Gateway."
     if reason:
         body += f" Reason: {reason}"
-    body += " Watchdog will attempt auto-recovery within 5 minutes."
+    body += " Daemon is retrying every 10 seconds (up to 10 min); watchdog escalates after that."
     send(
         title="IBKR disconnected",
         message=body,

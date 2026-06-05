@@ -1,21 +1,113 @@
 services:
   ib-gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:stable
+    # TWS Desktop image rather than IB Gateway. Reasoning (2026-06-04):
+    # Multi-hour debug found IB Gateway from datacenter VPS gets disconnected
+    # by IBKR's risk system every ~5 min ("Exit Session Setting" dialog in
+    # IBC log), while TWS Desktop on residential network stays connected
+    # indefinitely on the same account/credentials. Switching to the TWS
+    # image lets the container present as a TWS session, which may bypass
+    # the Gateway-specific risk flag. Ports are different too: TWS lives on
+    # 7496 (live) / 7497 (paper) where Gateway used 4001/4002.
+    #
+    # If you prefer Gateway (lower memory footprint, headless-ish), swap
+    # this line back to `ghcr.io/gnzsnz/ib-gateway:stable`, remove the
+    # shm_size/security_opt lines below, and change IBKR_PORT in your .env
+    # to 4001 (live) or 4002 (paper).
+    image: ghcr.io/gnzsnz/tws-rdesktop:latest
     container_name: ib-gateway
     restart: unless-stopped
-    # Host networking so Gateway sees connections as coming from 127.0.0.1
+    # ────────────────────────────────────────────────────────────────────
+    # tws-rdesktop requirements:
+    #   - shm_size: TWS GUI rendering needs ≥1GB shared memory
+    #   - seccomp:unconfined: TWS uses some syscalls Docker blocks by default
+    #   - /dev/dri: GPU device for hardware-accelerated rendering. OMITTED
+    #     here because most VPSes don't have one — TWS falls back to
+    #     software rendering. If running on a host with a GPU and
+    #     /dev/dri exists, uncomment the devices block.
+    # ────────────────────────────────────────────────────────────────────
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # Host networking so TWS sees connections as coming from 127.0.0.1
     # (which is what its TrustedIPs=127.0.0.1 config allows). The same
     # arrangement we settled on for the Layer 1 verification.
     network_mode: host
     env_file: ../.env
     environment:
-      TRADING_MODE: paper
+      # Set TRADING_MODE in your .env. Use "paper" for DU* accounts and
+      # "live" for U* accounts. Live mode also requires the live-account
+      # TWS_USERID + TWS_PASSWORD in .env (those load via env_file above).
+      # Set IBKR_PORT in your .env to 7496 (live) or 7497 (paper) to match
+      # the TWS image's bound ports.
+      TRADING_MODE: ${TRADING_MODE:-paper}
       READ_ONLY_API: "no"
       TWS_ACCEPT_INCOMING: accept
       TIME_ZONE: America/New_York
+      # Java reads TZ separately from TIME_ZONE; set both so timestamps in
+      # jts.ini stay consistent with daemon logs.
+      TZ: America/New_York
       AUTO_RESTART_TIME: "11:59 PM"
-      RELOGIN_AFTER_2FA_TIMEOUT: "yes"
+
+      # ------------------------------------------------------------------
+      # Live-mode hardening — researched and verified 2026-06-04 after a
+      # multi-hour debug against a live account. No-op on paper but
+      # required on live. Do NOT remove these in a "simplification" pass.
+      # ------------------------------------------------------------------
+
+      # IBC config: relogin after 2FA timeout. Note the var name is
+      # TWOFA (no digit) — the older RELOGIN_AFTER_2FA_TIMEOUT (with the
+      # digit) is silently ignored by the gnzsnz image.
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+
+      # If 2FA times out, restart IBC (which re-pushes the 2FA prompt)
+      # instead of exiting the container.
+      TWOFA_TIMEOUT_ACTION: restart
+
+      # CRITICAL for live: how IBKR's session arbiter resolves conflicts
+      # when another active session (IBKR Mobile installed for 2FA,
+      # Client Portal browser tab, TWS Desktop, another Gateway) exists
+      # for the same username.
+      #   - "primary"         → this Gateway refuses to yield, BUT a
+      #                          competing primary session WINS the
+      #                          arbitration, kicking us. Symptom:
+      #                          Gateway logs in, dies in 30-60s, IBC
+      #                          re-logins, repeat forever.
+      #   - "primaryoverride" → this Gateway forcefully TAKES OVER.
+      #                          IBC user guide explicitly recommends
+      #                          this "if using the IBKR Mobile app or
+      #                          the Client Portal on the IBKR Account
+      #                          Management page causes your TWS/Gateway
+      #                          session to be shut down."
+      # The gnzsnz .env-dist default of "primary" is WRONG for any
+      # account where the operator has IBKR Mobile installed or ever
+      # visits Client Portal in a browser (i.e. essentially every
+      # real-world account).
+      EXISTING_SESSION_DETECTED_ACTION: primaryoverride
+
+      # Suppress the "API client needs write access action confirmation"
+      # dialog that pops up on the first live API connection. Without
+      # this, IBC may fail to dismiss the dialog and the API listener
+      # hangs.
+      ALLOW_BLIND_TRADING: "yes"
+
+      # IBC's master client ID. Daemon connects with clientId=1 (its
+      # default). They MUST differ — using clientId=1 as the master
+      # while the daemon also uses 1 caused mysterious disconnects in
+      # debugging.
+      TWS_MASTER_CLIENT_ID: "100"
+
       BYPASS_WARNING: "yes"
+      # ------------------------------------------------------------------
+
+    # File-descriptor exhaustion was a documented cause of mid-day
+    # Gateway container restarts (gnzsnz Discussion #245). Default Docker
+    # ulimit is ~1024 which the JVM + jxbrowser internals can exhaust.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   ibkr-mcp:
     build:
@@ -25,20 +117,21 @@ services:
     restart: unless-stopped
     depends_on:
       - ib-gateway
-    # Also host networking — the daemon needs to reach 127.0.0.1:4002 (Gateway)
-    # via the same loopback Gateway is bound to. This also publishes the MCP
-    # HTTP port directly on the host's 127.0.0.1:8765 (assuming MCP_BIND_HOST
-    # is 127.0.0.1 in .env, which it should be for SSH-tunnel access).
+    # Also host networking — the daemon needs to reach 127.0.0.1:4001
+    # (live) or 127.0.0.1:4002 (paper) on the same loopback Gateway is
+    # bound to. This also publishes the MCP HTTP port directly on the
+    # host's 127.0.0.1:8765 (assuming MCP_BIND_HOST is 127.0.0.1 in
+    # .env, which it should be for SSH-tunnel access).
     network_mode: host
     env_file:
       - ../.env
     volumes:
       # Persist the per-strategy JSON state files across container restarts.
       - mcp-state:/home/trader
-    # The Dockerfile sets ENTRYPOINT=["python", "-m", "ibkr_mcp_server"]; compose's
-    # `command` appends to it, so we list only the CLI flags here. Wait long
-    # enough for Gateway to finish logging in before we try to connect; the
-    # healthcheck handles steady-state restarts.
+    # The Dockerfile sets ENTRYPOINT=["python", "-m", "ibkr_mcp_server"];
+    # compose's `command` appends to it, so we list only the CLI flags
+    # here. Wait long enough for Gateway to finish logging in before we
+    # try to connect; the healthcheck handles steady-state restarts.
     command: ["--daemon", "--transport", "http"]
 
 volumes:
