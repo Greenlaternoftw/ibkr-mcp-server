@@ -1,36 +1,18 @@
 services:
   ib-gateway:
-    # TWS Desktop image rather than IB Gateway. Reasoning (2026-06-04):
-    # Multi-hour debug found IB Gateway from datacenter VPS gets disconnected
-    # by IBKR's risk system every ~5 min ("Exit Session Setting" dialog in
-    # IBC log), while TWS Desktop on residential network stays connected
-    # indefinitely on the same account/credentials. Switching to the TWS
-    # image lets the container present as a TWS session, which may bypass
-    # the Gateway-specific risk flag. Ports are different too: TWS lives on
-    # 7496 (live) / 7497 (paper) where Gateway used 4001/4002.
+    # IB Gateway (headless). The "live mode disconnects every 5 min" saga
+    # of 2026-06-04/05 turned out NOT to be a Gateway or IBKR problem at
+    # all — it was our own watchdog (scripts/ibkr-watchdog.sh) hardcoded to
+    # check the paper port 4002, restarting a perfectly-healthy live Gateway
+    # every 5 minutes. Fixed in that script (port now derives from
+    # IBKR_PORT). Gateway-on-4001-from-VPS is stable; no TWS image or IP
+    # workaround needed.
     #
-    # If you prefer Gateway (lower memory footprint, headless-ish), swap
-    # this line back to `ghcr.io/gnzsnz/ib-gateway:stable`, remove the
-    # shm_size/security_opt lines below, and change IBKR_PORT in your .env
-    # to 4001 (live) or 4002 (paper).
-    image: ghcr.io/gnzsnz/tws-rdesktop:latest
+    # Ports: 4001 (live) / 4002 (paper). Set IBKR_PORT in your .env to match.
+    image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
     restart: unless-stopped
-    # ────────────────────────────────────────────────────────────────────
-    # tws-rdesktop requirements:
-    #   - shm_size: TWS GUI rendering needs ≥1GB shared memory
-    #   - seccomp:unconfined: TWS uses some syscalls Docker blocks by default
-    #   - /dev/dri: GPU device for hardware-accelerated rendering. OMITTED
-    #     here because most VPSes don't have one — TWS falls back to
-    #     software rendering. If running on a host with a GPU and
-    #     /dev/dri exists, uncomment the devices block.
-    # ────────────────────────────────────────────────────────────────────
-    shm_size: "1gb"
-    security_opt:
-      - seccomp:unconfined
-    # devices:
-    #   - /dev/dri:/dev/dri
-    # Host networking so TWS sees connections as coming from 127.0.0.1
+    # Host networking so Gateway sees connections as coming from 127.0.0.1
     # (which is what its TrustedIPs=127.0.0.1 config allows). The same
     # arrangement we settled on for the Layer 1 verification.
     network_mode: host
@@ -39,8 +21,7 @@ services:
       # Set TRADING_MODE in your .env. Use "paper" for DU* accounts and
       # "live" for U* accounts. Live mode also requires the live-account
       # TWS_USERID + TWS_PASSWORD in .env (those load via env_file above).
-      # Set IBKR_PORT in your .env to 7496 (live) or 7497 (paper) to match
-      # the TWS image's bound ports.
+      # Set IBKR_PORT in your .env to 4001 (live) or 4002 (paper).
       TRADING_MODE: ${TRADING_MODE:-paper}
       READ_ONLY_API: "no"
       TWS_ACCEPT_INCOMING: accept
