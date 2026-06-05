@@ -187,8 +187,8 @@ Available overrides for the watchdog:
 | `IBKR_WATCHDOG_LOG` | `/home/trader/ibkr-watchdog.log` | Where to log |
 | `IBKR_WATCHDOG_ENV_FILE` | `/home/trader/ibkr-mcp-server/.env` | Where to read `MCP_AUTH_TOKEN` from |
 | `IBKR_WATCHDOG_GATEWAY_COMPOSE` | `/home/trader/ibkr-stack/docker-compose.yml` | Gateway compose file |
-| `IBKR_WATCHDOG_HEALTHZ_URL` | `http://127.0.0.1:8765/healthz` | Daemon health endpoint |
-| `IBKR_WATCHDOG_GATEWAY_PORT` | `4002` | Port to check for listening |
+| `IBKR_WATCHDOG_HEALTHZ_URL` | derived from `MCP_BIND_HOST`/`MCP_BIND_PORT` in `.env` | Daemon health endpoint |
+| `IBKR_WATCHDOG_GATEWAY_PORT` | derived from `IBKR_PORT` in `.env` (falls back to `4002`) | Port to check for listening. **Auto-follows the daemon's port** so paper↔live flips don't make the watchdog bounce a healthy Gateway. Pin explicitly only if your Gateway and daemon use different ports. |
 | `IBKR_WATCHDOG_GATEWAY_WAIT` | `90` | Seconds to wait after Gateway restart |
 | `IBKR_WATCHDOG_DAEMON_WAIT` | `5` | Seconds to wait after daemon restart |
 | `IBKR_WATCHDOG_STATE_FILE` | `/tmp/ibkr-watchdog.last-state` | Tracks last-known state so we only alert on transitions |

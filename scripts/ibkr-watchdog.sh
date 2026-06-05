@@ -30,7 +30,16 @@ set -uo pipefail
 LOG=${IBKR_WATCHDOG_LOG:-/home/trader/ibkr-watchdog.log}
 ENV_FILE=${IBKR_WATCHDOG_ENV_FILE:-/home/trader/ibkr-mcp-server/.env}
 GATEWAY_COMPOSE=${IBKR_WATCHDOG_GATEWAY_COMPOSE:-/home/trader/ibkr-stack/docker-compose.yml}
-GATEWAY_PORT=${IBKR_WATCHDOG_GATEWAY_PORT:-4002}
+# GATEWAY_PORT: if not pinned explicitly via IBKR_WATCHDOG_GATEWAY_PORT,
+# we DERIVE it from IBKR_PORT in the daemon's .env (resolved below, after
+# read_env is defined). This is the cornerstone fix for the "watchdog
+# restarts a healthy live Gateway every 5 minutes" bug: the old hardcoded
+# 4002 default is the PAPER Gateway port, so the moment anyone flipped to
+# live (port 4001, or 7496/7497 for the TWS image) the watchdog found 4002
+# dead on every tick and helpfully bounced a perfectly-healthy Gateway --
+# forcing a re-login + 2FA push every 5 minutes, forever. Deriving from
+# the same .env the daemon connects through keeps them in lockstep.
+GATEWAY_PORT=${IBKR_WATCHDOG_GATEWAY_PORT:-}
 GATEWAY_RESTART_WAIT=${IBKR_WATCHDOG_GATEWAY_WAIT:-90}
 DAEMON_RESTART_WAIT=${IBKR_WATCHDOG_DAEMON_WAIT:-5}
 LOCK_FILE=/tmp/ibkr-watchdog.lock
@@ -73,6 +82,7 @@ if [ -r "$ENV_FILE" ]; then
     NTFY_TOPIC_VAL=$(read_env NTFY_TOPIC)
     BIND_HOST=$(read_env MCP_BIND_HOST)
     BIND_PORT=$(read_env MCP_BIND_PORT)
+    IBKR_PORT_VAL=$(read_env IBKR_PORT)
 fi
 NTFY_URL_VAL=${NTFY_URL_VAL:-https://ntfy.sh}
 
@@ -82,6 +92,17 @@ NTFY_URL_VAL=${NTFY_URL_VAL:-https://ntfy.sh}
 # guessing 127.0.0.1.
 if [ -z "$HEALTHZ_URL" ]; then
     HEALTHZ_URL="http://${BIND_HOST:-127.0.0.1}:${BIND_PORT:-8765}/healthz"
+fi
+
+# Resolve GATEWAY_PORT from the daemon's IBKR_PORT if the cron didn't pin
+# it explicitly. Follows whatever port the daemon actually connects to:
+#   4002 = Gateway paper   4001 = Gateway live
+#   7497 = TWS paper       7496 = TWS live
+# Falls back to 4002 only if .env has no IBKR_PORT at all (legacy default).
+# This prevents the watchdog from bouncing a healthy live Gateway because
+# it was hardcoded to look for the paper port.
+if [ -z "$GATEWAY_PORT" ]; then
+    GATEWAY_PORT="${IBKR_PORT_VAL:-4002}"
 fi
 
 # --- ntfy helper (failure-silent) -----------------------------------------
