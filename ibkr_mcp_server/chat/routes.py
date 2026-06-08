@@ -48,6 +48,14 @@ from .schemas import mcp_tools_to_anthropic
 
 logger = logging.getLogger(__name__)
 
+# Cooldown timestamp (monotonic seconds) for the /chat/api/positions
+# market-data backfill. When a snapshot comes back with zero usable marks
+# (no L1 subscription on the account), we set this ~5min ahead so the next
+# polls skip the snapshot instead of each burning the full timeout. Reset
+# to 0 the moment we get a real mark. Module-global so it persists across
+# requests within the process.
+_POSITIONS_MARK_BACKOFF_UNTIL = 0.0
+
 
 # Singleton agent per process. Built lazily so the daemon can start
 # without an API key (chat is opt-in). Reset to None when settings change
@@ -963,6 +971,17 @@ async def positions(request: Request) -> Response:
     #
     # Use plain asyncio.wait_for + swallow EVERY exception. If the snapshot
     # is slow or fails, positions still render with avg_cost and a 0 mark.
+    # Short-circuit: if a recent backfill came back completely empty (no
+    # market-data subscription on this account -> reqTickers returns NaN
+    # for everything and just burns the full timeout), skip the snapshot
+    # for a cooldown window so the dashboard stays snappy instead of
+    # eating ~4s on every 30s poll. Retries once the window expires in
+    # case a subscription was added or the market reopened.
+    import time as _time
+    global _POSITIONS_MARK_BACKOFF_UNTIL
+    if need_mark and _time.monotonic() < _POSITIONS_MARK_BACKOFF_UNTIL:
+        need_mark = []  # skip the snapshot this round
+
     if need_mark:
         def _ticker_px(t):
             for v in (getattr(t, "last", None), getattr(t, "close", None)):
@@ -979,15 +998,25 @@ async def positions(request: Request) -> Response:
             except Exception:
                 pass
             return None
+        got_any_mark = False
         try:
+            # Request DELAYED market data (type 3) for the snapshot. Live
+            # accounts without a real-time L1 subscription (Error 10089)
+            # get nothing from the default real-time request, so unrealized
+            # P&L stayed $0. Delayed data is free on virtually all accounts
+            # and ~15min lagged -- perfectly adequate for a portfolio P&L
+            # display. We restore real-time (type 1) immediately after so
+            # strategy ticks are unaffected.
+            try:
+                ibkr_client.ib.reqMarketDataType(3)
+            except Exception:
+                pass
             contracts = [c for (_, c, _, _) in need_mark]
-            # 4s timeout: tight enough that a polling client hitting this
-            # every 30s never queues backfills, loose enough for a normal
-            # market-hours snapshot. Plain wait_for -- timeout raises but
-            # does NOT cascade into a connection reset like _bounded does.
+            # 3s timeout. Plain wait_for -- a timeout raises but does NOT
+            # cascade into a connection reset like _bounded does.
             tickers = await asyncio.wait_for(
                 ibkr_client.ib.reqTickersAsync(*contracts),
-                timeout=4.0,
+                timeout=3.0,
             )
             by_con = {}
             for t in (tickers or []):
@@ -1001,18 +1030,29 @@ async def positions(request: Request) -> Response:
                 px = _ticker_px(t)
                 if not px:
                     continue
+                got_any_mark = True
                 row = out[idx]
                 row["market_price"] = px
                 row["market_value"] = px * qty
                 row["unrealized_pnl"] = (px - avg_cost) * qty
         except asyncio.TimeoutError:
-            # Snapshot too slow -- normal during off-hours or for illiquid
-            # symbols. Render with 0 marks; next poll will retry.
             logger.debug("positions mark backfill timed out (skipping silently)")
         except Exception:
-            # Anything else (no market-data subscription, qualify failure,
-            # IBKR rate-limit). Same handling: skip silently.
             logger.debug("positions mark backfill skipped", exc_info=True)
+        finally:
+            # Restore real-time market data type so strategy ticks aren't
+            # left on delayed data.
+            try:
+                ibkr_client.ib.reqMarketDataType(1)
+            except Exception:
+                pass
+        # If we got nothing usable, back off for 5 minutes so subsequent
+        # polls don't each eat the full timeout. If we DID get marks, clear
+        # any prior backoff so we keep refreshing live.
+        if got_any_mark:
+            _POSITIONS_MARK_BACKOFF_UNTIL = 0.0
+        else:
+            _POSITIONS_MARK_BACKOFF_UNTIL = _time.monotonic() + 300.0
 
     return JSONResponse({"positions": out})
 
