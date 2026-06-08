@@ -1704,6 +1704,89 @@ def reset_agent() -> None:
     _agent = None
 
 
+# --- EWS (Portfolio Early Warning System) ---------------------------------
+
+
+async def ews_status(request: Request) -> Response:
+    """EWS config + last-scan summary for the dashboard status bar."""
+    from ..ews import persistence as ews_persist
+    last = ews_persist.get_store().last_scan()
+    return JSONResponse({
+        "enabled": settings.ews_enabled,
+        "uw_configured": bool(settings.uw_api_key),
+        "scan_interval_minutes": settings.ews_scan_interval_minutes,
+        "push_min_severity": settings.ews_push_min_severity,
+        "anthropic_configured": bool(settings.anthropic_api_key),
+        "last_scan": last,
+    })
+
+
+async def ews_alerts(request: Request) -> Response:
+    """The alert feed, newest first. ?limit=N, ?include_dismissed=1."""
+    from ..ews import persistence as ews_persist
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except (TypeError, ValueError):
+        limit = 100
+    incl = request.query_params.get("include_dismissed", "0") in ("1", "true", "yes")
+    alerts = ews_persist.get_store().list_alerts(limit=max(1, min(limit, 500)),
+                                                 include_dismissed=incl)
+    return JSONResponse({"alerts": alerts})
+
+
+async def ews_scan_now(request: Request) -> Response:
+    """Trigger one immediate scan cycle (brief: 'Scan Now')."""
+    from ..client import ibkr_client
+    from ..ews import monitor as ews_monitor
+    if not settings.anthropic_api_key:
+        return JSONResponse({"error": "Anthropic key not configured"},
+                            status_code=400)
+    summary = await ews_monitor.run_scan(ibkr_client)
+    return JSONResponse({"status": "ok", "summary": summary})
+
+
+async def ews_dismiss(request: Request) -> Response:
+    """Dismiss one alert from the feed."""
+    from ..ews import persistence as ews_persist
+    try:
+        alert_id = int(request.path_params["alert_id"])
+    except (TypeError, ValueError, KeyError):
+        return JSONResponse({"error": "bad alert id"}, status_code=400)
+    ok = ews_persist.get_store().dismiss_alert(alert_id)
+    return JSONResponse({"dismissed": ok})
+
+
+async def ews_alert_ics(request: Request) -> Response:
+    """Download one alert's review reminders as a .ics calendar file."""
+    from ..ews import persistence as ews_persist
+    from ..ews import ics as ews_ics
+    import datetime as _dt
+    try:
+        alert_id = int(request.path_params["alert_id"])
+    except (TypeError, ValueError, KeyError):
+        return JSONResponse({"error": "bad alert id"}, status_code=400)
+    alerts = ews_persist.get_store().list_alerts(limit=500, include_dismissed=True)
+    match = [a for a in alerts if a["id"] == alert_id]
+    if not match:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    body = ews_ics.build_ics(match, now=_dt.datetime.now(_dt.timezone.utc))
+    return Response(body, media_type="text/calendar",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="ews-{match[0]["symbol"]}.ics"'})
+
+
+async def ews_all_ics(request: Request) -> Response:
+    """Download review reminders for ALL active alerts as one .ics."""
+    from ..ews import persistence as ews_persist
+    from ..ews import ics as ews_ics
+    import datetime as _dt
+    alerts = ews_persist.get_store().list_alerts(limit=200, include_dismissed=False)
+    body = ews_ics.build_ics(alerts, now=_dt.datetime.now(_dt.timezone.utc))
+    return Response(body, media_type="text/calendar",
+                    headers={"Content-Disposition":
+                             'attachment; filename="portfolio-all-reminders.ics"'})
+
+
 # --- route assembly -------------------------------------------------------
 
 
@@ -1766,6 +1849,13 @@ def chat_routes() -> List:
         Route("/chat/api/accounts/summary-all", accounts_summary_all, methods=["GET"]),
         Route("/chat/api/accounts/transfer-plan", balance_transfer_plan, methods=["POST"]),
         Route("/chat/api/pivot/{symbol}", pivot_analysis, methods=["GET"]),
+        # Portfolio Early Warning System (EWS)
+        Route("/chat/api/ews/status", ews_status, methods=["GET"]),
+        Route("/chat/api/ews/alerts", ews_alerts, methods=["GET"]),
+        Route("/chat/api/ews/scan-now", ews_scan_now, methods=["POST"]),
+        Route("/chat/api/ews/alerts/{alert_id}/dismiss", ews_dismiss, methods=["POST"]),
+        Route("/chat/api/ews/alerts/{alert_id}.ics", ews_alert_ics, methods=["GET"]),
+        Route("/chat/api/ews/alerts.ics", ews_all_ics, methods=["GET"]),
         # Pivot-loop persistent state (SQLite-backed). Claude reads/writes
         # through these endpoints (and the matching MCP tools) so loop
         # state survives restarts + cross-device + multi-thread.

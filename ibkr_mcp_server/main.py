@@ -182,6 +182,19 @@ async def run_daemon_http():
         # hiccups -- a failed tick logs and retries on the next interval.
         snapshot_task = asyncio.create_task(ibkr_client._snapshot_loop())
 
+        # Background task: Portfolio Early Warning System scan loop. Scans
+        # held positions for SEC filings / options flow / short interest /
+        # dark pool / news, asks Claude for recommendations, and pushes
+        # CRITICAL/HIGH alerts via ntfy. No-op (returns immediately) when
+        # ews_enabled is False or the interval is 0. Failure-isolated like
+        # the snapshot loop.
+        ews_task = None
+        try:
+            from .ews import monitor as ews_monitor
+            ews_task = asyncio.create_task(ews_monitor.scan_loop(ibkr_client))
+        except Exception:
+            logger.exception("failed to start EWS scan loop (continuing without it)")
+
         await run_http_server(
             host=settings.mcp_bind_host,
             port=settings.mcp_bind_port,
@@ -199,6 +212,12 @@ async def run_daemon_http():
         try:
             snapshot_task.cancel()
             await asyncio.wait_for(snapshot_task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, NameError):
+            pass
+        try:
+            if ews_task is not None:
+                ews_task.cancel()
+                await asyncio.wait_for(ews_task, timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError, NameError):
             pass
         try:
