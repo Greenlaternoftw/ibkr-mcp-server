@@ -880,10 +880,15 @@ async def positions(request: Request) -> Response:
         target = ibkr_client.current_account
 
         # Authoritative position list -- works across all managed accounts.
+        # reset_on_timeout=False: this is a read-only query polled every 30s
+        # from the dashboard. A slow reqPositions (busy reconnect, many
+        # positions) must NOT force-disconnect the socket -- that cascaded
+        # into the "lost connection on every page refresh" storm.
         positions = await ibkr_client._bounded(
             ibkr_client.ib.reqPositionsAsync(),
             timeout=ibkr_client.SUMMARY_TIMEOUT,
             op="reqPositions",
+            reset_on_timeout=False,
         )
 
         # Best-effort: nudge the account-update stream to subscribe to the
@@ -1288,10 +1293,14 @@ async def market_quote(request: Request) -> Response:
     try:
         from ib_async import Stock as _Stock
         contract = _Stock(sym, "SMART", "USD")
+        # reset_on_timeout=False: read-only quote for the price ticker,
+        # polled from the dashboard. A slow qualify must not force-
+        # disconnect the IBKR socket (page-refresh disconnect storm).
         await ibkr_client._bounded(
             ibkr_client.ib.qualifyContractsAsync(contract),
             timeout=ibkr_client.QUALIFY_TIMEOUT,
             op=f"qualify_quote:{sym}",
+            reset_on_timeout=False,
         )
         if not contract.conId:
             return JSONResponse(

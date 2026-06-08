@@ -189,22 +189,41 @@ class IBKRClient:
     RECONNECT_RETRY_INTERVAL = 10.0  # seconds between attempts
     RECONNECT_MAX_DURATION = 600.0   # 10 min ceiling, then alert + give up
 
-    async def _bounded(self, coro, *, timeout: float, op: str):
+    async def _bounded(self, coro, *, timeout: float, op: str,
+                       reset_on_timeout: bool = True):
         """Run an IB coroutine with a hard timeout.
 
-        On timeout, schedules a connection reset and re-raises TimeoutError.
-        The reset is what prevents the whole-server wedge bug class: without
-        it, the next IB call inherits the same stuck event-loop state.
+        On timeout, by default schedules a connection reset and re-raises
+        TimeoutError. The reset prevents the whole-server wedge bug class:
+        without it, the next IB call inherits the same stuck event-loop
+        state. This is the right behavior for order placement and other
+        write/state-critical calls where a hung call genuinely means the
+        socket is wedged.
+
+        reset_on_timeout=False: for READ-ONLY dashboard queries (positions,
+        quotes, account summary) that get polled every 30s from the phone.
+        A slow snapshot there is NORMAL (no L1 subscription, off-hours,
+        illiquid symbol) -- it must NOT tear down the IBKR socket, which
+        cascades into the disconnect/reconnect/ntfy storm seen on every
+        page refresh (2026-06-08). The slow request just returns a clean
+        TimeoutError to that one caller; the connection is left intact and
+        the next poll retries.
         """
         try:
             return await asyncio.wait_for(coro, timeout=timeout)
         except asyncio.TimeoutError:
-            self.logger.error(
-                f"IB call timed out: op={op} timeout={timeout}s -- resetting connection"
-            )
-            # Fire-and-forget reset so callers see the timeout immediately and
-            # the next caller starts on a fresh connection.
-            asyncio.create_task(self._reset_on_timeout())
+            if reset_on_timeout:
+                self.logger.error(
+                    f"IB call timed out: op={op} timeout={timeout}s -- resetting connection"
+                )
+                # Fire-and-forget reset so callers see the timeout immediately
+                # and the next caller starts on a fresh connection.
+                asyncio.create_task(self._reset_on_timeout())
+            else:
+                self.logger.warning(
+                    f"IB read call timed out: op={op} timeout={timeout}s -- "
+                    "returning empty (connection left intact)"
+                )
             raise
 
     async def _reset_on_timeout(self) -> None:
