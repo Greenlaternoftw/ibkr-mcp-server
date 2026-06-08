@@ -32,7 +32,15 @@ class Settings(BaseSettings):
     
     # Trading Safety
     enable_live_trading: bool = False
-    max_order_size: int = 1000
+    # Per-order share cap. Paired with `live_max_order_size` below: the
+    # effective live cap is `min(live_max_order_size, max_order_size)`,
+    # so this ceiling also constrains live. Raised to 10_000_000 with
+    # the live cap lift (2026-06-05) so real position sizes (NIQ=62k,
+    # AVEX=12k, KEEL=8k, etc.) can transmit in a single order. This is
+    # a runaway-typo bouncer rather than a real cap -- a misclicked
+    # qty=99999999 still bounces. Lower (e.g. 5000) if you want a
+    # meaningful per-order ceiling back.
+    max_order_size: int = 10_000_000
     require_order_confirmation: bool = True
 
     # === LIVE-MODE SAFETY RAILS ===
@@ -47,10 +55,17 @@ class Settings(BaseSettings):
     # this is a stop-the-bleeding rail, not a normal-day signal.
     live_daily_loss_limit: float = -500.0
 
-    # Override max_order_size in live mode. Default 100 vs 1000 paper
-    # default -- forces conservative position sizing until operator
-    # explicitly raises it after observation.
-    live_max_order_size: int = 100
+    # Override max_order_size in live mode. The original 100-share
+    # conservative default was lifted at operator request (2026-06-05)
+    # once real position sizes were known to dwarf it (NIQ=62k, KEEL=8k,
+    # AVEX=12k etc.). 10_000_000 acts as a runaway-typo bouncer rather
+    # than a real cap: a misclicked qty=99999999 still bounces, but no
+    # realistic order is constrained. Set lower (e.g. 5000) if you want
+    # a meaningful per-order ceiling back. Note: the audit (#54/C1) flagged
+    # that this value is not yet enforced on place_order/place_oca_group;
+    # until that lands, this knob only affects /chat/api/live/status
+    # display, not actual order acceptance.
+    live_max_order_size: int = 10_000_000
 
     # On the first connect in live mode, all existing pivot loops are
     # auto-paused (status='paused' in SQLite). Operator must manually

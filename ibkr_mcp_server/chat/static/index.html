@@ -3445,6 +3445,31 @@ const fmt = n => n == null || isNaN(n) ? '—' : '$' + Number(n).toFixed(2);
 const fmtPct = n => n == null || isNaN(n) ? '—' : (n >= 0 ? '+' : '') + Number(n).toFixed(1) + '%';
 const fmtInt = n => n == null || isNaN(n) ? '—' : Number(n).toLocaleString();
 
+// Adaptive price formatting -- precision chosen by magnitude. Used by
+// the portfolio table for the price/target/range columns so big-cap
+// names don't look like "$2,346.81" while penny-stock-fractionals show
+// 4 decimals. `fmt` stays as the project-wide $X.XX default.
+const fmtPrice = n => {
+  if (n == null || isNaN(n)) return '—';
+  const v = Number(n);
+  if (v >= 1000) return '$' + v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  if (v >= 10)   return '$' + v.toFixed(2);
+  if (v >= 1)    return '$' + v.toFixed(3);
+  return '$' + v.toFixed(4);
+};
+// Quantity formatting -- K/M abbreviation for huge positions (NIQ=62k,
+// AVEX=12k) so the column doesn't blow out, 4-decimal precision for
+// tiny fractional shares (BTC=2e-8, fractional ORCL=0.86), comma-
+// separated integers otherwise.
+const fmtQty = n => {
+  if (n == null || isNaN(n) || n === 0) return '—';
+  const v = Math.abs(Number(n));
+  if (v < 10 && v % 1 !== 0) return v.toFixed(4);
+  if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + 'M';
+  if (v >= 10_000)    return (v / 1000).toFixed(1) + 'K';
+  return Math.round(v).toLocaleString();
+};
+
 /* ============================================================
    STYLE TOGGLE
 ============================================================ */
@@ -3650,10 +3675,27 @@ function renderPortfolioStocks() {
 
   tbody.innerHTML = stocks.map(s => {
     const moveColor = (s.potentialMovePct || 0) >= 0 ? 'var(--go)' : 'var(--stop)';
-    const ratingColor = s.gatePassed ? 'var(--go)' : 'var(--stop)';
-    const ratingLabel = s.gatePassed
-      ? s.rating
-      : `<span style="font-size:13px; margin-right:4px;">✗</span> ${s.rating || 'GATE FAIL'}`;
+    // Rating label: four cases, not two. Old code only handled
+    // gate-pass / gate-fail and treated "no research yet" as a GATE FAIL
+    // (misleading "✗" on rows that simply hadn't been enriched). Now:
+    //   - research in flight from auto-enqueue:       muted dots
+    //   - no rating at all (auto-added IBKR row):     muted dash
+    //   - rating + gate passed:                       green pill
+    //   - rating + gate failed:                       red pill with ✗
+    let ratingLabel, ratingColor;
+    if (s._researchLoading) {
+      ratingLabel = '<span style="opacity:0.55; letter-spacing:0.15em;">···</span>';
+      ratingColor = 'var(--muted)';
+    } else if (s.rating == null) {
+      ratingLabel = '<span style="opacity:0.55;">—</span>';
+      ratingColor = 'var(--muted)';
+    } else if (s.gatePassed) {
+      ratingLabel = s.rating;
+      ratingColor = 'var(--go)';
+    } else {
+      ratingLabel = `<span style="font-size:13px; margin-right:4px;">✗</span> ${s.rating}`;
+      ratingColor = 'var(--stop)';
+    }
     // The 30D range and Updated columns get written under DIFFERENT
     // field names depending on the code path:
     //   - fresh research summary writes projection30dLow/High + lastUpdated
@@ -3664,17 +3706,17 @@ function renderPortfolioStocks() {
     // reached the row via DB-load or auto-sync rendered as "—".)
     const rangeLo = s.projection30dLow ?? (Array.isArray(s.range) ? s.range[0] : null);
     const rangeHi = s.projection30dHigh ?? (Array.isArray(s.range) ? s.range[1] : null);
+    // En-dash, no spaces -- narrower in the column.
     const range = (rangeLo != null && rangeHi != null)
-      ? `${fmt(rangeLo)} – ${fmt(rangeHi)}`
+      ? `${fmtPrice(rangeLo)}–${fmtPrice(rangeHi)}`
       : '—';
     const updatedIso = s.updatedAt || s.lastUpdated;
     const updated = updatedIso ? timeSince(updatedIso) : '—';
+    const updatedTooltip = updatedIso ? new Date(updatedIso).toLocaleString() : '';
     // Qty + unrealized P&L. Both come from auto-sync (refreshPositions
     // stamps these from IBKR PortfolioItem). null on watchlist rows
     // since they aren't tied to a real position.
-    const qty = (typeof s.quantity === 'number' && s.quantity !== 0)
-      ? `${Math.round(s.quantity).toLocaleString()}`
-      : '—';
+    const qty = fmtQty(s.quantity);
     let pnlCell = '—';
     if (typeof s.unrealizedPnL === 'number'
         && typeof s.avgCost === 'number' && s.avgCost > 0
@@ -3683,7 +3725,10 @@ function renderPortfolioStocks() {
       const pct = cost > 0 ? (s.unrealizedPnL / cost) * 100 : 0;
       const color = s.unrealizedPnL >= 0 ? 'var(--go)' : 'var(--stop)';
       const sign = s.unrealizedPnL >= 0 ? '+' : '';
-      pnlCell = `<span style="color:${color};">${sign}$${Math.abs(s.unrealizedPnL).toFixed(2)} <span style="opacity:0.75; font-size:10px;">(${sign}${pct.toFixed(1)}%)</span></span>`;
+      // Stack vertically: dollar above, percent below. Easier to scan
+      // than a single cramped line.
+      pnlCell = `<div style="color:${color}; font-size:13px; line-height:1.15;">${sign}$${Math.abs(s.unrealizedPnL).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>`
+              + `<div style="color:${color}; opacity:0.7; font-size:10px; line-height:1.15;">${sign}${pct.toFixed(1)}%</div>`;
     }
     const status = s._loading
       ? '<td colspan="8" style="color:var(--accent); text-align:center; font-size:10px; letter-spacing:0.15em;">FETCHING…</td>'
@@ -3692,12 +3737,12 @@ function renderPortfolioStocks() {
         : `
           <td><span class="rating-pill" style="color:${ratingColor};">${ratingLabel}</span></td>
           <td class="right">${qty}</td>
-          <td class="right${s.priceFlash ? ' price-flash' : ''}">${fmt(s.currentPrice)}</td>
-          <td class="right">${fmt(s.targetPrice)}</td>
-          <td class="right">${range}</td>
+          <td class="right${s.priceFlash ? ' price-flash' : ''}">${fmtPrice(s.currentPrice)}</td>
+          <td class="right">${fmtPrice(s.targetPrice)}</td>
+          <td class="right" style="font-size:11px;">${range}</td>
           <td class="right" style="color:${moveColor};">${fmtPct(s.potentialMovePct)}</td>
           <td class="right">${pnlCell}</td>
-          <td class="right" style="color:var(--muted); font-size:10px;">${updated}</td>`;
+          <td class="right" style="color:var(--muted); font-size:11px;" title="${updatedTooltip}">${updated}</td>`;
     const sellBtn = isPortfolio
       ? `<button class="sell-btn" title="Quick exit — lock in gains with fast fill" onclick="sellStock('${s.symbol}')">EXIT</button>`
       : '';
@@ -6360,6 +6405,104 @@ function _updateSyncStatus(msg, color) {
   el.style.color = color || 'var(--text-2)';
 }
 
+/* ============================================================
+   RESEARCH AUTO-ENQUEUE
+   Auto-added IBKR positions arrive with rating=null, targetPrice=null,
+   range=null. The user has to click Refresh on every row to populate
+   the analyst columns -- on a 18-position live account that's 18
+   clicks. Instead, scan after every position sync and queue any row
+   that has a position but no rating for an async research fetch.
+   Throttled to 1 call / 2.5s so an 18-position cold start spreads
+   over ~45s rather than slamming Anthropic.
+
+   Failure handling: rate-limit / billing-cap errors land on
+   _researchErrorAt timestamp. Retry the row 30min later. Hard errors
+   never block the row from rendering -- just mean the analyst columns
+   show "—" until billing clears.
+============================================================ */
+const RESEARCH_THROTTLE_MS = 2500;
+const RESEARCH_RETRY_AFTER_MS = 30 * 60 * 1000;
+let _researchQueue = [];
+let _researchInFlight = false;
+let _researchTimer = null;
+
+function _scanForResearchTargets() {
+  // Build a fresh queue of (alias, sym) pairs that need enrichment.
+  // De-dupe vs the already-pending queue.
+  const pending = new Set(_researchQueue.map(q => q.alias + '|' + q.sym));
+  const now = Date.now();
+  for (const alias of Object.keys(portfolios.data)) {
+    const wl = portfolios.data[alias];
+    if ((wl.type || 'portfolio') !== 'portfolio') continue;
+    for (const sym of Object.keys(wl.stocks)) {
+      const s = wl.stocks[sym];
+      if (!s.quantity || s.quantity === 0) continue;  // no position
+      if (s.rating) continue;                          // already enriched
+      if (s._loading || s._researchLoading) continue;  // in flight
+      if (s._researchErrorAt && now - s._researchErrorAt < RESEARCH_RETRY_AFTER_MS) continue;
+      const key = alias + '|' + sym;
+      if (pending.has(key)) continue;
+      _researchQueue.push({alias, sym});
+      pending.add(key);
+    }
+  }
+}
+
+async function _processResearchQueue() {
+  _researchTimer = null;
+  if (_researchInFlight) return;
+  if (_researchQueue.length === 0) return;
+  const {alias, sym} = _researchQueue.shift();
+  const wl = portfolios.data[alias];
+  // Tab/row may have vanished between scan and process (auto-sync
+  // removed a closed position). Skip silently and tick the queue.
+  if (!wl || !wl.stocks[sym]) {
+    _researchTimer = setTimeout(_processResearchQueue, 50);
+    return;
+  }
+  _researchInFlight = true;
+  wl.stocks[sym]._researchLoading = true;
+  // Light re-render so the operator sees the row tick into "···" state.
+  // Cheap enough to do per-call (it's one query selector + innerHTML).
+  try { renderPortfolioStocks(); } catch (_) {}
+  try {
+    const data = await fetchResearchData(sym);
+    const summary = summarizeStockData(data);
+    const existing = wl.stocks[sym];
+    // Merge: keep position fields from IBKR auto-sync, take analyst
+    // fields from research. currentPrice prefers the live IBKR mark
+    // if it's set (truer); falls back to summary.currentPrice from the
+    // research payload otherwise.
+    wl.stocks[sym] = {
+      ...summary,
+      quantity: existing.quantity,
+      avgCost: existing.avgCost,
+      unrealizedPnL: existing.unrealizedPnL,
+      marketValue: existing.marketValue,
+      currentPrice: (existing.currentPrice && existing.currentPrice > 0)
+        ? existing.currentPrice
+        : summary.currentPrice,
+      updatedAt: new Date().toISOString(),
+    };
+    // Recompute potential move with possibly-newer current price.
+    if (wl.stocks[sym].targetPrice && wl.stocks[sym].currentPrice) {
+      wl.stocks[sym].potentialMovePct =
+        ((wl.stocks[sym].targetPrice - wl.stocks[sym].currentPrice) / wl.stocks[sym].currentPrice) * 100;
+    }
+    try { await _persistStockMetrics(wl, sym, wl.stocks[sym]); } catch (_) {}
+  } catch (e) {
+    if (wl.stocks[sym]) {
+      wl.stocks[sym]._researchLoading = false;
+      wl.stocks[sym]._researchErrorAt = Date.now();
+    }
+  } finally {
+    if (wl.stocks[sym]) wl.stocks[sym]._researchLoading = false;
+    _researchInFlight = false;
+    try { renderPortfolioStocks(); } catch (_) {}
+    _researchTimer = setTimeout(_processResearchQueue, RESEARCH_THROTTLE_MS);
+  }
+}
+
 async function refreshPositions() {
   let positions = [];
   try {
@@ -6448,6 +6591,16 @@ async function refreshPositions() {
   // Always render -- even if nothing mutated, the status indicator
   // above lets the operator see the poller IS running.
   renderPortfolios();
+
+  // After every sync, kick the research queue: enqueue any positioned
+  // row that still has rating=null. The queue self-throttles to one
+  // call every RESEARCH_THROTTLE_MS so an 18-row cold start spreads
+  // across ~45s instead of slamming Anthropic. No-op if the queue
+  // already has work or every row is enriched.
+  _scanForResearchTargets();
+  if (!_researchTimer && !_researchInFlight && _researchQueue.length) {
+    _processResearchQueue();
+  }
 }
 
 // Manual trigger from the "⟳ Sync from IBKR" button. Useful as a

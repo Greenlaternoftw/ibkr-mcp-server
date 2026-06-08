@@ -906,6 +906,7 @@ async def positions(request: Request) -> Response:
         return JSONResponse({"error": str(e)}, status_code=500)
 
     out = []
+    need_mark = []  # (out_index, contract, qty, avg_cost) for the multi-account backfill
     for pos in positions or []:
         # Per-account filter: Position has an `account` field.
         if target and getattr(pos, "account", None) != target:
@@ -927,7 +928,6 @@ async def positions(request: Request) -> Response:
             realized = float(getattr(pf, "realizedPNL", 0) or 0)
         else:
             # Stream not populated for this account (multi-account login).
-            # Show the position with a 0 mark rather than dropping it.
             market_price = 0.0
             market_value = 0.0
             unrealized = 0.0
@@ -941,6 +941,59 @@ async def positions(request: Request) -> Response:
             "unrealized_pnl": unrealized,
             "realized_pnl": realized,
         })
+        if market_price <= 0:
+            need_mark.append((len(out) - 1, contract, qty, avg_cost))
+
+    # Multi-account backfill: ib.portfolio() carries no live mark for a
+    # non-default account, so unrealized P&L / market value came back 0 and
+    # the dashboard showed "—". Pull a snapshot quote for those positions
+    # (Position.contract already has a conId, so reqTickersAsync qualifies,
+    # snapshots, and cleans up in one bounded call) and compute P&L
+    # client-independently: unrealized = (mark - avg_cost) * qty.
+    if need_mark:
+        def _ticker_px(t):
+            for v in (getattr(t, "last", None), getattr(t, "close", None)):
+                # NaN != NaN, so the `v == v` guard rejects NaN marks.
+                if v is not None and v == v and v > 0:
+                    return float(v)
+            bid, ask = getattr(t, "bid", None), getattr(t, "ask", None)
+            if bid and ask and bid == bid and ask == ask and bid > 0 and ask > 0:
+                return (float(bid) + float(ask)) / 2.0
+            try:
+                mp = t.marketPrice()
+                if mp is not None and mp == mp and mp > 0:
+                    return float(mp)
+            except Exception:
+                pass
+            return None
+        try:
+            contracts = [c for (_, c, _, _) in need_mark]
+            tickers = await ibkr_client._bounded(
+                ibkr_client.ib.reqTickersAsync(*contracts),
+                timeout=8.0,
+                op="reqTickers_positions",
+            )
+            by_con = {}
+            for t in (tickers or []):
+                con = getattr(getattr(t, "contract", None), "conId", None)
+                if con is not None:
+                    by_con[con] = t
+            for (idx, contract, qty, avg_cost) in need_mark:
+                t = by_con.get(getattr(contract, "conId", None))
+                if t is None:
+                    continue
+                px = _ticker_px(t)
+                if not px:
+                    continue
+                row = out[idx]
+                row["market_price"] = px
+                row["market_value"] = px * qty
+                row["unrealized_pnl"] = (px - avg_cost) * qty
+        except Exception:
+            # Market data unavailable (no subscription / timeout). Leave the
+            # positions with a 0 mark rather than failing the whole tab.
+            logger.debug("positions mark backfill skipped", exc_info=True)
+
     return JSONResponse({"positions": out})
 
 
