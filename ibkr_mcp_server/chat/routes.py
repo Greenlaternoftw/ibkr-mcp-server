@@ -998,57 +998,78 @@ async def positions(request: Request) -> Response:
             except Exception:
                 pass
             return None
-        got_any_mark = False
-        try:
-            # Request DELAYED market data (type 3) for the snapshot. Live
-            # accounts without a real-time L1 subscription (Error 10089)
-            # get nothing from the default real-time request, so unrealized
-            # P&L stayed $0. Delayed data is free on virtually all accounts
-            # and ~15min lagged -- perfectly adequate for a portfolio P&L
-            # display. We restore real-time (type 1) immediately after so
-            # strategy ticks are unaffected.
+
+        async def _snapshot(contracts, data_type):
+            """Set market-data type, snapshot the contracts, return
+            {conId: ticker}. Best-effort; swallows timeout/errors."""
             try:
-                ibkr_client.ib.reqMarketDataType(3)
+                ibkr_client.ib.reqMarketDataType(data_type)
             except Exception:
                 pass
-            contracts = [c for (_, c, _, _) in need_mark]
-            # 3s timeout. Plain wait_for -- a timeout raises but does NOT
-            # cascade into a connection reset like _bounded does.
-            tickers = await asyncio.wait_for(
-                ibkr_client.ib.reqTickersAsync(*contracts),
-                timeout=3.0,
-            )
-            by_con = {}
+            try:
+                tickers = await asyncio.wait_for(
+                    ibkr_client.ib.reqTickersAsync(*contracts),
+                    timeout=3.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                return {}
+            out_map = {}
             for t in (tickers or []):
                 con = getattr(getattr(t, "contract", None), "conId", None)
                 if con is not None:
-                    by_con[con] = t
+                    out_map[con] = t
+            return out_map
+
+        got_any_mark = False
+        try:
+            contracts = [c for (_, c, _, _) in need_mark]
+            # PASS 1 -- REAL-TIME (type 1). Operator has a live L1
+            # subscription, so this is the accurate, sub-second-fresh
+            # price. Tag these rows price_delayed=False.
+            rt = await _snapshot(contracts, 1)
+            still_unmarked = []
             for (idx, contract, qty, avg_cost) in need_mark:
-                t = by_con.get(getattr(contract, "conId", None))
-                if t is None:
-                    continue
-                px = _ticker_px(t)
+                t = rt.get(getattr(contract, "conId", None))
+                px = _ticker_px(t) if t is not None else None
                 if not px:
+                    still_unmarked.append((idx, contract, qty, avg_cost))
                     continue
                 got_any_mark = True
                 row = out[idx]
                 row["market_price"] = px
                 row["market_value"] = px * qty
                 row["unrealized_pnl"] = (px - avg_cost) * qty
-        except asyncio.TimeoutError:
-            logger.debug("positions mark backfill timed out (skipping silently)")
+                row["price_delayed"] = False
+
+            # PASS 2 -- DELAYED (type 3) fallback ONLY for symbols real-time
+            # couldn't price (no subscription for that specific product,
+            # halted, etc.). Tag these price_delayed=True so the UI marks
+            # them. Skipped entirely if real-time covered everything.
+            if still_unmarked:
+                dl = await _snapshot([c for (_, c, _, _) in still_unmarked], 3)
+                for (idx, contract, qty, avg_cost) in still_unmarked:
+                    t = dl.get(getattr(contract, "conId", None))
+                    px = _ticker_px(t) if t is not None else None
+                    if not px:
+                        continue
+                    got_any_mark = True
+                    row = out[idx]
+                    row["market_price"] = px
+                    row["market_value"] = px * qty
+                    row["unrealized_pnl"] = (px - avg_cost) * qty
+                    row["price_delayed"] = True
         except Exception:
             logger.debug("positions mark backfill skipped", exc_info=True)
         finally:
-            # Restore real-time market data type so strategy ticks aren't
+            # Leave market-data type at real-time so strategy ticks aren't
             # left on delayed data.
             try:
                 ibkr_client.ib.reqMarketDataType(1)
             except Exception:
                 pass
-        # If we got nothing usable, back off for 5 minutes so subsequent
-        # polls don't each eat the full timeout. If we DID get marks, clear
-        # any prior backoff so we keep refreshing live.
+        # Back off for 5 min only if NOTHING priced (neither real-time nor
+        # delayed) -- keeps the dashboard snappy when an account has no
+        # data at all. Clear the backoff the moment any mark comes through.
         if got_any_mark:
             _POSITIONS_MARK_BACKOFF_UNTIL = 0.0
         else:

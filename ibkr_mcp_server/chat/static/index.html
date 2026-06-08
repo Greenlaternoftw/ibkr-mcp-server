@@ -3830,7 +3830,7 @@ function renderPortfolioStocks() {
         : `
           <td><span class="rating-pill" style="color:${ratingColor};">${ratingLabel}</span></td>
           <td class="right">${qty}</td>
-          <td class="right${s.priceFlash ? ' price-flash' : ''}">${fmtPrice(s.currentPrice)}</td>
+          <td class="right${s.priceFlash ? ' price-flash' : ''}">${fmtPrice(s.currentPrice)}${s.priceDelayed && s.currentPrice ? '<span style="margin-left:4px; font-size:8px; letter-spacing:0.1em; color:var(--warn); vertical-align:middle;" title="Delayed ~15min — no real-time entitlement for this symbol">DLY</span>' : ''}</td>
           <td class="right">${fmtPrice(s.targetPrice)}</td>
           <td class="right" style="font-size:11px;">${range}</td>
           <td class="right" style="color:${moveColor};">${fmtPct(s.potentialMovePct)}</td>
@@ -6676,6 +6676,10 @@ async function refreshPositions() {
       s.avgCost = p.avg_cost;
       s.unrealizedPnL = p.unrealized_pnl;
       s.marketValue = p.market_value;
+      // Whether the backend priced this off delayed data (no real-time
+      // entitlement for the symbol). Drives the "DLY" tag in the Current
+      // column so a 15-min-lagged price is never mistaken for live.
+      s.priceDelayed = !!p.price_delayed;
     }
 
     // 3. Remove rows for positions no longer held.
