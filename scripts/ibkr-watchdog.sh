@@ -83,7 +83,26 @@ if [ -r "$ENV_FILE" ]; then
     BIND_HOST=$(read_env MCP_BIND_HOST)
     BIND_PORT=$(read_env MCP_BIND_PORT)
     IBKR_PORT_VAL=$(read_env IBKR_PORT)
+    IBKR_IS_PAPER_VAL=$(read_env IBKR_IS_PAPER)
 fi
+
+# Live mode is anything where IBKR_IS_PAPER is not strictly "true". Paper
+# mode auto-logs in instantly; live mode requires human 2FA approval. The
+# watchdog must behave very differently in the two modes:
+#   - paper: aggressive restart on any port-down (safe, no human in loop)
+#   - live:  NEVER auto-restart Gateway. A port-down moment is almost
+#            always either (a) the operator hasn't approved 2FA yet, or
+#            (b) Gateway is in a logout/restart cycle. Auto-restarting
+#            Gateway forces a NEW 2FA push, which the operator may also
+#            miss, which triggers another restart, ad infinitum -- the
+#            "5-minute clock-aligned 2FA storm" we hit on 2026-06-05.
+# In live mode we only restart the DAEMON (it's stateless and won't push
+# a 2FA prompt). Gateway is operator-owned.
+IS_LIVE_MODE="false"
+case "${IBKR_IS_PAPER_VAL,,}" in
+    ""|"true"|"yes"|"1") IS_LIVE_MODE="false" ;;
+    *) IS_LIVE_MODE="true" ;;
+esac
 NTFY_URL_VAL=${NTFY_URL_VAL:-https://ntfy.sh}
 
 # Resolve HEALTHZ_URL from daemon config if the cron didn't pin it. This
@@ -144,7 +163,11 @@ on_transition_to_failure() {
     case "$kind" in
         gateway_down)
             title="IBKR Gateway port down"
-            msg="Gateway port $GATEWAY_PORT not listening on the VPS. Restarting Gateway + daemon. Check ibkr-watchdog.log if this repeats."
+            if [ "$IS_LIVE_MODE" = "true" ]; then
+                msg="Gateway port $GATEWAY_PORT not listening (LIVE mode). NOT auto-restarting -- needs 2FA. Restart via: cd /home/trader/ibkr-stack && docker compose restart ib-gateway, then approve 2FA on phone."
+            else
+                msg="Gateway port $GATEWAY_PORT not listening on the VPS. Restarting Gateway + daemon. Check ibkr-watchdog.log if this repeats."
+            fi
             ;;
         daemon_down)
             title="IBKR daemon HTTP wedged"
@@ -196,9 +219,19 @@ restart_daemon() {
 }
 
 # --- check 1: Gateway port listening --------------------------------------
+# In live mode we DO NOT auto-restart Gateway -- doing so triggers a new
+# 2FA push, which if missed cascades into the 5-min restart storm we hit
+# on 2026-06-05. The daemon's own persistent reconnect loop (10s
+# interval, 10 min ceiling) handles transient Gateway drops; if Gateway
+# is truly down, the operator must approve 2FA on their phone anyway,
+# so auto-restart adds nothing but noise. We just alert and exit.
 if ! ss -tln 2>/dev/null | grep -q ":$GATEWAY_PORT "; then
     log "FAIL: Gateway port $GATEWAY_PORT not listening"
     on_transition_to_failure gateway_down
+    if [ "$IS_LIVE_MODE" = "true" ]; then
+        log "SKIP: live mode -- Gateway restart needs 2FA, operator owns recovery"
+        exit 0
+    fi
     restart_gateway
     restart_daemon
     exit 0
