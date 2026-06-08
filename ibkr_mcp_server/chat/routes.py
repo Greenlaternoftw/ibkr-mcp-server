@@ -947,9 +947,17 @@ async def positions(request: Request) -> Response:
     # Multi-account backfill: ib.portfolio() carries no live mark for a
     # non-default account, so unrealized P&L / market value came back 0 and
     # the dashboard showed "—". Pull a snapshot quote for those positions
-    # (Position.contract already has a conId, so reqTickersAsync qualifies,
-    # snapshots, and cleans up in one bounded call) and compute P&L
-    # client-independently: unrealized = (mark - avg_cost) * qty.
+    # and compute P&L client-independently: unrealized = (mark - avg_cost) * qty.
+    #
+    # CRITICAL: do NOT use ibkr_client._bounded() here. It triggers a
+    # force-disconnect on timeout to "clear stuck waits," which propagates
+    # as the disconnect/reconnect/ntfy storm we observed on every phone
+    # refresh. The backfill is best-effort cosmetic data -- a slow market
+    # data response is normal (no L1 subscription / closed market /
+    # illiquid symbol) and must NEVER take the IBKR socket down.
+    #
+    # Use plain asyncio.wait_for + swallow EVERY exception. If the snapshot
+    # is slow or fails, positions still render with avg_cost and a 0 mark.
     if need_mark:
         def _ticker_px(t):
             for v in (getattr(t, "last", None), getattr(t, "close", None)):
@@ -968,10 +976,13 @@ async def positions(request: Request) -> Response:
             return None
         try:
             contracts = [c for (_, c, _, _) in need_mark]
-            tickers = await ibkr_client._bounded(
+            # 4s timeout: tight enough that a polling client hitting this
+            # every 30s never queues backfills, loose enough for a normal
+            # market-hours snapshot. Plain wait_for -- timeout raises but
+            # does NOT cascade into a connection reset like _bounded does.
+            tickers = await asyncio.wait_for(
                 ibkr_client.ib.reqTickersAsync(*contracts),
-                timeout=8.0,
-                op="reqTickers_positions",
+                timeout=4.0,
             )
             by_con = {}
             for t in (tickers or []):
@@ -989,9 +1000,13 @@ async def positions(request: Request) -> Response:
                 row["market_price"] = px
                 row["market_value"] = px * qty
                 row["unrealized_pnl"] = (px - avg_cost) * qty
+        except asyncio.TimeoutError:
+            # Snapshot too slow -- normal during off-hours or for illiquid
+            # symbols. Render with 0 marks; next poll will retry.
+            logger.debug("positions mark backfill timed out (skipping silently)")
         except Exception:
-            # Market data unavailable (no subscription / timeout). Leave the
-            # positions with a 0 mark rather than failing the whole tab.
+            # Anything else (no market-data subscription, qualify failure,
+            # IBKR rate-limit). Same handling: skip silently.
             logger.debug("positions mark backfill skipped", exc_info=True)
 
     return JSONResponse({"positions": out})
