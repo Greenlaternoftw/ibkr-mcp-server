@@ -148,7 +148,41 @@ class Settings(BaseSettings):
     # gives a clean equity curve without producing thousands of rows
     # per day. The chart tool reads from these rows.
     portfolio_snapshot_interval_seconds: int = 3600
-    
+
+    # === PORTFOLIO EARLY WARNING SYSTEM (EWS) ===
+    # AI-powered signal monitoring per the EWS integration brief. Scans
+    # each held position for SEC filings, options flow, short interest,
+    # dark pool prints, and news, then asks Claude for a structured
+    # buy/sell/hold/hedge/trim/watch recommendation and pushes CRITICAL/
+    # HIGH alerts via ntfy. Adapted to the daemon (server-side scan loop,
+    # server-side Anthropic, ntfy push) rather than the brief's
+    # browser-only React design.
+    ews_enabled: bool = False
+
+    # Unusual Whales API key (optional). Without it the system still runs
+    # on free signals (SEC EDGAR + yfinance news) -- recommendations are
+    # less signal-rich but still AI-generated. Bearer token; read-only
+    # market data. Sign up: unusualwhales.com/pricing
+    uw_api_key: Optional[str] = None
+    uw_base_url: str = "https://api.unusualwhales.com"
+
+    # SEC EDGAR requires a User-Agent with a contact email (10 req/s cap).
+    # Set this to your own email or the request will be throttled/blocked.
+    ews_edgar_user_agent: str = "ibkr-mcp-ews ews@example.com"
+
+    # Scan cadence. The brief offers 5/10/15/30/60 min; default 15.
+    # 0 disables the autonomous scan loop (manual scan-now still works).
+    ews_scan_interval_minutes: int = 15
+
+    # Only push ntfy for alerts at or above this severity. Order:
+    # CRITICAL > HIGH > MEDIUM > INFO. Default HIGH so MEDIUM/INFO land
+    # in the in-app feed without buzzing the phone (matches brief §2.2).
+    ews_push_min_severity: str = "HIGH"
+
+    # Where the EWS alert feed + scan audit live. Reuses chat.db by
+    # default (same SQLite file, separate tables).
+    ews_db_path: Optional[str] = None
+
     @field_validator('ibkr_managed_accounts')
     @classmethod
     def parse_managed_accounts(cls, v) -> Optional[List[str]]:
