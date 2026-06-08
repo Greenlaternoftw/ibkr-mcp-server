@@ -979,10 +979,14 @@ async def positions(request: Request) -> Response:
     # case a subscription was added or the market reopened.
     import time as _time
     global _POSITIONS_MARK_BACKOFF_UNTIL
-    if need_mark and _time.monotonic() < _POSITIONS_MARK_BACKOFF_UNTIL:
-        need_mark = []  # skip the snapshot this round
 
     if need_mark:
+        # The 5-min backoff only suppresses the IBKR snapshot (which burns
+        # a timeout when the account has no quote subscription). The
+        # yfinance fallback below still runs, so prices never sit at $0
+        # for the whole backoff window.
+        skip_ibkr = _time.monotonic() < _POSITIONS_MARK_BACKOFF_UNTIL
+
         def _ticker_px(t):
             for v in (getattr(t, "last", None), getattr(t, "close", None)):
                 # NaN != NaN, so the `v == v` guard rejects NaN marks.
@@ -1021,59 +1025,82 @@ async def positions(request: Request) -> Response:
             return out_map
 
         got_any_mark = False
-        try:
-            contracts = [c for (_, c, _, _) in need_mark]
-            # PASS 1 -- REAL-TIME (type 1). Operator has a live L1
-            # subscription, so this is the accurate, sub-second-fresh
-            # price. Tag these rows price_delayed=False.
-            rt = await _snapshot(contracts, 1)
-            still_unmarked = []
-            for (idx, contract, qty, avg_cost) in need_mark:
-                t = rt.get(getattr(contract, "conId", None))
-                px = _ticker_px(t) if t is not None else None
-                if not px:
-                    still_unmarked.append((idx, contract, qty, avg_cost))
-                    continue
-                got_any_mark = True
-                row = out[idx]
-                row["market_price"] = px
-                row["market_value"] = px * qty
-                row["unrealized_pnl"] = (px - avg_cost) * qty
-                row["price_delayed"] = False
-
-            # PASS 2 -- DELAYED (type 3) fallback ONLY for symbols real-time
-            # couldn't price (no subscription for that specific product,
-            # halted, etc.). Tag these price_delayed=True so the UI marks
-            # them. Skipped entirely if real-time covered everything.
-            if still_unmarked:
-                dl = await _snapshot([c for (_, c, _, _) in still_unmarked], 3)
-                for (idx, contract, qty, avg_cost) in still_unmarked:
-                    t = dl.get(getattr(contract, "conId", None))
+        if not skip_ibkr:
+            try:
+                contracts = [c for (_, c, _, _) in need_mark]
+                # PASS 1 -- REAL-TIME (type 1). Accurate, sub-second-fresh
+                # when the account has a live L1 subscription.
+                # price_delayed=False.
+                rt = await _snapshot(contracts, 1)
+                still_unmarked = []
+                for (idx, contract, qty, avg_cost) in need_mark:
+                    t = rt.get(getattr(contract, "conId", None))
                     px = _ticker_px(t) if t is not None else None
                     if not px:
+                        still_unmarked.append((idx, contract, qty, avg_cost))
                         continue
                     got_any_mark = True
                     row = out[idx]
                     row["market_price"] = px
                     row["market_value"] = px * qty
                     row["unrealized_pnl"] = (px - avg_cost) * qty
-                    row["price_delayed"] = True
-        except Exception:
-            logger.debug("positions mark backfill skipped", exc_info=True)
-        finally:
-            # Leave market-data type at real-time so strategy ticks aren't
-            # left on delayed data.
-            try:
-                ibkr_client.ib.reqMarketDataType(1)
+                    row["price_delayed"] = False
+
+                # PASS 2 -- DELAYED (type 3) for what real-time couldn't price.
+                if still_unmarked:
+                    dl = await _snapshot([c for (_, c, _, _) in still_unmarked], 3)
+                    for (idx, contract, qty, avg_cost) in still_unmarked:
+                        t = dl.get(getattr(contract, "conId", None))
+                        px = _ticker_px(t) if t is not None else None
+                        if not px:
+                            continue
+                        got_any_mark = True
+                        row = out[idx]
+                        row["market_price"] = px
+                        row["market_value"] = px * qty
+                        row["unrealized_pnl"] = (px - avg_cost) * qty
+                        row["price_delayed"] = True
             except Exception:
-                pass
-        # Back off for 5 min only if NOTHING priced (neither real-time nor
-        # delayed) -- keeps the dashboard snappy when an account has no
-        # data at all. Clear the backoff the moment any mark comes through.
-        if got_any_mark:
-            _POSITIONS_MARK_BACKOFF_UNTIL = 0.0
-        else:
-            _POSITIONS_MARK_BACKOFF_UNTIL = _time.monotonic() + 300.0
+                logger.debug("positions mark backfill skipped", exc_info=True)
+            finally:
+                # Leave market-data type at real-time so strategy ticks
+                # aren't left on delayed data.
+                try:
+                    ibkr_client.ib.reqMarketDataType(1)
+                except Exception:
+                    pass
+            # Back off the IBKR snapshot for 5 min only if it priced NOTHING
+            # (no quote subscription). Clear it the moment IBKR prices.
+            if got_any_mark:
+                _POSITIONS_MARK_BACKOFF_UNTIL = 0.0
+            else:
+                _POSITIONS_MARK_BACKOFF_UNTIL = _time.monotonic() + 300.0
+
+        # FREE FALLBACK -- for anything IBKR couldn't price (no quote
+        # subscription, or we're in the IBKR backoff window), pull a price
+        # from yfinance so positions never render at $0. Tagged
+        # price_delayed + price_source="yfinance" so it's never mistaken
+        # for a live IBKR quote. IBKR is always preferred when it works.
+        if getattr(settings, "price_yfinance_fallback", True):
+            unpriced = [(idx, c, qty, ac) for (idx, c, qty, ac) in need_mark
+                        if (out[idx].get("market_price") or 0) <= 0]
+            if unpriced:
+                try:
+                    from .. import price_fallback
+                    syms = [c.symbol for (_, c, _, _) in unpriced]
+                    prices = await asyncio.to_thread(price_fallback.fetch_prices, syms)
+                    for (idx, contract, qty, avg_cost) in unpriced:
+                        px = prices.get(contract.symbol)
+                        if not px or px <= 0:
+                            continue
+                        row = out[idx]
+                        row["market_price"] = px
+                        row["market_value"] = px * qty
+                        row["unrealized_pnl"] = (px - avg_cost) * qty
+                        row["price_delayed"] = True
+                        row["price_source"] = "yfinance"
+                except Exception:
+                    logger.debug("yfinance price fallback skipped", exc_info=True)
 
     return JSONResponse({"positions": out})
 

@@ -149,6 +149,15 @@ class Settings(BaseSettings):
     # per day. The chart tool reads from these rows.
     portfolio_snapshot_interval_seconds: int = 3600
 
+    # Free price backup. When IBKR market data returns no quote (account
+    # has no L1 subscription, or we're in the snapshot backoff window),
+    # the positions endpoint falls back to yfinance so the dashboard
+    # never shows $0. IBKR is always preferred when it works; fallback
+    # prices are tagged price_source="yfinance" + price_delayed in the
+    # response so the UI marks them. Set False to disable the fallback
+    # (positions then show $0 when IBKR has no quote).
+    price_yfinance_fallback: bool = True
+
     # === PORTFOLIO EARLY WARNING SYSTEM (EWS) ===
     # AI-powered signal monitoring per the EWS integration brief. Scans
     # each held position for SEC filings, options flow, short interest,
