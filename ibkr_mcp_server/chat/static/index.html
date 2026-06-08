@@ -1249,6 +1249,21 @@
     padding: 10px 8px;
     border-bottom: 1px solid var(--hairline);
   }
+  .portfolio-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    transition: color 0.12s ease;
+  }
+  .portfolio-table th.sortable:hover { color: var(--text-2); }
+  .portfolio-table th.sort-active { color: var(--accent); }
+  .portfolio-table th .sort-ind {
+    display: inline-block;
+    width: 0.9em;
+    margin-left: 2px;
+    font-size: 9px;
+    opacity: 0.85;
+  }
   .portfolio-table td {
     padding: 11px 8px;
     border-bottom: 1px dotted var(--hairline-2);
@@ -2123,15 +2138,15 @@
     <table class="portfolio-table">
       <thead>
         <tr>
-          <th>Symbol</th>
-          <th>Rating</th>
-          <th class="right">Qty</th>
-          <th class="right">Current</th>
-          <th class="right">Target</th>
+          <th class="sortable" onclick="setPortfolioSort('symbol')" data-sortkey="symbol">Symbol<span class="sort-ind"></span></th>
+          <th class="sortable" onclick="setPortfolioSort('rating')" data-sortkey="rating">Rating<span class="sort-ind"></span></th>
+          <th class="right sortable" onclick="setPortfolioSort('quantity')" data-sortkey="quantity">Qty<span class="sort-ind"></span></th>
+          <th class="right sortable" onclick="setPortfolioSort('currentPrice')" data-sortkey="currentPrice">Current<span class="sort-ind"></span></th>
+          <th class="right sortable" onclick="setPortfolioSort('targetPrice')" data-sortkey="targetPrice">Target<span class="sort-ind"></span></th>
           <th class="right">30D Range</th>
-          <th class="right">Potential</th>
-          <th class="right">Unrealized P&amp;L</th>
-          <th class="right">Updated</th>
+          <th class="right sortable" onclick="setPortfolioSort('potentialMovePct')" data-sortkey="potentialMovePct">Potential<span class="sort-ind"></span></th>
+          <th class="right sortable" onclick="setPortfolioSort('unrealizedPnL')" data-sortkey="unrealizedPnL">Unrealized P&amp;L<span class="sort-ind"></span></th>
+          <th class="right sortable" onclick="setPortfolioSort('updatedAt')" data-sortkey="updatedAt">Updated<span class="sort-ind"></span></th>
           <th></th>
         </tr>
       </thead>
@@ -3642,6 +3657,82 @@ function _renderPortfolioPnlStrip(totals, isPortfolio) {
   }
 }
 
+/* ============================================================
+   PORTFOLIO SORTING
+   Click a column header to sort. First click = descending for
+   numeric columns (biggest position / best gainer on top),
+   ascending for text (symbol A-Z). Click again to flip. The
+   choice persists in localStorage so it survives reloads.
+============================================================ */
+let _portfolioSort = (() => {
+  try {
+    const raw = localStorage.getItem('ibkr-portfolio-sort');
+    if (raw) return JSON.parse(raw);
+  } catch (_) {}
+  return { key: 'unrealizedPnL', dir: 'desc' };  // default: biggest movers up top
+})();
+
+// Which columns are text (ascending-first) vs numeric (descending-first).
+const _TEXT_SORT_KEYS = new Set(['symbol', 'rating']);
+
+function setPortfolioSort(key) {
+  if (_portfolioSort.key === key) {
+    // Same column -> flip direction.
+    _portfolioSort.dir = _portfolioSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    // New column -> sensible default direction for its type.
+    _portfolioSort.key = key;
+    _portfolioSort.dir = _TEXT_SORT_KEYS.has(key) ? 'asc' : 'desc';
+  }
+  try { localStorage.setItem('ibkr-portfolio-sort', JSON.stringify(_portfolioSort)); } catch (_) {}
+  renderPortfolioStocks();
+}
+
+function _sortKeyValue(s, key) {
+  switch (key) {
+    case 'symbol':  return (s.symbol || '').toUpperCase();
+    case 'rating':  return (s.rating || '~~~').toUpperCase(); // nulls sort last (A-Z)
+    case 'quantity':         return Math.abs(Number(s.quantity) || 0);
+    case 'currentPrice':     return Number(s.currentPrice) || 0;
+    case 'targetPrice':      return Number(s.targetPrice) || 0;
+    case 'potentialMovePct': return Number(s.potentialMovePct) ?? -Infinity;
+    case 'unrealizedPnL':    return Number(s.unrealizedPnL) ?? -Infinity;
+    case 'updatedAt':        return new Date(s.updatedAt || s.lastUpdated || 0).getTime();
+    default: return 0;
+  }
+}
+
+function _sortStocksInPlace(stocks) {
+  const { key, dir } = _portfolioSort;
+  const mult = dir === 'asc' ? 1 : -1;
+  stocks.sort((a, b) => {
+    const av = _sortKeyValue(a, key);
+    const bv = _sortKeyValue(b, key);
+    if (typeof av === 'string' || typeof bv === 'string') {
+      return String(av).localeCompare(String(bv)) * mult;
+    }
+    if (av < bv) return -1 * mult;
+    if (av > bv) return  1 * mult;
+    // Tiebreak by symbol so order is stable.
+    return (a.symbol || '').localeCompare(b.symbol || '');
+  });
+}
+
+function _paintSortIndicators() {
+  const ths = document.querySelectorAll('.portfolio-table th.sortable');
+  ths.forEach(th => {
+    const key = th.getAttribute('data-sortkey');
+    const ind = th.querySelector('.sort-ind');
+    if (key === _portfolioSort.key) {
+      th.classList.add('sort-active');
+      if (ind) ind.textContent = _portfolioSort.dir === 'asc' ? '▲' : '▼';
+    } else {
+      th.classList.remove('sort-active');
+      if (ind) ind.textContent = '';
+    }
+  });
+}
+
 function renderPortfolioStocks() {
   const tbody = document.getElementById('portfolioStocksBody');
   if (!portfolios.active) {
@@ -3657,6 +3748,8 @@ function renderPortfolioStocks() {
     _renderPortfolioPnlStrip(null, isPortfolio);
     return;
   }
+  _sortStocksInPlace(stocks);
+  _paintSortIndicators();
   // Roll up unrealized P&L + market value across rows for the summary
   // strip. Only show on portfolio-type tabs (watchlists have no real
   // positions to sum).
@@ -6409,22 +6502,28 @@ function _updateSyncStatus(msg, color) {
    RESEARCH AUTO-ENQUEUE
    Auto-added IBKR positions arrive with rating=null, targetPrice=null,
    range=null. The user has to click Refresh on every row to populate
-   the analyst columns -- on a 18-position live account that's 18
+   the analyst columns -- on an 18-position live account that's 18
    clicks. Instead, scan after every position sync and queue any row
    that has a position but no rating for an async research fetch.
-   Throttled to 1 call / 2.5s so an 18-position cold start spreads
-   over ~45s rather than slamming Anthropic.
+
+   Concurrency: a small worker pool (MAX_RESEARCH_CONCURRENCY) pulls from
+   the queue in parallel, each pacing itself by RESEARCH_THROTTLE_MS.
+   With 3 workers @ ~900ms an 18-position cold start finishes in ~6s
+   instead of the ~45s the old single-worker 2.5s loop took -- which is
+   what made "stocks toward the bottom of the list load slow." Anthropic
+   billing is on auto-reload so the higher rate is fine; if you ever want
+   to throttle back, drop MAX_RESEARCH_CONCURRENCY to 1.
 
    Failure handling: rate-limit / billing-cap errors land on
    _researchErrorAt timestamp. Retry the row 30min later. Hard errors
    never block the row from rendering -- just mean the analyst columns
    show "—" until billing clears.
 ============================================================ */
-const RESEARCH_THROTTLE_MS = 2500;
+const RESEARCH_THROTTLE_MS = 900;
+const MAX_RESEARCH_CONCURRENCY = 3;
 const RESEARCH_RETRY_AFTER_MS = 30 * 60 * 1000;
 let _researchQueue = [];
-let _researchInFlight = false;
-let _researchTimer = null;
+let _researchActiveCount = 0;
 
 function _scanForResearchTargets() {
   // Build a fresh queue of (alias, sym) pairs that need enrichment.
@@ -6448,31 +6547,23 @@ function _scanForResearchTargets() {
   }
 }
 
-async function _processResearchQueue() {
-  _researchTimer = null;
-  if (_researchInFlight) return;
-  if (_researchQueue.length === 0) return;
-  const {alias, sym} = _researchQueue.shift();
+// Enrich one symbol via the Anthropic research path, merging the result
+// onto the existing position row. Returns nothing; updates state in place.
+async function _researchOne(alias, sym) {
   const wl = portfolios.data[alias];
-  // Tab/row may have vanished between scan and process (auto-sync
-  // removed a closed position). Skip silently and tick the queue.
-  if (!wl || !wl.stocks[sym]) {
-    _researchTimer = setTimeout(_processResearchQueue, 50);
-    return;
-  }
-  _researchInFlight = true;
+  // Tab/row may have vanished between scan and process (auto-sync removed
+  // a closed position).
+  if (!wl || !wl.stocks[sym]) return;
   wl.stocks[sym]._researchLoading = true;
-  // Light re-render so the operator sees the row tick into "···" state.
-  // Cheap enough to do per-call (it's one query selector + innerHTML).
   try { renderPortfolioStocks(); } catch (_) {}
   try {
     const data = await fetchResearchData(sym);
     const summary = summarizeStockData(data);
     const existing = wl.stocks[sym];
+    if (!existing) return;  // removed mid-fetch
     // Merge: keep position fields from IBKR auto-sync, take analyst
-    // fields from research. currentPrice prefers the live IBKR mark
-    // if it's set (truer); falls back to summary.currentPrice from the
-    // research payload otherwise.
+    // fields from research. currentPrice prefers the live IBKR mark if
+    // set (truer); falls back to the research payload otherwise.
     wl.stocks[sym] = {
       ...summary,
       quantity: existing.quantity,
@@ -6484,22 +6575,38 @@ async function _processResearchQueue() {
         : summary.currentPrice,
       updatedAt: new Date().toISOString(),
     };
-    // Recompute potential move with possibly-newer current price.
     if (wl.stocks[sym].targetPrice && wl.stocks[sym].currentPrice) {
       wl.stocks[sym].potentialMovePct =
         ((wl.stocks[sym].targetPrice - wl.stocks[sym].currentPrice) / wl.stocks[sym].currentPrice) * 100;
     }
     try { await _persistStockMetrics(wl, sym, wl.stocks[sym]); } catch (_) {}
   } catch (e) {
-    if (wl.stocks[sym]) {
-      wl.stocks[sym]._researchLoading = false;
-      wl.stocks[sym]._researchErrorAt = Date.now();
-    }
+    if (wl.stocks[sym]) wl.stocks[sym]._researchErrorAt = Date.now();
   } finally {
     if (wl.stocks[sym]) wl.stocks[sym]._researchLoading = false;
-    _researchInFlight = false;
     try { renderPortfolioStocks(); } catch (_) {}
-    _researchTimer = setTimeout(_processResearchQueue, RESEARCH_THROTTLE_MS);
+  }
+}
+
+// One worker: drains the queue, pacing itself by RESEARCH_THROTTLE_MS.
+// Multiple of these run concurrently (up to MAX_RESEARCH_CONCURRENCY).
+async function _researchWorker() {
+  while (_researchQueue.length) {
+    const {alias, sym} = _researchQueue.shift();
+    await _researchOne(alias, sym);
+    if (_researchQueue.length) {
+      await new Promise(r => setTimeout(r, RESEARCH_THROTTLE_MS));
+    }
+  }
+}
+
+// Spin up workers until either the queue is drained or we hit the
+// concurrency cap. Safe to call repeatedly -- it only adds workers up
+// to the cap and each exits when the queue empties.
+function _processResearchQueue() {
+  while (_researchActiveCount < MAX_RESEARCH_CONCURRENCY && _researchQueue.length) {
+    _researchActiveCount++;
+    _researchWorker().finally(() => { _researchActiveCount--; });
   }
 }
 
@@ -6593,12 +6700,12 @@ async function refreshPositions() {
   renderPortfolios();
 
   // After every sync, kick the research queue: enqueue any positioned
-  // row that still has rating=null. The queue self-throttles to one
-  // call every RESEARCH_THROTTLE_MS so an 18-row cold start spreads
-  // across ~45s instead of slamming Anthropic. No-op if the queue
-  // already has work or every row is enriched.
+  // row that still has rating=null, then spin up workers (up to
+  // MAX_RESEARCH_CONCURRENCY). _processResearchQueue is idempotent --
+  // it only adds workers up to the cap and each exits when the queue
+  // drains, so calling it every sync is safe.
   _scanForResearchTargets();
-  if (!_researchTimer && !_researchInFlight && _researchQueue.length) {
+  if (_researchQueue.length) {
     _processResearchQueue();
   }
 }
