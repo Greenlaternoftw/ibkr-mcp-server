@@ -228,6 +228,70 @@
     color: rgba(255, 255, 255, 0.78);
     font-weight: 500;
   }
+  /* ===== Early Warning System card ===== */
+  .ews-card {
+    background: var(--card, #0f1f33);
+    border: 1px solid var(--hairline, #1e3a5f);
+    border-radius: 12px;
+    margin: 0 0 16px;
+    overflow: hidden;
+  }
+  .ews-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 12px 16px;
+    border-bottom: 1px solid var(--hairline-2, #16283f);
+    flex-wrap: wrap;
+  }
+  .ews-title { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; }
+  .ews-sub { color: var(--muted); font-size: 11px; font-weight: 400; letter-spacing: 0.04em; }
+  .ews-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted, #5a6f8a); flex: none; }
+  .ews-dot.live { background: var(--go, #36c98e); animation: ewsPulse 2s infinite; }
+  @keyframes ewsPulse { 0%{box-shadow:0 0 0 0 rgba(54,201,142,0.5)} 70%{box-shadow:0 0 0 7px rgba(54,201,142,0)} 100%{box-shadow:0 0 0 0 rgba(54,201,142,0)} }
+  .ews-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ews-count { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; min-width: 22px; text-align: center; }
+  .ews-count.crit { background: rgba(232,92,77,0.18); color: var(--stop, #e85c4d); }
+  .ews-count.high { background: rgba(232,160,77,0.18); color: var(--warn, #e8a04d); }
+  .ews-btn {
+    background: transparent; border: 1px solid var(--hairline, #1e3a5f);
+    color: var(--text-2, #c4d3e6); border-radius: 8px; padding: 6px 10px;
+    font-size: 11px; cursor: pointer; transition: all 0.12s ease;
+  }
+  .ews-btn:hover { background: rgba(255,255,255,0.06); }
+  .ews-btn:disabled { opacity: 0.5; cursor: default; }
+  .ews-btn.busy { opacity: 0.6; }
+  .ews-body { max-height: 520px; overflow-y: auto; }
+  .ews-card.collapsed .ews-body { display: none; }
+  .ews-feed { display: flex; flex-direction: column; }
+  .ews-empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 12px; }
+  .ews-alert {
+    border-bottom: 1px dotted var(--hairline-2, #16283f);
+    padding: 12px 16px; cursor: pointer;
+  }
+  .ews-alert:hover { background: rgba(255,255,255,0.02); }
+  .ews-alert-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ews-sym { font-weight: 700; font-size: 14px; }
+  .ews-action { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 6px; letter-spacing: 0.08em; }
+  .ews-action.BUY, .ews-action.HOLD { background: rgba(54,201,142,0.16); color: var(--go); }
+  .ews-action.SELL, .ews-action.TRIM { background: rgba(232,92,77,0.16); color: var(--stop); }
+  .ews-action.HEDGE, .ews-action.WATCH { background: rgba(232,160,77,0.16); color: var(--warn); }
+  .ews-sev { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; padding: 2px 6px; border-radius: 5px; }
+  .ews-sev.CRITICAL { background: var(--stop); color: #fff; }
+  .ews-sev.HIGH { background: var(--warn); color: #1a1205; }
+  .ews-sev.MEDIUM { background: rgba(123,160,210,0.2); color: #9cc0ff; }
+  .ews-sev.INFO { background: rgba(120,140,170,0.16); color: var(--muted); }
+  .ews-atitle { flex: 1 1 200px; font-size: 12px; color: var(--text-2); }
+  .ews-time { font-size: 10px; color: var(--muted); }
+  .ews-detail { margin-top: 10px; font-size: 12px; color: var(--text-2); display: none; }
+  .ews-alert.open .ews-detail { display: block; }
+  .ews-detail .ews-summary { margin-bottom: 10px; line-height: 1.5; }
+  .ews-chip { display: inline-block; font-size: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--hairline-2); border-radius: 12px; padding: 2px 8px; margin: 2px 4px 2px 0; color: var(--muted); }
+  .ews-step { margin: 6px 0; padding-left: 22px; position: relative; line-height: 1.45; }
+  .ews-step .n { position: absolute; left: 0; top: 0; font-weight: 700; color: var(--accent, #ff6b5c); }
+  .ews-targets { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0; }
+  .ews-tgt { font-size: 11px; }
+  .ews-tgt .k { color: var(--muted); margin-right: 4px; }
+  .ews-detail-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
   .view-toggle {
     background: var(--accent);
     color: white;
@@ -2170,6 +2234,30 @@
   </div>
 </section>
 
+<!-- ============ EARLY WARNING SYSTEM ============ -->
+<section class="ews-card" id="ewsCard">
+  <div class="ews-head">
+    <div class="ews-title">
+      <span class="ews-dot" id="ewsDot"></span>
+      <span>Early Warning System</span>
+      <span class="ews-sub" id="ewsSub">—</span>
+    </div>
+    <div class="ews-controls">
+      <span class="ews-count crit" id="ewsCritCount" title="Critical alerts">0</span>
+      <span class="ews-count high" id="ewsHighCount" title="High alerts">0</span>
+      <button class="ews-btn" id="ewsScanBtn" onclick="ewsScanNow()">⟳ Scan Now</button>
+      <button class="ews-btn" id="ewsPushBtn" onclick="ewsEnablePush()" title="Enable browser push notifications">🔔 Push</button>
+      <button class="ews-btn" id="ewsIcsBtn" onclick="ewsDownloadAllIcs()" title="Download all reminders (.ics)">📅 .ics</button>
+      <button class="ews-btn" id="ewsCollapseBtn" onclick="ewsToggleCollapse()">▾</button>
+    </div>
+  </div>
+  <div class="ews-body" id="ewsBody">
+    <div class="ews-feed" id="ewsFeed">
+      <div class="ews-empty">No alerts yet. Click <b>Scan Now</b> to analyze your positions, or wait for the next auto-scan.</div>
+    </div>
+  </div>
+</section>
+
 <!-- ============ MAIN GRID ============ -->
 <div class="grid">
 
@@ -3103,6 +3191,217 @@ async function computeTransferPlan() {
   `;
 }
 
+/* ============================================================
+   EARLY WARNING SYSTEM (EWS) — dashboard panel
+   Polls /chat/api/ews/status + /alerts, renders the alert feed,
+   drives Scan Now / push-permission / .ics download, and fires a
+   browser Notification for fresh CRITICAL/HIGH alerts (in addition
+   to the daemon's ntfy push, which works even when the tab is shut).
+============================================================ */
+const EWS_REFRESH_MS = 60 * 1000;
+let _ewsTimer = null;
+let _ewsSeenIds = new Set();
+let _ewsBooted = false;
+let _ewsBrowserPush = false;
+
+function ewsInit() {
+  _ewsBrowserPush = ('Notification' in window) && Notification.permission === 'granted';
+  ewsRefresh();
+  if (_ewsTimer) clearInterval(_ewsTimer);
+  _ewsTimer = setInterval(ewsRefresh, EWS_REFRESH_MS);
+  // Restore collapsed pref.
+  try {
+    if (localStorage.getItem('ews-collapsed') === '1')
+      document.getElementById('ewsCard')?.classList.add('collapsed');
+  } catch (_) {}
+}
+
+function ewsToggleCollapse() {
+  const card = document.getElementById('ewsCard');
+  if (!card) return;
+  card.classList.toggle('collapsed');
+  try { localStorage.setItem('ews-collapsed', card.classList.contains('collapsed') ? '1' : '0'); } catch (_) {}
+}
+
+async function ewsRefresh() {
+  let status, feed;
+  try {
+    [status, feed] = await Promise.all([
+      daemonGet('/chat/api/ews/status'),
+      daemonGet('/chat/api/ews/alerts?limit=100'),
+    ]);
+  } catch (e) { return; }  // silent — dashboard keeps working
+  _ewsRenderStatus(status);
+  _ewsRenderFeed(feed.alerts || []);
+  _ewsBooted = true;
+}
+
+function _ewsRenderStatus(s) {
+  const dot = document.getElementById('ewsDot');
+  const sub = document.getElementById('ewsSub');
+  if (!s) return;
+  const live = s.enabled && (s.scan_interval_minutes > 0);
+  if (dot) dot.className = 'ews-dot' + (live ? ' live' : '');
+  const bits = [];
+  bits.push(live ? `auto every ${s.scan_interval_minutes}m` : 'manual only');
+  bits.push(s.uw_configured ? 'UW on' : 'free signals');
+  if (s.last_scan && s.last_scan.finished_at) {
+    bits.push('last ' + timeSince(s.last_scan.finished_at));
+  }
+  if (!s.anthropic_configured) bits.push('⚠ no AI key');
+  if (sub) sub.textContent = bits.join(' · ');
+}
+
+function _ewsRenderFeed(alerts) {
+  const feed = document.getElementById('ewsFeed');
+  if (!feed) return;
+  let crit = 0, high = 0;
+  for (const a of alerts) {
+    if (a.severity === 'CRITICAL') crit++;
+    else if (a.severity === 'HIGH') high++;
+  }
+  const cc = document.getElementById('ewsCritCount');
+  const hc = document.getElementById('ewsHighCount');
+  if (cc) cc.textContent = crit;
+  if (hc) hc.textContent = high;
+
+  // Browser-notify any NEW critical/high alert (dedupe by id). Skip the
+  // very first render so we don't replay history on page load.
+  for (const a of alerts) {
+    if (!_ewsSeenIds.has(a.id)) {
+      if (_ewsBooted && _ewsBrowserPush && (a.severity === 'CRITICAL' || a.severity === 'HIGH')) {
+        _ewsBrowserNotify(a);
+      }
+      _ewsSeenIds.add(a.id);
+    }
+  }
+
+  if (!alerts.length) {
+    feed.innerHTML = '<div class="ews-empty">No alerts yet. Click <b>Scan Now</b> to analyze your positions, or wait for the next auto-scan.</div>';
+    return;
+  }
+  feed.innerHTML = alerts.map(_ewsAlertCard).join('');
+}
+
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function _ewsAlertCard(a) {
+  const steps = (a.action_steps || []).map(st =>
+    `<div class="ews-step"><span class="n">${_esc(st.step ?? '•')}</span>`
+    + `${_esc(st.action || '')}`
+    + (st.rationale ? ` <span style="color:var(--muted);">— ${_esc(st.rationale)}</span>` : '')
+    + `</div>`).join('');
+  const chips = (a.signals_detected || []).map(s => `<span class="ews-chip">${_esc(s)}</span>`).join('');
+  const srcs = (a.trigger_sources || []).map(s => `<span class="ews-chip">${_esc(s)}</span>`).join('');
+  const pt = a.price_targets || {};
+  const tgts = ['30d', '60d', '90d', 'eoy'].filter(k => pt[k]).map(k =>
+    `<span class="ews-tgt"><span class="k">${k.toUpperCase()}</span>${_esc(pt[k])}</span>`).join('');
+  return `
+    <div class="ews-alert" data-id="${a.id}" onclick="ewsToggleAlert(${a.id})">
+      <div class="ews-alert-top">
+        <span class="ews-sym">${_esc(a.symbol)}</span>
+        <span class="ews-action ${_esc(a.action)}">${_esc(a.action)}</span>
+        <span class="ews-sev ${_esc(a.severity)}">${_esc(a.severity)}</span>
+        <span class="ews-atitle">${_esc(a.title)}</span>
+        <span class="ews-time">${a.created_at ? timeSince(a.created_at) : ''}</span>
+      </div>
+      <div class="ews-detail">
+        <div class="ews-summary">${_esc(a.summary)}</div>
+        ${chips ? `<div>${chips}</div>` : ''}
+        ${steps}
+        ${tgts ? `<div class="ews-targets">${tgts}</div>` : ''}
+        ${srcs ? `<div style="margin-top:6px;">${srcs}</div>` : ''}
+        <div class="ews-detail-actions">
+          <button class="ews-btn" onclick="event.stopPropagation(); ewsResendPush(${a.id})">🔔 Re-send</button>
+          <button class="ews-btn" onclick="event.stopPropagation(); ewsDownloadIcs(${a.id})">📅 .ics</button>
+          <button class="ews-btn" onclick="event.stopPropagation(); ewsDismiss(${a.id})">✕ Dismiss</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function ewsToggleAlert(id) {
+  const el = document.querySelector(`.ews-alert[data-id="${id}"]`);
+  if (el) el.classList.toggle('open');
+}
+
+async function ewsScanNow() {
+  const btn = document.getElementById('ewsScanBtn');
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); btn.textContent = '⟳ Scanning…'; }
+  try {
+    const r = await daemonPost('/chat/api/ews/scan-now', {});
+    await ewsRefresh();
+  } catch (e) {
+    alert('Scan failed: ' + (e.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('busy'); btn.textContent = '⟳ Scan Now'; }
+  }
+}
+
+async function ewsDismiss(id) {
+  try { await daemonPost(`/chat/api/ews/alerts/${id}/dismiss`, {}); } catch (_) {}
+  await ewsRefresh();
+}
+
+async function ewsEnablePush() {
+  if (!('Notification' in window)) { alert('This browser does not support notifications.'); return; }
+  const res = await Notification.requestPermission();
+  _ewsBrowserPush = (res === 'granted');
+  alert(_ewsBrowserPush ? 'Browser push enabled. (Phone push via ntfy is always on.)'
+                        : 'Browser push not granted. ntfy phone push still works.');
+}
+
+function _ewsBrowserNotify(a) {
+  try {
+    const emoji = a.severity === 'CRITICAL' ? '🚨' : '⚠️';
+    const step = (a.action_steps && a.action_steps[0]) ? a.action_steps[0].action : '';
+    const n = new Notification(`${emoji} ${a.symbol} ${a.action} — ${a.severity}`, {
+      body: (a.title || '') + (step ? `\n→ ${step}` : ''),
+      tag: `ews-${a.symbol}`,
+      requireInteraction: a.severity === 'CRITICAL',
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (_) {}
+}
+
+function ewsResendPush(id) {
+  const card = document.querySelector(`.ews-alert[data-id="${id}"]`);
+  // Rebuild a minimal alert object from the DOM is fiddly; just re-notify
+  // from the cached feed via a fresh fetch is overkill — instead pull the
+  // single alert from the last feed render stored on the element.
+  // Simplest: re-run a browser notification using on-card data attrs.
+  if (!('Notification' in window) || Notification.permission !== 'granted') {
+    alert('Enable browser push first (🔔 Push).'); return;
+  }
+  // Find it in the current feed snapshot.
+  daemonGet('/chat/api/ews/alerts?limit=100').then(f => {
+    const a = (f.alerts || []).find(x => x.id === id);
+    if (a) _ewsBrowserNotify(a);
+  }).catch(() => {});
+}
+
+function _ewsDownload(url, filename) {
+  const t = _daemonTokenRead();
+  fetch(url, { headers: t ? { 'Authorization': 'Bearer ' + t } : {} })
+    .then(r => r.blob())
+    .then(blob => {
+      const u = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = u; a.download = filename; document.body.appendChild(a);
+      a.click(); a.remove(); URL.revokeObjectURL(u);
+    }).catch(e => alert('Download failed: ' + e));
+}
+
+function ewsDownloadIcs(id) {
+  _ewsDownload(`/chat/api/ews/alerts/${id}.ics`, `ews-${id}.ics`);
+}
+function ewsDownloadAllIcs() {
+  _ewsDownload('/chat/api/ews/alerts.ics', 'portfolio-all-reminders.ics');
+}
+
 async function bootAppPostPin() {
   try {
     await _ensurePrefsLoaded();
@@ -3113,6 +3412,7 @@ async function bootAppPostPin() {
     startPositionsPolling();
     startLiveBannerPolling();
     startLiveSyncStream();
+    ewsInit();
     await _ensureActiveThread();
     renderChatMessages();
     await _restoreActiveView();

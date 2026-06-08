@@ -786,6 +786,41 @@ TOOLS = [
             "additionalProperties": False,
         },
     ),
+    Tool(
+        name="ews_scan_now",
+        description=(
+            "Run one Portfolio Early Warning System scan cycle NOW: for "
+            "every held stock position, fetch SEC EDGAR filings (S-1/8-K/"
+            "Form 4), options flow, short interest, dark-pool prints, and "
+            "news, then generate an AI buy/sell/hold/hedge/trim/watch "
+            "recommendation per position. CRITICAL/HIGH alerts also push "
+            "to the operator's phone via ntfy. Returns a summary "
+            "(positions scanned, alerts generated, alerts pushed)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="get_ews_alerts",
+        description=(
+            "Get the Portfolio Early Warning System alert feed (newest "
+            "first). Each alert has symbol, action, severity, title, "
+            "summary, signals_detected, action_steps, price_targets, and "
+            "trigger_sources. Use limit to cap results; include_dismissed "
+            "to also return dismissed alerts."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 50},
+                "include_dismissed": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 
@@ -1251,6 +1286,23 @@ async def call_tool(
                 text=json.dumps(status, indent=2)
             )]
         
+        elif name == "ews_scan_now":
+            from .ews import monitor as ews_monitor
+            summary = await ews_monitor.run_scan(ibkr_client)
+            return [TextContent(
+                type="text", text=json.dumps(summary, indent=2, default=str),
+            )]
+
+        elif name == "get_ews_alerts":
+            from .ews import persistence as ews_persist
+            alerts = ews_persist.get_store().list_alerts(
+                limit=int(arguments.get("limit", 50)),
+                include_dismissed=bool(arguments.get("include_dismissed", False)),
+            )
+            return [TextContent(
+                type="text", text=json.dumps({"alerts": alerts}, indent=2, default=str),
+            )]
+
         else:
             return [TextContent(
                 type="text",
